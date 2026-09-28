@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "agent_steward",
+  "project_id": "a80de480-56b7-4614-b50c-69e02889d569"
+}
