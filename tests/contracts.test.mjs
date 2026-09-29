@@ -6,9 +6,11 @@ import {
   ConfigSchema,
   ResultSchema,
   SnapshotSchema,
+  StopInputSchema,
   StewardError,
   errorResult,
 } from '../dist/src/contracts.js';
+import * as contractExports from '../dist/src/contracts.js';
 import { approval, candidate, config, evaluation, snapshot, windowFact } from './helpers.mjs';
 
 const validWindow = windowFact({ type: 'account' });
@@ -249,12 +251,13 @@ test('approval context accepts and preserves an own constructor key', () => {
   assert.equal(Object.prototype.polluted, before);
 });
 
-test('approval example uses the validated non-secret stopped-agent input shape', async () => {
-  const raw = JSON.parse(await readFile(new URL('../examples/approval.json', import.meta.url), 'utf8'));
-  const parsed = ApprovalInputSchema.parse(raw);
-  assert.equal(parsed.status, 'stopped');
-  assert.equal(parsed.context.includes('current terminal output'), true);
-  assert.equal(parsed.pending_action.action, 'Edit the local draft file');
+test('stop example parses as a version-2 observation with episode-matched retry history', async () => {
+  const raw = JSON.parse(await readFile(new URL('../examples/stop.json', import.meta.url), 'utf8'));
+  const parsed = StopInputSchema.parse(raw);
+  assert.equal(parsed.status, 'blocked');
+  assert.equal(parsed.current_episode_id, parsed.retry.failure_episode_id);
+  assert.equal(parsed.context.includes('current permission prompt'), true);
+  assert.equal(parsed.pending_action.action, "Run the project's unit tests");
   assert.equal(parsed.automatic_approval_forbidden, false);
 });
 
@@ -398,4 +401,238 @@ test('error envelopes expose only catalogued messages and safe codes', () => {
   assert.equal(unknown.reason_code, 'evaluation_failed');
   assert.equal(unknown.message, 'Evaluation failed.');
   assert.equal(unknown.message.includes('secret-token'), false);
+});
+
+test('version-2 stop input strictly validates adapter observations and retry/reset metadata', () => {
+  const { StopInputSchema } = contractExports;
+  assert.equal(typeof StopInputSchema?.parse, 'function');
+  const input = {
+    schema_version: 2,
+    request_id: 'r1',
+    agent: { id: 'a', tool: 'pi', pane_id: 'w1:p2', session_id: null },
+    status: 'blocked',
+    current_episode_id: 'e1',
+    context: 'API error',
+    automatic_approval_forbidden: false,
+    retry: {
+      failure_episode_id: 'e1',
+      first_observed_at: '2026-09-29T10:00:00Z',
+      attempt_count: 0,
+      last_attempt_at: null,
+      quota_check_count: 0,
+      last_quota_check_at: null,
+    },
+  };
+  const parsed = StopInputSchema.parse(input);
+  assert.equal(parsed.agent.pane_id, 'w1:p2');
+  assert.equal(parsed.current_episode_id, 'e1');
+  const { current_episode_id: _episodeId, ...withoutCurrentEpisodeId } = input;
+  assert.equal(StopInputSchema.safeParse(withoutCurrentEpisodeId).success, false);
+  const { automatic_approval_forbidden: _restriction, ...withoutRestriction } = input;
+  assert.equal(StopInputSchema.parse(withoutRestriction).automatic_approval_forbidden, false);
+
+  const reset = {
+    reset_at: '2026-09-29T12:00:00Z',
+    observed_at: '2026-09-29T10:00:00Z',
+    valid_until: '2026-09-29T11:00:00Z',
+    source: 'codex',
+    account_id: 'account-1',
+    pool_id: 'pool-1',
+    scope: { type: 'pool', pool_id: 'pool-1' },
+  };
+  assert.equal(StopInputSchema.safeParse({ ...input, reset }).success, true);
+  assert.equal(StopInputSchema.safeParse({ ...input, reset: { ...reset, source: 'terminal' } }).success, false);
+  assert.equal(
+    StopInputSchema.safeParse({ ...input, reset: { ...reset, scope: { type: 'account', hidden: true } } }).success,
+    false,
+  );
+  assert.equal(StopInputSchema.safeParse({ ...input, reset: { ...reset, verified: true } }).success, false);
+
+  const invalidInputs = [
+    { ...input, hidden: true },
+    { ...input, schema_version: 1 },
+    { ...input, status: 'stopped' },
+    { ...input, agent: { ...input.agent, tool: 'agy' } },
+    { ...input, agent: { ...input.agent, session_id: 4 } },
+    { ...input, agent: { ...input.agent, unexpected: true } },
+    { ...input, pending_action: { action: 'Edit file', secret: 'bad' } },
+    { ...input, retry: { ...input.retry, hidden: true } },
+    { ...input, reset: { ...reset, hidden: true } },
+    { ...input, reset: { ...reset, windows: [reset] } },
+    { ...input, reset: { ...reset, observed_at: 'tomorrow' } },
+    { ...input, retry: { ...input.retry, attempt_count: -1 } },
+    { ...input, retry: { ...input.retry, quota_check_count: -1 } },
+    { ...input, retry: { ...input.retry, attempt_count: 0.5 } },
+    { ...input, retry: { ...input.retry, first_observed_at: 'tomorrow' } },
+    { ...input, retry: { ...input.retry, last_attempt_at: '2026-02-30T10:00:00Z' } },
+    { ...input, retry: { ...input.retry, last_quota_check_at: 'not-a-date' } },
+  ];
+  for (const value of invalidInputs) assert.equal(StopInputSchema.safeParse(value).success, false);
+});
+
+test('version-2 stop results enforce action, reason, classification, and metric consistency', () => {
+  const { StopResultSchema } = contractExports;
+  assert.equal(typeof StopResultSchema?.safeParse, 'function');
+  const evaluatedResult = (
+    proposed_action,
+    reason_code,
+    waiting_for,
+    { waiting_confidence = 0.9, risk_probability = 0.2, evaluated = true } = {},
+  ) => ({
+    schema_version: 2,
+    request_id: 'r1',
+    decision: 'stop_decision',
+    proposed_action,
+    reason_code,
+    waiting_for,
+    waiting_confidence,
+    risk_probability,
+    evaluation: evaluated
+      ? evaluation({
+          waiting_for: {
+            type: 'choice',
+            choice: waiting_for,
+            probabilities: { [waiting_for]: 1 },
+            confidence: waiting_confidence,
+          },
+          risky: { type: 'noul', noul: risk_probability ?? 0.2 },
+        })
+      : null,
+  });
+  const actions = {
+    approve: { kind: 'approve_request' },
+    recover: {
+      kind: 'send_recovery_instruction',
+      not_before: '2026-09-29T10:00:30Z',
+      instruction:
+        'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.',
+    },
+    quota: { kind: 'wait_for_quota', not_before: '2026-09-29T12:01:00Z' },
+    manual: { kind: 'manual_review' },
+    done: { kind: 'no_action' },
+  };
+  const stopWaitingOptions = [
+    'approve_command',
+    'approve_edit',
+    'answer_question',
+    'credentials',
+    'recoverable_api_error',
+    'quota_limit',
+    'permanent_error',
+    'completed',
+    'other',
+  ];
+  const tiedEvaluation = (first, second, choice, risk = 0.2) =>
+    evaluation({
+      waiting_for: {
+        type: 'choice',
+        choice,
+        probabilities: Object.fromEntries(
+          stopWaitingOptions.map((state) => [state, state === first || state === second ? 0.5 : 0]),
+        ),
+        confidence: 0.9,
+      },
+      risky: { type: 'noul', noul: risk },
+    });
+  const ambiguousManual = {
+    ...evaluatedResult(actions.manual, 'unclear_waiting_state', 'approve_command', { risk_probability: null }),
+    evaluation: tiedEvaluation('approve_command', 'credentials', 'credentials'),
+  };
+  const validResults = [
+    evaluatedResult(actions.approve, 'low_risk', 'approve_command', { risk_probability: 0.1 }),
+    evaluatedResult(actions.manual, 'high_risk', 'approve_edit', { risk_probability: 0.9 }),
+    evaluatedResult(actions.manual, 'explicit_restriction', 'approve_command', { risk_probability: 0.1 }),
+    evaluatedResult(actions.manual, 'unclear_waiting_state', 'other', { risk_probability: null }),
+    evaluatedResult(actions.manual, 'ordinary_question', 'answer_question', { risk_probability: null }),
+    evaluatedResult(actions.manual, 'credentials', 'credentials', { risk_probability: null }),
+    evaluatedResult(actions.manual, 'permanent_error', 'permanent_error', { risk_probability: null }),
+    evaluatedResult(actions.manual, 'retry_exhausted', 'recoverable_api_error', { risk_probability: null }),
+    evaluatedResult(actions.manual, 'retry_exhausted', 'quota_limit', { risk_probability: null }),
+    evaluatedResult(actions.recover, 'recoverable_api_error', 'recoverable_api_error', { risk_probability: null }),
+    evaluatedResult(actions.quota, 'quota_limit', 'quota_limit', { risk_probability: null }),
+    evaluatedResult(actions.done, 'completed', 'completed', { risk_probability: null }),
+    evaluatedResult(actions.manual, 'insufficient_context', 'other', {
+      waiting_confidence: null,
+      risk_probability: null,
+      evaluated: false,
+    }),
+    ambiguousManual,
+  ];
+  for (const value of validResults) assert.equal(StopResultSchema.safeParse(value).success, true);
+
+  const approved = validResults[0];
+  const recovery = validResults[9];
+  const completed = validResults[11];
+  const localManual = validResults[12];
+  const invalidResults = [
+    { ...approved, evaluation: tiedEvaluation('approve_command', 'credentials', 'credentials', 0.1) },
+    { ...recovery, evaluation: tiedEvaluation('recoverable_api_error', 'quota_limit', 'quota_limit') },
+    { ...validResults[10], evaluation: tiedEvaluation('quota_limit', 'answer_question', 'answer_question') },
+    { ...approved, waiting_confidence: 0.8 },
+    {
+      ...approved,
+      evaluation: evaluation({
+        waiting_for: { type: 'choice', choice: 'credentials', probabilities: { credentials: 1 }, confidence: 0.9 },
+        risky: { type: 'noul', noul: 0.1 },
+      }),
+    },
+    {
+      ...approved,
+      evaluation: evaluation({
+        waiting_for: approved.evaluation.answers.waiting_for,
+        risky: { type: 'noul', noul: 0.8 },
+      }),
+    },
+    { ...approved, hidden: true },
+    { ...approved, schema_version: 1 },
+    { ...approved, waiting_for: 'terminal_text' },
+    { ...approved, reason_code: 'explicit_restriction' },
+    { ...approved, waiting_for: 'credentials' },
+    { ...recovery, reason_code: 'completed', waiting_for: 'completed' },
+    { ...recovery, waiting_for: 'credentials' },
+    { ...validResults[10], reason_code: 'recoverable_api_error', waiting_for: 'recoverable_api_error' },
+    { ...validResults[4], waiting_for: 'credentials' },
+    { ...completed, waiting_for: 'other' },
+    { ...validResults[1], proposed_action: actions.approve },
+    { ...approved, evaluation: null, waiting_confidence: null, risk_probability: null },
+    { ...approved, evaluation: null, waiting_confidence: 0.9 },
+    { ...approved, waiting_confidence: null },
+    { ...localManual, waiting_confidence: 0.9 },
+    { ...localManual, risk_probability: 0.1 },
+    { ...localManual, evaluation: evaluation({}) },
+    { ...localManual, waiting_for: 'credentials' },
+    { ...localManual, reason_code: 'ordinary_question' },
+    { ...localManual, proposed_action: actions.done },
+    { ...localManual, proposed_action: actions.recover },
+    { ...recovery, proposed_action: { ...actions.approve, not_before: '2026-09-29T10:00:00Z' } },
+    { ...validResults[10], proposed_action: { ...actions.quota, instruction: 'send a new command' } },
+    { ...recovery, proposed_action: { ...actions.recover, not_before: 'tomorrow' } },
+    { ...recovery, proposed_action: { ...actions.recover, instruction: 'run arbitrary command' } },
+  ];
+  for (const [index, value] of invalidResults.entries()) {
+    assert.equal(StopResultSchema.safeParse(value).success, false, `invalid result ${index} should fail`);
+  }
+
+  const version2Error = {
+    schema_version: 2,
+    request_id: null,
+    decision: 'error',
+    reason_code: 'invalid_input',
+    message: 'Input is invalid.',
+  };
+  assert.equal(StopResultSchema.safeParse(version2Error).success, true);
+  assert.equal(StopResultSchema.safeParse({ ...version2Error, schema_version: 1 }).success, false);
+
+  const version1Approval = {
+    schema_version: 1,
+    request_id: 'r1',
+    decision: 'approve',
+    reason_code: 'low_risk',
+    waiting_for: 'approve_command',
+    waiting_confidence: 0.9,
+    risk_probability: 0.1,
+    evaluation: evaluation({}),
+  };
+  assert.equal(ResultSchema.safeParse(version1Approval).success, true);
+  assert.equal(StopResultSchema.safeParse(version1Approval).success, false);
 });

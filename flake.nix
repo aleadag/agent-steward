@@ -12,7 +12,7 @@
           root = ./.;
           fileset = pkgs.lib.fileset.unions [
             ./package.json ./package-lock.json ./tsconfig.json ./src ./tests ./examples
-            ./skills ./README.md
+            ./skills ./plugins ./README.md
           ];
         };
         nodejs = pkgs.nodejs_22;
@@ -31,11 +31,15 @@
           runHook postCheck
         '';
         postInstall = ''
-          mkdir -p "$out/share/agent-steward/skills/agent-steward"
+          mkdir -p "$out/share/agent-steward/skills/agent-steward" "$out/share/agent-steward/herdr-plugin"
           cp skills/agent-steward/SKILL.md "$out/share/agent-steward/skills/agent-steward/SKILL.md"
+          cp plugins/agent-steward/herdr-plugin.toml plugins/agent-steward/run.sh "$out/share/agent-steward/herdr-plugin/"
+          ln -s ../../../bin/agent-steward-herdr-adapter "$out/share/agent-steward/herdr-plugin/agent-steward-herdr-adapter"
           rm -f "$out/bin/agent-steward"
           makeWrapper ${pkgs.nodejs_22}/bin/node "$out/bin/agent-steward" \
             --add-flags "$out/lib/node_modules/agent-steward/dist/src/main.js"
+          makeWrapper ${pkgs.nodejs_22}/bin/node "$out/bin/agent-steward-herdr-adapter" \
+            --add-flags "$out/lib/node_modules/agent-steward/dist/src/herdr-adapter/entry.js"
         '';
       };
     in {
@@ -53,14 +57,16 @@
       checks.${system} = {
         build = package;
         installed = pkgs.runCommand "agent-steward-installed-check" {
-          nativeBuildInputs = [ pkgs.nodejs_22 ];
+          nativeBuildInputs = [ pkgs.nodejs_22 pkgs.coreutils ];
         } ''
           mkdir -p "$TMPDIR/outside" "$TMPDIR/home" "$TMPDIR/xdg"
           cd "$TMPDIR/outside"
           env -i HOME="$TMPDIR/home" XDG_CONFIG_HOME="$TMPDIR/xdg" \
             AGENT_STEWARD_PACKAGE="${package}" \
             AGENT_STEWARD_SKILL_SOURCE="${./skills/agent-steward/SKILL.md}" \
-            ${pkgs.nodejs_22}/bin/node --test ${./tests/installed.test.mjs}
+            AGENT_STEWARD_PINNED_NODE="${pkgs.nodejs_22}/bin/node" \
+            AGENT_STEWARD_DIRNAME="${pkgs.coreutils}/bin/dirname" \
+            ${pkgs.nodejs_22}/bin/node --test ${./tests/installed.test.mjs} ${./tests/herdr-plugin.test.mjs}
           touch "$out"
         '';
       };

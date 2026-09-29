@@ -39,6 +39,20 @@ function evaluatorQuestions(): Questions {
   };
 }
 
+export function approvalPolicy(
+  automaticApprovalForbidden: boolean,
+  risk: number,
+  threshold: number,
+): {
+  proposed_action: { kind: 'approve_request' } | { kind: 'manual_review' };
+  reason_code: 'low_risk' | 'high_risk' | 'explicit_restriction';
+} {
+  if (automaticApprovalForbidden)
+    return { proposed_action: { kind: 'manual_review' }, reason_code: 'explicit_restriction' };
+  if (risk >= threshold) return { proposed_action: { kind: 'manual_review' }, reason_code: 'high_risk' };
+  return { proposed_action: { kind: 'approve_request' }, reason_code: 'low_risk' };
+}
+
 const ThresholdsSchema = z.strictObject({
   risky: z.number().finite().min(0).max(1),
   choiceConfidence: z.number().finite().min(0).max(1),
@@ -120,15 +134,10 @@ export async function assessApproval(
   } else if (waitingFor === 'answer_question' || waitingFor === 'credentials' || waitingFor === 'error_help') {
     decision = 'no_action';
     reasonCode = 'not_approval';
-  } else if (automaticApprovalForbidden) {
-    decision = 'manual_review';
-    reasonCode = 'explicit_restriction';
-  } else if (risk >= parsedThresholds.data.risky) {
-    decision = 'manual_review';
-    reasonCode = 'high_risk';
   } else {
-    decision = 'approve';
-    reasonCode = 'low_risk';
+    const policy = approvalPolicy(automaticApprovalForbidden, risk, parsedThresholds.data.risky);
+    decision = policy.proposed_action.kind === 'approve_request' ? 'approve' : 'manual_review';
+    reasonCode = policy.reason_code;
   }
 
   const result = ResultSchema.safeParse({

@@ -1,6 +1,6 @@
 # Agent-steward
 
-Agent-steward is a standalone decision CLI for task-routing previews and stopped-agent assessments. This release implements `session start --dry-run` and `approval check`; it does not launch an agent, create a session, inspect existing sessions, adjust effort, collect quota, or send approval input. Configuration describes a local inventory only. It does not install tools, change authentication, or activate an integration.
+Agent-steward's standalone decision CLI provides task-routing previews and stopped-agent assessments through `session start --dry-run` and `stop check`. The CLI does not launch an agent, create a session, inspect existing sessions, adjust effort, collect live quota, or send input to a stopped agent. Configuration describes a local inventory only. The separate bundled Herdr adapter is opt-in; building this package does not install or activate it.
 
 ## Install and run
 
@@ -37,24 +37,20 @@ These are optional manual instructions only. Agent-steward does not install skil
 agent-steward --help
 agent-steward --config ./config.json session start "Review the parser" --dry-run --json
 agent-steward --config ./config.json session start --dry-run -- "--help"
-agent-steward --config ./config.json approval check < stopped-state.json
+agent-steward --config ./config.json stop check < stopped-state.json
 ```
 
-The `--` separator ends option parsing. The third command routes the literal task `--help`; text after the separator is never treated as a CLI option. Before the separator, `--config <path>` is global and can appear before or after command tokens. Each route task must be exactly one argument; quote a multiword task rather than relying on the CLI to join or discard extra arguments. The final command reads user-prepared stopped-state JSON from stdin; it does not discover or create that file. Approval output is always JSON.
+The `--` separator ends option parsing. The third command routes the literal task `--help`; text after the separator is never treated as a CLI option. Before the separator, `--config <path>` is global and can appear before or after command tokens. Each route task must be exactly one argument; quote a multiword task rather than relying on the CLI to join or discard extra arguments. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
 
-JSON results use `schema_version: 1` and a `request_id`. A successful route contains `decision: "selected"`, the chosen candidate, quota facts, the exact planned executable and argument array, and pair/effort evaluation metadata. Its request ID identifies the evaluation, not a session. A local no-evidence approval result has this shape:
+Route results use `schema_version: 1`; stop results and stop errors use `schema_version: 2`. Both include a `request_id`. A successful route contains `decision: "selected"`, the chosen candidate, quota facts, the exact planned executable and argument array, and pair/effort evaluation metadata. Its request ID identifies the evaluation, not a session. When a stop observation has no meaningful context, the CLI returns this local result without calling Jev:
 
 ```json
-{"schema_version":1,"request_id":"request-42","decision":"manual_review","reason_code":"insufficient_context","waiting_for":null,"waiting_confidence":null,"risk_probability":null,"evaluation":null}
+{"schema_version":2,"request_id":"request-42","decision":"stop_decision","proposed_action":{"kind":"manual_review"},"reason_code":"insufficient_context","waiting_for":"other","waiting_confidence":null,"risk_probability":null,"evaluation":null}
 ```
 
-Errors also use one structured envelope, for example:
+Error envelopes have fixed messages and retain the command's schema version. For example, a route error is version 1 and a valid stop-command error is version 2. Malformed command-line arguments that do not select a command use the generic version-1 error.
 
-```json
-{"schema_version":1,"request_id":null,"decision":"error","reason_code":"missing_credentials","message":"Required credentials are missing."}
-```
-
-Routing exits 0 for a complete selected result and 1 for errors. Approval exits 0 for `approve`, 2 for `manual_review`, 3 for `no_action`, and 1 for errors. Check the structured result as well as its exit code; exit 0 is not authorization. `no_action` means no automatic approval input should be sent, not that a person has no reason to respond. Errors never accompany an approval or partial route.
+Routing exits 0 for a complete selected result and 1 for errors. `stop check` exits 0 for an approval, recovery, or quota-wait proposal, 2 for `manual_review`, 3 for `no_action`, and 1 for errors. Check the structured result as well as its exit code: no exit code authorizes delivery. `no_action` means no follow-up input should be sent, not that a person has no reason to respond. Errors never accompany a proposal or partial route.
 
 Routing first selects a tool/model pair, then selects one of that pair's configured thinking levels. A single configured level skips the second evaluation. Each Jev request has its own 30-second deadline with no retries, so a route can involve two sequential requests and two separate deadlines. Evaluation token usage measures Jev usage, not remaining subscription quota.
 
@@ -72,15 +68,33 @@ Start from [`examples/config.json`](examples/config.json). It shows GPT Astra th
 
 Account-wide windows apply to every candidate on that account; a pool window applies only to candidates using that exact configured pool. All applicable facts are retained. A missing or unmatched pool window, malformed/unreadable snapshot, expired validity time, passed reset, or future observation makes the affected quota unknown, never full. If any applicable window is stale, the summary is unknown and the stale remaining percentage is withheld. The CLI does not fetch or refresh live quota.
 
-Config files, snapshots, approval stdin, and Jev request/response bodies are each limited to 1,048,576 UTF-8 bytes and 64 nested object/array levels. Inputs over a limit are rejected rather than truncated.
+Config files, snapshots, stop stdin, and Jev request/response bodies are each limited to 1,048,576 UTF-8 bytes and 64 nested object/array levels. Inputs over a limit are rejected rather than truncated.
 
 ## Decision and privacy boundaries
 
-A route preview sends the supplied task, configured candidate facts, applicable snapshot facts, and fixed evaluator questions to `https://api.typesafe.ai/v1/systemone`. Approval sends the supplied stopped-agent context and optional structured action hints. Send only the context needed. Agent-steward does not inspect terminal history, repository files, provider credentials, or live account state, and it does not persist request/response bodies. An absent context and action produce local manual review without a Jev call or API key requirement.
+A route preview sends the supplied task, configured candidate facts, applicable snapshot facts, and fixed evaluator questions to `https://api.typesafe.ai/v1/systemone`. `stop check` sends the supplied version-2 observation, including context and any structured action hints, with fixed classification questions when evaluation is needed. Send only the excerpt around the current stop. Agent-steward does not inspect terminal history, repository files, provider credentials, live account state, or Herdr, and it does not persist request/response bodies. If context is absent, blank, null, or empty, even action hints produce local manual review without a Jev call or API-key requirement. A meaningful context is required before Jev evaluation.
 
-Before sending, the CLI rejects the configured TypeSafe key if it appears in outbound data and checks a limited set of recognizable credential patterns: private-key headers, common `sk-`/GitHub token prefixes, AWS `AKIA` keys, Bearer tokens, and values under credential-named fields. Detection is incomplete and may both miss unfamiliar/encoded secrets and reject token-like ordinary text. Do not rely on it to make sensitive input safe.
+Before sending, the CLI rejects the configured TypeSafe key if it appears in outbound data and checks a limited set of recognizable credential patterns: private-key headers, common `sk-`/GitHub token prefixes, AWS `AKIA` keys, Bearer tokens, and values under credential-named fields. It also checks caller IDs and output for the configured key. Detection is incomplete and may miss unfamiliar or encoded secrets, while rejecting token-like ordinary text. Do not rely on it to make sensitive input safe. The opt-in evaluation sends the supplied context to TypeSafe.
 
-Approval results distinguish `approve`, `manual_review`, and `no_action`. The waiting classification must identify a current command/edit permission request before an approval assessment can return `approve`; ties, low confidence, `other`, explicit caller restrictions, or risk at/above the threshold require manual review. Jev's Noul value is not a calibrated probability of harm. Set `automatic_approval_forbidden: true` when the caller knows a restriction applies; `false` never grants permission. Existing permission checks remain binding, and the assessment does not execute an action or authorize changing another session. A future executor would have to verify the exact current pending request and preserve existing controls.
+A stop observation identifies the agent and pane, current status and episode, and retry history. Those adapter-supplied fields are separate from untrusted context and action text. Approval proposals require a blocked agent, meaningful context, and a nonblank `pending_action.action`; they do not approve or execute anything. The assessment preserves the existing restriction and risk cutoff: ties, low confidence, unclear state, explicit caller restrictions, or risk at/above the threshold require `manual_review`. Jev's Noul value is not a calibrated probability of harm. `automatic_approval_forbidden: true` records a known restriction; `false` never grants permission.
+
+Other stop proposals are a fixed recovery instruction for a classified recoverable API error, a wait deadline for a classified quota limit, `manual_review` for uncertain or non-actionable cases, and `no_action` only for a settled `done` state. The CLI neither waits nor sends the instruction. A caller must re-read the agent before recovery delivery; approval additionally requires proof of the exact current permission request and accepting control. It must preserve the tool's existing permission controls, never guess a UI key, and never treat a proposal as a capability. Asserted reset data does not establish a live account or quota binding, and this CLI does not collect live quota. Stop assessments do not launch, restart, or change another session.
+
+### Optional Herdr adapter (not activated)
+
+The bundled Herdr 0.9.1 adapter operates only on explicitly configured Pi/Codex pane targets while its visible supervisor pane owns the local lease. It forwards at most 12 returned detection lines (2,048 bytes) for classification; Herdr may mark the read truncated and its read revision is independent of `agent.get`. The excerpt can include earlier screen lines and may be sent to TypeSafe. It is not proof of a current permission request or error. For best-effort recovery, a fresh matching classification plus ready-state and same-session checks may trigger the fixed conditional instruction; an older error can cause an unnecessary prompt. Approval still requires separate proof of the exact current request and accepting control. The adapter does not install a plugin, start an agent, or restart a process.
+
+After separate review and explicit authorization, an operator can link the **disabled** packaged plugin without a source checkout (replace `<package-path>` with the absolute Nix build output path):
+
+```sh
+herdr plugin link --disabled "<package-path>/share/agent-steward/herdr-plugin"
+```
+
+The package supplies `herdr-plugin.toml`, `run.sh` and a relative link to the pinned-Node adapter wrapper. Linking disabled is not activation: do not enable the plugin or open its `supervisor` pane in a normal Herdr session without a separate opt-in. Before a future opt-in, configure only intended Pi/Codex pane IDs in the plugin's `targets.json` as `{"pane_ids":["w1:p1"]}` (find its directory using `herdr plugin config-dir agent-steward`), then independently review that pane's bounded text disclosure and retry behavior. Packaging tests use an isolated fake Herdr socket and CLI; they do not establish safe live activation.
+
+A recovery proposal waits until its episode-anchored deadline, then re-observes and asks `stop check` again before using Herdr's `agent prompt` command with the fixed instruction. Only an unchanged, ready `idle` agent is eligible. This is best-effort babysitting, not proof that the error is still current: the instruction asks the agent to check prior success and do nothing if the failure is no longer current. Blocked dialogs, including error and permission UI, require a person: no Codex/Pi non-approval dismissal has been proven. `done` is not yet eligible because the current bounded observation path cannot verify a fresh recovery classification for that status. Approval proposals always hand off to a human and never send keys: Herdr 0.9.1's installed Pi lifecycle integration and Codex session hook expose no exact current permission-request identity, action or accepting control. The default verifier returns no proof, and neither a proposed `approve_request`, a detection digest, a blocked status nor a configured key grants authority. There is no approval-key configuration or sending path; if a future independently tested tool-specific verifier and sender are added, `1` is the requested default with optional per-tool override **only after** proof of the current request and accepting control. Quota exhaustion schedules bounded rechecks (5, 15, 45, 120 minutes, then up to six hours) and hands off at 24 hours; it cannot verify account-bound reset times. A prompt timeout, stall, or unknown write outcome is recorded as uncertain and is never automatically resent.
+
+Human handoffs emit fixed, credential-free stderr text and, when Herdr supplies its executable path, call Herdr 0.9.1 `notification show` with a fixed title and body. A successful notification call does not prove that a person saw the toast. Socket device/inode is only a local server-instance proxy, not authenticated session identity. Disposable tests exercised live Jev classification on synthetic context and one adapter-originated conditional prompt to a ready Pi with a synthetic recovery decision; they did not prove genuine-error recovery or human notification visibility. Enabling the plugin in a normal session still needs separate review and explicit authorization.
 
 Stable error codes are `invalid_input`, `invalid_config`, `missing_credentials`, `credential_detected`, `invalid_response`, `evaluation_failed`, and `execution_unavailable`. Messages are fixed and do not contain paths, submitted data, credentials, or raw evaluator errors. Diagnostics use stderr; JSON stdout contains one result and a newline.
 

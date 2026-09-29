@@ -1,0 +1,20 @@
+id = "agent-steward"
+name = "Agent Steward"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Opt-in stopped-agent scheduler; opening the visible supervisor pane can deliver gated recovery prompts. Approvals never send keys. Unsupported Herdr versions must not link this plugin."
+platforms = ["linux"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["sh", "run.sh", "event"]
+
+[[events]]
+on = "pane.exited"
+command = ["sh", "run.sh", "event"]
+
+[[panes]]
+id = "supervisor"
+title = "Agent Steward supervisor"
+placement = "split"
+command = ["sh", "run.sh", "scheduler"]

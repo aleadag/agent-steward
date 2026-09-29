@@ -44,7 +44,8 @@ test('installed help needs neither checkout nor global Node and skill bytes matc
     const result = run(['--help']);
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /session start/);
-    assert.match(result.stdout, /approval check/);
+    assert.match(result.stdout, /stop check/);
+    assert.doesNotMatch(result.stdout, /approval check/);
     const skill = readFileSync(join(pkg, 'share/agent-steward/skills/agent-steward/SKILL.md'), 'utf8');
     assert.ok(skill.includes('name: agent-steward'));
     assert.equal(skill, readFileSync(skillSource, 'utf8'));
@@ -66,22 +67,47 @@ test('installed failures stay local, structured, and credential-free', { skip: !
       'invalid_config',
     );
 
-    const approval = {
-      schema_version: 1,
+    const stop = {
+      schema_version: 2,
       request_id: 'installed-request',
-      agent: { id: 'agent', tool: 'codex' },
-      status: 'stopped',
+      agent: { id: 'agent', tool: 'codex', pane_id: 'w1:p1', session_id: null },
+      status: 'blocked',
+      current_episode_id: 'episode-1',
       context: 'A current stopped task needs an assessment.',
+      pending_action: { action: 'Assess the current request' },
+      automatic_approval_forbidden: false,
+      retry: {
+        failure_episode_id: 'episode-1',
+        first_observed_at: '2026-09-29T10:00:00Z',
+        attempt_count: 0,
+        last_attempt_at: null,
+        quota_check_count: 0,
+        last_quota_check_at: null,
+      },
     };
     mkdirSync(join(xdg, 'agent-steward'));
     writeConfig(join(xdg, 'agent-steward', 'config.json'), { tools: [], accounts: [], candidates: [] });
-    const missingKey = parsed(run(['approval', 'check'], JSON.stringify(approval)));
+
+    const local = { ...stop, request_id: 'installed-local', context: null };
+    const localResult = run(['stop', 'check'], JSON.stringify(local));
+    assert.equal(localResult.status, 2);
+    assert.equal(parsed(localResult).schema_version, 2);
+    assert.equal(parsed(localResult).reason_code, 'insufficient_context');
+    assert.equal(parsed(localResult).request_id, 'installed-local');
+
+    const missingKey = parsed(run(['stop', 'check'], JSON.stringify(stop)));
+    assert.equal(missingKey.schema_version, 2);
     assert.equal(missingKey.reason_code, 'missing_credentials');
     assert.equal(missingKey.request_id, 'installed-request');
 
-    const malformed = parsed(run(['approval', 'check'], '{'));
+    const malformed = parsed(run(['stop', 'check'], '{'));
+    assert.equal(malformed.schema_version, 2);
     assert.equal(malformed.reason_code, 'invalid_input');
     assert.equal(malformed.request_id, null);
+
+    const obsolete = parsed(run(['approval', 'check'], JSON.stringify(stop)));
+    assert.equal(obsolete.schema_version, 1);
+    assert.equal(obsolete.reason_code, 'invalid_input');
   });
 });
 

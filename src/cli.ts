@@ -1,5 +1,5 @@
-import { ApprovalInputSchema, StewardError, errorResult } from './contracts.js';
-import type { ErrorResult, Result, SelectedResult } from './contracts.js';
+import { StopInputSchema, StopResultSchema, StewardError, errorResult } from './contracts.js';
+import type { ErrorResult, Result, SelectedResult, StopInput, StopResult } from './contracts.js';
 import { loadConfig } from './config.js';
 import { validateCandidateSyntax } from './commands.js';
 import { assertByteLength, assertJsonDepth } from './limits.js';
@@ -8,12 +8,12 @@ import { assertNoCredentials } from './privacy.js';
 import { makeEvaluator } from './jev.js';
 import type { Evaluate, HttpPost, Questions } from './jev.js';
 import { route } from './routing.js';
-import { assessApproval } from './approval.js';
+import { assessStop } from './triage.js';
 
 export type Invocation =
   | { kind: 'help' }
   | { kind: 'route'; config?: string; task: string; dryRun: boolean; json: boolean }
-  | { kind: 'approval'; config?: string };
+  | { kind: 'stop'; config?: string };
 
 export type Runtime = {
   env: { HOME?: string; XDG_CONFIG_HOME?: string; TYPESAFE_API_KEY?: string };
@@ -33,11 +33,11 @@ Usage:
   agent-steward --help
   agent-steward [--config <path>] session start <task> [--dry-run] [--json]
   agent-steward [--config <path>] session start --dry-run -- <task>
-  agent-steward [--config <path>] approval check < stopped-state.json
+  agent-steward [--config <path>] stop check < stopped-state.json
 
-Only session start --dry-run and approval check are available. A non-dry session start
+Only session start --dry-run and stop check are available. A non-dry session start
 fails before configuration or API access because launching is unavailable in this release.
-Approval check always reads JSON from stdin and writes a JSON result.
+Stop check reads JSON from stdin and writes a version-2 JSON result.
 `;
 
 const DIAGNOSTICS: Record<string, string> = {
@@ -88,20 +88,15 @@ export function parseArgs(argv: readonly string[]): Invocation {
           } else if (token.startsWith('-')) invalidInput();
         }
       } else if (
-        !(
-          commandTokens[0] === 'approval' &&
-          commandTokens[1] === 'check' &&
-          commandTokens.length === 2 &&
-          separator < 0
-        )
+        !(commandTokens[0] === 'stop' && commandTokens[1] === 'check' && commandTokens.length === 2 && separator < 0)
       )
         invalidInput();
     }
     return { kind: 'help' };
   }
-  if (commandTokens[0] === 'approval' && commandTokens[1] === 'check') {
+  if (commandTokens[0] === 'stop' && commandTokens[1] === 'check') {
     if (commandTokens.length !== 2 || separator >= 0) invalidInput();
-    return config === undefined ? { kind: 'approval' } : { kind: 'approval', config };
+    return config === undefined ? { kind: 'stop' } : { kind: 'stop', config };
   }
   if (commandTokens[0] !== 'session' || commandTokens[1] !== 'start') invalidInput();
 
@@ -154,7 +149,18 @@ function safeError(error: unknown, requestId: string | null, apiKey: string): Er
   }
 }
 
-function emitJson(runtime: Runtime, value: Result): void {
+function safeStopError(error: unknown, requestId: string | null, apiKey: string): StopResult {
+  const id = safeRequestId(requestId, apiKey);
+  let result = { ...errorResult(error, id), schema_version: 2 as const };
+  try {
+    assertNoCredentials(result, apiKey);
+  } catch {
+    result = { ...errorResult(new StewardError('credential_detected'), safeRequestId(id, apiKey)), schema_version: 2 };
+  }
+  return result;
+}
+
+function emitJson(runtime: Runtime, value: Result | StopResult): void {
   runtime.stdout(`${JSON.stringify(value)}\n`);
 }
 
@@ -230,7 +236,19 @@ export function renderDecisionCard(result: SelectedResult): string {
   return `${lines.join('\n')}\n`;
 }
 
-function decisionExitCode(result: Result): number {
+function decisionExitCode(result: Result | StopResult): number {
+  if (result.decision === 'stop_decision') {
+    switch (result.proposed_action.kind) {
+      case 'approve_request':
+      case 'send_recovery_instruction':
+      case 'wait_for_quota':
+        return 0;
+      case 'manual_review':
+        return 2;
+      case 'no_action':
+        return 3;
+    }
+  }
   switch (result.decision) {
     case 'selected':
     case 'approve':
@@ -257,11 +275,11 @@ function emitError(
   return 1;
 }
 
-async function readApprovalInput(
+async function readStopInput(
   runtime: Runtime,
   onRequestId: (id: string | null) => void,
   apiKey: string,
-): Promise<ReturnType<typeof ApprovalInputSchema.parse>> {
+): Promise<StopInput> {
   let contents: string;
   try {
     contents = await runtime.readStdin();
@@ -290,7 +308,7 @@ async function readApprovalInput(
   }
   onRequestId(requestId);
 
-  const parsed = ApprovalInputSchema.safeParse(raw);
+  const parsed = StopInputSchema.safeParse(raw);
   if (!parsed.success) throw new StewardError('invalid_input');
   return parsed.data;
 }
@@ -331,9 +349,9 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
 
   const humanRoute = invocation.kind === 'route' && !invocation.json;
   try {
-    let approvalInput: ReturnType<typeof ApprovalInputSchema.parse> | undefined;
-    if (invocation.kind === 'approval') {
-      approvalInput = await readApprovalInput(
+    let stopInput: StopInput | undefined;
+    if (invocation.kind === 'stop') {
+      stopInput = await readStopInput(
         runtime,
         (id) => {
           requestId = id;
@@ -367,17 +385,35 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       return evaluator(state, questions);
     };
 
-    let result: Result;
+    let result: Result | StopResult;
     if (invocation.kind === 'route') {
       result = await route({ task: invocation.task, requestId: requestId!, config, quota: quota!, evaluate });
     } else {
-      result = await assessApproval(approvalInput!, { thresholds: config.thresholds, evaluate });
+      result = await assessStop(stopInput!, { thresholds: config.thresholds, evaluate, now: runtime.now() });
+    }
+
+    if (invocation.kind === 'stop') {
+      let safeResult: StopResult;
+      try {
+        assertNoCredentials(result, apiKey);
+        const parsed = StopResultSchema.safeParse(result);
+        if (!parsed.success) throw new StewardError('invalid_response');
+        safeResult = parsed.data;
+      } catch (error) {
+        const safeFailure =
+          error instanceof StewardError && error.code === 'invalid_response'
+            ? error
+            : new StewardError('credential_detected');
+        safeResult = safeStopError(safeFailure, requestId, apiKey);
+      }
+      emitJson(runtime, safeResult);
+      return decisionExitCode(safeResult);
     }
 
     let safeResult: Result;
     try {
       assertNoCredentials(result, apiKey);
-      safeResult = result;
+      safeResult = result as Result;
     } catch {
       safeResult = errorResult(new StewardError('credential_detected'), safeRequestId(requestId, apiKey));
     }
@@ -387,7 +423,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       safeResult = errorResult(new StewardError('credential_detected'), null);
     }
 
-    if (safeResult.decision === 'selected' && invocation.kind === 'route' && !invocation.json) {
+    if (safeResult.decision === 'selected' && !invocation.json) {
       runtime.stdout(renderDecisionCard(safeResult));
     } else {
       emitJson(runtime, safeResult);
@@ -395,6 +431,10 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     }
     return decisionExitCode(safeResult);
   } catch (error) {
+    if (invocation.kind === 'stop') {
+      emitJson(runtime, safeStopError(error, requestId, apiKey));
+      return 1;
+    }
     return emitError(runtime, error, requestId, apiKey, humanRoute);
   }
 }
