@@ -403,6 +403,21 @@ test('error envelopes expose only catalogued messages and safe codes', () => {
   assert.equal(unknown.message.includes('secret-token'), false);
 });
 
+test('live-launch errors use fixed credential-free schema-1 envelopes', () => {
+  const expectedMessages = {
+    interactive_terminal_required: 'Interactive terminal input and output are required.',
+    launch_failed: 'Agent launch failed or its outcome is uncertain.',
+  };
+
+  for (const [code, message] of Object.entries(expectedMessages)) {
+    const result = errorResult(new StewardError(code), 'req');
+    const parsed = ResultSchema.parse(result);
+    assert.equal(parsed.schema_version, 1);
+    assert.equal(parsed.reason_code, code);
+    assert.equal(parsed.message, message);
+  }
+});
+
 test('version-2 stop input strictly validates adapter observations and retry/reset metadata', () => {
   const { StopInputSchema } = contractExports;
   assert.equal(typeof StopInputSchema?.parse, 'function');

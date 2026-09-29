@@ -10,15 +10,19 @@ const NOW = new Date('2026-09-28T10:30:00Z');
 function runtime(overrides = {}) {
   const out = [],
     err = [],
-    reads = [];
+    reads = [],
+    launches = [];
+  const { launch: launchOverride, ...ioOverrides } = overrides;
   const cfg = config({ accounts: [], candidates: [] });
   return {
     out,
     err,
     reads,
+    launches,
     io: {
       env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg' },
       cwd: '/isolated/work',
+      terminal: { stdin: true, stdout: true },
       readText: async (path) => {
         reads.push(path);
         return JSON.stringify(cfg);
@@ -31,7 +35,12 @@ function runtime(overrides = {}) {
       post: async () => {
         throw new Error('unexpected post');
       },
-      ...overrides,
+      launch: async (command) => {
+        launches.push(command);
+        if (launchOverride === undefined) throw new Error('unexpected launch');
+        return launchOverride(command);
+      },
+      ...ioOverrides,
     },
   };
 }
@@ -92,22 +101,162 @@ function stopAnswer(wire, waitingFor = 'recoverable_api_error', risk = 0.1, conf
   });
 }
 
-test('launch unavailable before config or API and JSON stdout remains one envelope', async () => {
-  const { io, out, err, reads } = runtime({
+test('live JSON is rejected before config, evaluation, or launch', async () => {
+  let posts = 0;
+  const { io, out, err, reads, launches } = runtime({
     readText: async () => {
       throw new Error('must not read');
     },
     post: async () => {
+      posts++;
       throw new Error('must not evaluate');
     },
   });
   const code = await run(['session', 'start', 'Task', '--json'], io);
   assert.equal(code, 1);
-  assert.equal(result(out).reason_code, 'execution_unavailable');
+  assert.equal(result(out).schema_version, 1);
+  assert.equal(result(out).reason_code, 'invalid_input');
   assert.equal(result(out).request_id, 'generated-1');
   assert.equal(out.length, 1);
   assert.deepEqual(reads, []);
+  assert.equal(posts, 0);
+  assert.deepEqual(launches, []);
   assert.ok(err.every((line) => !line.includes('Task')));
+});
+
+test('live launch requires both terminal streams before config, evaluation, or spawn', async () => {
+  for (const terminal of [
+    { stdin: false, stdout: true },
+    { stdin: true, stdout: false },
+  ]) {
+    let posts = 0,
+      launchCalls = 0;
+    const { io, out, reads } = runtime({
+      terminal,
+      readText: async () => {
+        throw new Error('must not read');
+      },
+      post: async () => {
+        posts++;
+        throw new Error('must not evaluate');
+      },
+      launch: async () => {
+        launchCalls++;
+        return 0;
+      },
+    });
+    assert.equal(await run(['session', 'start', 'Task'], io), 1);
+    assert.equal(result(out).reason_code, 'interactive_terminal_required');
+    assert.equal(out.length, 1);
+    assert.deepEqual(reads, []);
+    assert.equal(posts, 0);
+    assert.equal(launchCalls, 0);
+  }
+});
+
+test('live task controls are rejected before config or evaluation', async () => {
+  let posts = 0;
+  const { io, out, reads, launches } = runtime({
+    readText: async () => {
+      throw new Error('must not read');
+    },
+    post: async () => {
+      posts++;
+      throw new Error('must not evaluate');
+    },
+  });
+  assert.equal(await run(['session', 'start', 'unsafe\u0000task'], io), 1);
+  assert.equal(result(out).reason_code, 'invalid_input');
+  assert.deepEqual(reads, []);
+  assert.equal(posts, 0);
+  assert.deepEqual(launches, []);
+});
+
+test('live route launches only the selected native command with a prefixed original task', async () => {
+  const candidates = [
+    candidate(),
+    candidate({
+      id: 'pi-chosen',
+      tool: 'pi',
+      provider: 'openai-codex',
+      model: 'pi-model',
+      thinking_levels: [
+        { id: 'medium', description: 'Configured medium effort' },
+        { id: 'high', description: 'Configured high effort' },
+      ],
+    }),
+  ];
+  const { post, requests } = fakePost((wire, index) =>
+    index === 1
+      ? jevResponse({ pair: choiceAnswer({ 'codex-astra': 0.1, 'pi-chosen': 0.9 }) })
+      : jevResponse({ effort: choiceAnswer({ medium: 0.2, high: 0.8 }) }),
+  );
+  const task = '-review @private.md\nKeep the second line';
+  const commandCalls = [];
+  const { io, out, err, launches } = runtime({
+    env: {
+      HOME: '/isolated/home',
+      XDG_CONFIG_HOME: '/isolated/xdg',
+      TYPESAFE_API_KEY: 'SyntheticKey-Not-Pattern-4f91',
+    },
+    readText: async (path) =>
+      path === CONFIG_PATH ? JSON.stringify(routeConfig(candidates)) : JSON.stringify(snapshot([])),
+    post,
+    launch: async (command) => {
+      commandCalls.push(command);
+      return 7;
+    },
+  });
+
+  assert.equal(await run(['session', 'start', '--', task], io), 7);
+  assert.equal(requests.length, 2);
+  assert.equal(commandCalls.length, 1);
+  assert.deepEqual(launches, [
+    {
+      executable: 'pi',
+      args: ['--provider', 'openai-codex', '--model', 'pi-model', '--thinking', 'high', '--', `User task:\n${task}`],
+    },
+  ]);
+  assert.deepEqual(out, []);
+  assert.match(err.join(''), /provider requested\/unverified: "openai-codex"/);
+  assert.match(err.join(''), /model requested\/unverified: "pi-model"/);
+  assert.match(err.join(''), /thinking requested\/unverified: "high"/);
+  assert.match(err.join(''), /account requested\/unverified: "shared"/);
+  assert.doesNotMatch(err.join(''), /-review @private\.md|second line|SyntheticKey-Not-Pattern-4f91/);
+});
+
+test('uncertain launch failure emits one sanitized launch error without retry or re-evaluation', async () => {
+  const candidates = [
+    candidate({
+      thinking_levels: [
+        { id: 'low', description: 'Configured low effort' },
+        { id: 'high', description: 'Configured high effort' },
+      ],
+    }),
+  ];
+  const { post, requests } = fakePost((wire, index) =>
+    index === 1
+      ? jevResponse({ pair: choiceAnswer({ 'codex-astra': 1 }) })
+      : jevResponse({ effort: choiceAnswer({ low: 0.1, high: 0.9 }) }),
+  );
+  const { io, out, err, launches } = runtime({
+    env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
+    readText: async (path) =>
+      path === CONFIG_PATH ? JSON.stringify(routeConfig(candidates)) : JSON.stringify(snapshot([])),
+    post,
+    launch: async () => {
+      throw new Error('private path and token');
+    },
+  });
+
+  assert.equal(await run(['session', 'start', 'sensitive task'], io), 1);
+  assert.equal(requests.length, 2);
+  assert.equal(launches.length, 1);
+  assert.equal(out.length, 1);
+  assert.equal(result(out).reason_code, 'launch_failed');
+  assert.equal(result(out).message, 'Agent launch failed or its outcome is uncertain.');
+  assert.equal(result(out).request_id, 'generated-1');
+  assert.doesNotMatch(out.join('') + err.join(''), /private path|token|sensitive task/);
 });
 
 test('parser preserves the standard task data boundary and rejects options and extra arguments', () => {
@@ -164,7 +313,10 @@ test('help lists exactly implemented forms and requires no configuration or cred
     },
   });
   assert.equal(await run(['--help'], io), 0);
-  assert.match(out.join(''), /session start <task> \[--dry-run\] \[--json\]/);
+  assert.match(out.join(''), /session start <task>\n/);
+  assert.match(out.join(''), /session start <task> --dry-run \[--json\]/);
+  assert.match(out.join(''), /Live session start requires terminal input and output/);
+  assert.match(out.join(''), /Live starts do not support --json/);
   assert.match(out.join(''), /stop check/);
   assert.doesNotMatch(out.join(''), /approval check/);
   assert.doesNotMatch(out.join(''), /session show|account list|usage refresh|choose-effort/);
@@ -237,12 +389,14 @@ test('human route card contains complete facts, command and explicit limitations
 test('JSON route returns one complete schema-v1 result with a generated request ID', async () => {
   const cfg = routeConfig();
   const { post, requests } = fakePost(routeAnswer);
-  const { io, out, err } = runtime({
+  const { io, out, err, launches } = runtime({
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
     readText: async (path) => (path === CONFIG_PATH ? JSON.stringify(cfg) : JSON.stringify(snapshot([]))),
     post,
   });
+  io.terminal = { stdin: false, stdout: false };
   assert.equal(await run(['session', 'start', 'Review', '--dry-run', '--json'], io), 0);
+  assert.deepEqual(launches, []);
   const parsed = result(out);
   assert.equal(parsed.schema_version, 1);
   assert.equal(parsed.decision, 'selected');
@@ -375,8 +529,9 @@ test('stop JSON exits are proposal 0, manual review 2, no action 3, errors 1', a
 
 test('insufficient-context stop remains local without an API key or transport', async () => {
   let posts = 0;
-  const { io, out, reads, err } = runtime({
+  const { io, out, reads, err, launches } = runtime({
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg' },
+    terminal: { stdin: false, stdout: false },
     readStdin: async () =>
       JSON.stringify(
         stopInput({ context: null, pending_action: { action: 'Retry the operation', target: 'current task' } }),
@@ -396,6 +551,7 @@ test('insufficient-context stop remains local without an API key or transport', 
   assert.deepEqual(reads, [CONFIG_PATH]);
   assert.equal(posts, 0);
   assert.deepEqual(err, []);
+  assert.deepEqual(launches, []);
 });
 
 test('configured optional key is captured for local and early-error request-ID privacy', async () => {
@@ -496,7 +652,7 @@ test('configured optional key is captured for local and early-error request-ID p
     },
   });
   assert.equal(await run(['session', 'start', 'task', '--json'], unavailable.io), 1);
-  assert.equal(result(unavailable.out).reason_code, 'execution_unavailable');
+  assert.equal(result(unavailable.out).reason_code, 'invalid_input');
   assert.equal(result(unavailable.out).request_id, 'safe-generated-id');
   assert.equal(reads, 0);
   assert.equal(posts, 0);

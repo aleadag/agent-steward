@@ -9,6 +9,8 @@ import { makeEvaluator } from './jev.js';
 import type { Evaluate, HttpPost, Questions } from './jev.js';
 import { route } from './routing.js';
 import { assessStop } from './triage.js';
+import { assertLiveTask, buildNativeLaunch } from './launch.js';
+import type { NativeLaunch } from './launch.js';
 
 export type Invocation =
   | { kind: 'help' }
@@ -25,18 +27,24 @@ export type Runtime = {
   now: () => Date;
   newRequestId: () => string;
   post: HttpPost;
+  terminal: { stdin: boolean; stdout: boolean };
+  launch: (command: NativeLaunch) => Promise<number>;
 };
 
 const HELP = `agent-steward - standalone task routing and stopped-agent decisions
 
 Usage:
   agent-steward --help
-  agent-steward [--config <path>] session start <task> [--dry-run] [--json]
+  agent-steward [--config <path>] session start <task>
+  agent-steward [--config <path>] session start <task> --dry-run [--json]
   agent-steward [--config <path>] session start --dry-run -- <task>
   agent-steward [--config <path>] stop check < stopped-state.json
 
-Only session start --dry-run and stop check are available. A non-dry session start
-fails before configuration or API access because launching is unavailable in this release.
+Live session start requires terminal input and output and launches the selected native agent in the foreground.
+Live starts do not support --json. Dry-run prints a route preview without launching; --json returns that preview as JSON.
+The task is passed in argv and may appear briefly in local process listings; do not include secrets.
+Provider, model, thinking level and account are requested, not verified; no steward session ID is created.
+Native permission controls remain with the selected tool. The CLI does not invoke the optional Herdr wrapper.
 Stop check reads JSON from stdin and writes a version-2 JSON result.
 `;
 
@@ -343,7 +351,14 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       return emitError(runtime, error, requestId, apiKey, !invocation.json);
     }
     if (!invocation.dryRun) {
-      return emitError(runtime, new StewardError('execution_unavailable'), requestId, apiKey, !invocation.json);
+      if (invocation.json) return emitError(runtime, new StewardError('invalid_input'), requestId, apiKey, false);
+      if (!runtime.terminal.stdin || !runtime.terminal.stdout)
+        return emitError(runtime, new StewardError('interactive_terminal_required'), requestId, apiKey, true);
+      try {
+        assertLiveTask(invocation.task);
+      } catch (error) {
+        return emitError(runtime, error, requestId, apiKey, true);
+      }
     }
   }
 
@@ -423,6 +438,22 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       safeResult = errorResult(new StewardError('credential_detected'), null);
     }
 
+    if (!invocation.dryRun && safeResult.decision === 'selected') {
+      const command = buildNativeLaunch(safeResult.planned_command, invocation.task);
+      const summary =
+        `agent-steward: requested tool=${jsonValue(safeResult.selected.tool)}; ` +
+        `provider requested/unverified: ${jsonValue(safeResult.selected.provider)}; ` +
+        `model requested/unverified: ${jsonValue(safeResult.selected.model)}; ` +
+        `thinking requested/unverified: ${jsonValue(safeResult.selected.thinking_level)}; ` +
+        `account requested/unverified: ${jsonValue(safeResult.selected.account_id)}\n`;
+      assertNoCredentials(summary, apiKey);
+      runtime.stderr(summary);
+      try {
+        return await runtime.launch(command);
+      } catch {
+        return emitError(runtime, new StewardError('launch_failed'), requestId, apiKey, true);
+      }
+    }
     if (safeResult.decision === 'selected' && !invocation.json) {
       runtime.stdout(renderDecisionCard(safeResult));
     } else {

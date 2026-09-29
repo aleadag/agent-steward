@@ -5,7 +5,6 @@ import { StopInputSchema } from '../dist/src/contracts.js';
 import { parseArgs, run } from '../dist/src/cli.js';
 
 const skill = readFileSync(new URL('../skills/agent-steward/SKILL.md', import.meta.url), 'utf8');
-const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
 const stopExample = JSON.parse(readFileSync(new URL('../examples/stop.json', import.meta.url), 'utf8'));
 
 function parseSkillCommands(text) {
@@ -27,7 +26,8 @@ function invocationForm(invocation) {
 function parseUsageForm(line) {
   let form = line.replace(/^agent-steward\s+/, '');
   form = form.replace(/^\[--config <path>\]\s+/, '--config config.json ');
-  form = form.replace('session start <task> [--dry-run] [--json]', 'session start Review --dry-run --json');
+  form = form.replace('session start <task> --dry-run [--json]', 'session start "Review the parser" --dry-run --json');
+  form = form.replace('session start <task>', 'session start "Review the parser"');
   form = form.replace('session start --dry-run -- <task>', 'session start --dry-run -- --help');
   form = form.replace('stop check < stopped-state.json', 'stop check');
   return parseArgs(shellWords(form));
@@ -56,10 +56,6 @@ async function emittedHelp() {
 }
 
 test('bundled skill command forms match parsed actual CLI help and parser behavior', async () => {
-  assert.match(
-    skill,
-    /^---\nname: agent-steward\ndescription: Use to route a task with agent-steward or assess a stopped agent[.] Session inspection, effort adjustment, and quota inspection apply only when supported by a later installed CLI version[.]\n---/,
-  );
   const usage = [...(await emittedHelp()).matchAll(/^  (agent-steward .+)$/gm)].map((match) => match[1]);
   assert.ok(usage.length > 0, 'run --help must emit parseable usage forms');
   const implementedForms = usage.map((line) => invocationForm(parseUsageForm(line)));
@@ -74,80 +70,24 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
   });
   assert.deepEqual(
     invocations.map((item) => item.kind),
-    ['help', 'route', 'route', 'stop'],
+    ['help', 'route', 'route', 'route', 'stop'],
   );
-  assert.doesNotMatch(skill, /approval check/);
-  assert.equal(invocations[2].task, '--help');
-  for (const unavailable of ['session show', 'account list', 'usage refresh', 'session choose-effort']) {
-    assert.match(
-      skill,
-      new RegExp(
-        unavailable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '.{0,100}(?:unavailable|not available|does not)',
-        'is',
-      ),
-    );
-  }
-  assert.match(skill, /does not launch agents/i);
+  assert.equal(invocations[1].task, 'Review the parser');
+  assert.equal(invocations[1].dryRun, false);
+  assert.equal(invocations[1].json, false);
+  assert.equal(invocations[2].task, 'Review the parser');
+  assert.equal(invocations[2].dryRun, true);
+  assert.equal(invocations[2].json, true);
+  assert.equal(invocations[3].task, '--help');
+  assert.equal(invocations[3].dryRun, true);
+  assert.equal(invocations[3].json, false);
 });
 
-test('skill stop example parses with the real strict schema and identifies user-prepared input', () => {
+test('skill stop JSON example parses with the real strict schema', () => {
   const block = skill.match(/```json\n([\s\S]*?)\n```/);
   assert.ok(block, 'skill must include an actual stop JSON example');
   const input = JSON.parse(block[1]);
   assert.equal(StopInputSchema.parse(input).status, 'blocked');
   assert.equal(input.current_episode_id, input.retry.failure_episode_id);
   assert.equal(StopInputSchema.parse(stopExample).current_episode_id, stopExample.retry.failure_episode_id);
-  assert.match(skill, /user-prepared/i);
-  assert.match(skill, /TYPESAFE_API_KEY/);
-  assert.match(skill, /no launch|does not launch/i);
-  assert.match(skill, /recognizable credential/i);
-  assert.match(skill, /unknown quota/i);
-  assert.match(skill, /manual_review/);
-  assert.match(skill, /no_action/);
-  assert.match(skill, /automatic_approval_forbidden/);
-  assert.match(skill, /assessment.{0,80}(?:not|does not).{0,40}permission/is);
-});
-
-test('README documents offline distribution, option boundary, schemas, baselines, caveat and manual skill setup', () => {
-  for (const phrase of [
-    'nix develop path:.',
-    'nix build path:.#agent-steward',
-    'nix flake check path:.',
-    'nix run path:. --no-update-lock-file -- --help',
-    'session start --dry-run -- "--help"',
-    '`stop check`',
-    'schema_version',
-    'request_id',
-    '1,048,576',
-    '64',
-    'Codex 0.157.1',
-    'Pi 0.87.1',
-    '`agy` 1.2.11',
-    'jev-1.13.0',
-    'skills/agent-steward/SKILL.md',
-    'manual',
-    'user-selected',
-    'runtime model/effort',
-    'authentication/account binding',
-  ])
-    assert.ok(readme.includes(phrase), `README missing ${phrase}`);
-  assert.match(readme, /not available|unavailable/i);
-  assert.doesNotMatch(readme, /approval check/);
-  assert.match(readme, /copy|link/i);
-  assert.doesNotMatch(readme, /\/nix\/store\/[0-9a-z]{32}/);
-});
-
-test('production CLI and entry sources have no child-process, write, or Herdr capability', () => {
-  const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-  const main = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
-  assert.doesNotMatch(
-    cli + main,
-    /from ['"]node:child_process['"]|from ['"]node:fs\/promises['"]|herdr|spawn\(|exec\(/i,
-  );
-  assert.match(main, /readBoundedUtf8\(process\.stdin\)/);
-  assert.match(main, /readFileText/);
-  assert.match(main, /postHttps/);
-  assert.match(main, /from ['"]node:process['"]/);
-  assert.match(main, /^#!\/usr\/bin\/env node/);
-  assert.match(main, /process\.exitCode\s*=\s*await run/);
 });

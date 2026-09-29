@@ -4,9 +4,13 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const pkg = process.env.AGENT_STEWARD_PACKAGE;
 const skillSource = process.env.AGENT_STEWARD_SKILL_SOURCE;
+const packagedProcess = pkg
+  ? await import(pathToFileURL(join(pkg, 'lib/node_modules/agent-steward/dist/src/process.js')).href)
+  : undefined;
 
 function withIsolatedHome(callback) {
   const root = mkdtempSync(join(tmpdir(), 'steward-installed-'));
@@ -58,7 +62,10 @@ test('installed failures stay local, structured, and credential-free', { skip: !
     assert.equal(missing.reason_code, 'invalid_config');
 
     const noLaunch = parsed(run(['session', 'start', 'task', '--json']));
-    assert.equal(noLaunch.reason_code, 'execution_unavailable');
+    assert.equal(noLaunch.reason_code, 'invalid_input');
+
+    const noTerminal = parsed(run(['session', 'start', 'task']));
+    assert.equal(noTerminal.reason_code, 'interactive_terminal_required');
 
     const badConfig = join(root, 'bad.json');
     writeFileSync(badConfig, '{');
@@ -110,6 +117,54 @@ test('installed failures stay local, structured, and credential-free', { skip: !
     assert.equal(obsolete.reason_code, 'invalid_input');
   });
 });
+
+test(
+  'packaged foreground adapter launches one offline fake executable with selected task argv',
+  { skip: !pkg },
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), 'steward-fake-native-'));
+    try {
+      const bin = join(root, 'bin');
+      mkdirSync(bin);
+      const executable = join(bin, 'pi');
+      const capture = join(root, 'capture.jsonl');
+      writeFileSync(
+        executable,
+        `#!${process.execPath}\nconst fs = require('node:fs');\nfs.appendFileSync(process.env.STUB_CAPTURE, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), hasKey: 'TYPESAFE_API_KEY' in process.env, providerKey: process.env.OPENAI_API_KEY }) + '\\n');\n`,
+        { mode: 0o700 },
+      );
+
+      const args = ['--model', 'requested-model', '--', 'User task:\nOffline fake only'];
+      const status = await packagedProcess.launchForeground(
+        { executable: 'pi', args },
+        {
+          cwd: root,
+          env: {
+            PATH: bin,
+            STUB_CAPTURE: capture,
+            TYPESAFE_API_KEY: 'SyntheticStewardKey-Not-Real',
+            OPENAI_API_KEY: 'SyntheticProviderKey-Not-Real',
+          },
+        },
+      );
+
+      assert.equal(status, 0);
+      const records = readFileSync(capture, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      assert.equal(records.length, 1);
+      assert.deepEqual(records[0], {
+        argv: args,
+        cwd: root,
+        hasKey: false,
+        providerKey: 'SyntheticProviderKey-Not-Real',
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test('installed routing reads a relative quota snapshot before a local missing-key failure', { skip: !pkg }, () => {
   withIsolatedHome(({ root, xdg, run }) => {

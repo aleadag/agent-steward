@@ -329,7 +329,8 @@ const ErrorResultSchema = z.strictObject({
     'credential_detected',
     'invalid_response',
     'evaluation_failed',
-    'execution_unavailable',
+    'interactive_terminal_required',
+    'launch_failed',
   ]),
   message: z.string(),
 });
@@ -542,7 +543,8 @@ const ERROR_MESSAGES: Record<ErrorCode, string> = {
   credential_detected: 'Recognizable credential material was found.',
   invalid_response: 'Evaluator response is invalid.',
   evaluation_failed: 'Evaluation failed.',
-  execution_unavailable: 'Execution is unavailable in this release.',
+  interactive_terminal_required: 'Interactive terminal input and output are required.',
+  launch_failed: 'Agent launch failed or its outcome is uncertain.',
 };
 
 export function errorResult(error: unknown, requestId: string | null): ErrorResult {

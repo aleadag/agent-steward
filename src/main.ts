@@ -4,6 +4,8 @@ import process from 'node:process';
 import { postHttps } from './jev.js';
 import { readBoundedUtf8, readFileText } from './io.js';
 import { run } from './cli.js';
+import { launchForeground } from './process.js';
+import type { NativeLaunch } from './launch.js';
 
 const runtime = {
   env: {
@@ -29,6 +31,8 @@ const runtime = {
   now: () => new Date(),
   newRequestId: () => randomUUID(),
   post: postHttps,
+  terminal: { stdin: process.stdin.isTTY === true, stdout: process.stdout.isTTY === true },
+  launch: (command: NativeLaunch) => launchForeground(command, { cwd: process.cwd(), env: process.env }),
 };
 
 process.exitCode = await run(process.argv.slice(2), runtime);

@@ -1,6 +1,6 @@
 # Agent-steward
 
-Agent-steward's standalone decision CLI provides task-routing previews and stopped-agent assessments through `session start --dry-run` and `stop check`. The CLI does not launch an agent, create a session, inspect existing sessions, adjust effort, collect live quota, or send input to a stopped agent. Configuration describes a local inventory only. The separate bundled Herdr adapter is opt-in; building this package does not install or activate it.
+Agent-steward's standalone CLI routes tasks to a native Codex, Pi, or agy executable. `session start --dry-run` produces a route preview; a live `session start <task>` launches the selected native process in the foreground. `stop check` assesses a user-prepared stopped-agent observation but does not send input. The CLI does not create steward-managed sessions, inspect existing sessions, adjust effort, collect live quota, or use Herdr to launch agents. Configuration describes a local inventory only. The separate bundled Herdr adapter is opt-in; building this package does not install or activate it.
 
 ## Install and run
 
@@ -35,14 +35,23 @@ These are optional manual instructions only. Agent-steward does not install skil
 
 ```sh
 agent-steward --help
+agent-steward --config ./config.json session start "Review the parser"
 agent-steward --config ./config.json session start "Review the parser" --dry-run --json
 agent-steward --config ./config.json session start --dry-run -- "--help"
 agent-steward --config ./config.json stop check < stopped-state.json
 ```
 
-The `--` separator ends option parsing. The third command routes the literal task `--help`; text after the separator is never treated as a CLI option. Before the separator, `--config <path>` is global and can appear before or after command tokens. Each route task must be exactly one argument; quote a multiword task rather than relying on the CLI to join or discard extra arguments. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
+The first `session start` command launches the selected native agent in the foreground; the next returns a JSON route preview without launching. The `--` separator ends option parsing. The fourth command previews the literal task `--help`; text after the separator is never treated as a CLI option. Before the separator, `--config <path>` is global and can appear before or after command tokens. Each route task is exactly one argument; quote multiword tasks. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
 
-Route results use `schema_version: 1`; stop results and stop errors use `schema_version: 2`. Both include a `request_id`. A successful route contains `decision: "selected"`, the chosen candidate, quota facts, the exact planned executable and argument array, and pair/effort evaluation metadata. Its request ID identifies the evaluation, not a session. When a stop observation has no meaningful context, the CLI returns this local result without calling Jev:
+### Foreground native launch (alpha)
+
+A live `session start <task>` requires terminal input and output, rejects `--json`, and stays attached to the selected Codex, Pi, or agy process until it exits. The native process inherits the caller's terminal and working directory. A zero exit status means only that the process exited zero; it does not prove that the task was accepted or completed. The CLI does not create a steward session ID or enable automatic approval.
+
+The live route summary labels the selected provider, model, thinking level, and account as requested, not confirmed. Native flags request those settings; the CLI cannot verify the effective runtime model, effort, provider, or account. The executable is selected by its fixed tool name from `PATH`. Every PATH entry must be absolute and nonempty. Those entries are trusted caller configuration, not proof of executable identity. The package does not install native tools.
+
+The task is sent as one native process argument, so it may be visible briefly in local process listings. Do not put secrets in task text. The child receives the caller's environment except `TYPESAFE_API_KEY`; native provider credentials are otherwise passed through. For a non-TTY caller, use `--dry-run --json` for a route preview, then have an already-authorized caller launch the selected tool and requested settings using its own safe argv construction. Do not execute `planned_command.display` as a shell command: a preview is not a launch.
+
+A `--dry-run` route uses `schema_version: 1` when returned as JSON; stop results and stop errors use `schema_version: 2`. These JSON results include a `request_id`. The JSON form of a selected `--dry-run` result contains `decision: "selected"`, the chosen candidate, quota facts, the exact planned executable and argument array, and pair/effort evaluation metadata. Its request ID identifies the evaluation, not a session. A successful live foreground start emits no steward route-result JSON; the selected native process owns stdout, and `agent-steward` returns its exit status. When a stop observation has no meaningful context, the CLI returns this local result without calling Jev:
 
 ```json
 {"schema_version":2,"request_id":"request-42","decision":"stop_decision","proposed_action":{"kind":"manual_review"},"reason_code":"insufficient_context","waiting_for":"other","waiting_confidence":null,"risk_probability":null,"evaluation":null}
@@ -50,7 +59,7 @@ Route results use `schema_version: 1`; stop results and stop errors use `schema_
 
 Error envelopes have fixed messages and retain the command's schema version. For example, a route error is version 1 and a valid stop-command error is version 2. Malformed command-line arguments that do not select a command use the generic version-1 error.
 
-Routing exits 0 for a complete selected result and 1 for errors. `stop check` exits 0 for an approval, recovery, or quota-wait proposal, 2 for `manual_review`, 3 for `no_action`, and 1 for errors. Check the structured result as well as its exit code: no exit code authorizes delivery. `no_action` means no follow-up input should be sent, not that a person has no reason to respond. Errors never accompany a proposal or partial route.
+A `session start --dry-run` route exits 0 for a complete selected preview and 1 for route errors. `stop check` exits 0 for an approval, recovery, or quota-wait proposal, 2 for `manual_review`, 3 for `no_action`, and 1 for errors. A successful live foreground start returns the native process exit status; a native exit status of 1 is not evidence of a steward route error or of task non-delivery, acceptance, or completion. Check `--dry-run` preview results and the `stop check` JSON result alongside their exit codes: no exit code authorizes delivery. `no_action` means no follow-up input should be sent, not that a person has no reason to respond. Errors never accompany a proposal or partial route.
 
 Routing first selects a tool/model pair, then selects one of that pair's configured thinking levels. A single configured level skips the second evaluation. Each Jev request has its own 30-second deadline with no retries, so a route can involve two sequential requests and two separate deadlines. Evaluation token usage measures Jev usage, not remaining subscription quota.
 
@@ -72,7 +81,7 @@ Config files, snapshots, stop stdin, and Jev request/response bodies are each li
 
 ## Decision and privacy boundaries
 
-A route preview sends the supplied task, configured candidate facts, applicable snapshot facts, and fixed evaluator questions to `https://api.typesafe.ai/v1/systemone`. `stop check` sends the supplied version-2 observation, including context and any structured action hints, with fixed classification questions when evaluation is needed. Send only the excerpt around the current stop. Agent-steward does not inspect terminal history, repository files, provider credentials, live account state, or Herdr, and it does not persist request/response bodies. If context is absent, blank, null, or empty, even action hints produce local manual review without a Jev call or API-key requirement. A meaningful context is required before Jev evaluation.
+Both dry-run previews and live starts send the supplied task, configured candidate facts, applicable snapshot facts, and fixed evaluator questions to `https://api.typesafe.ai/v1/systemone`. `stop check` sends the supplied version-2 observation, including context and any structured action hints, with fixed classification questions when evaluation is needed. Send only the excerpt around the current stop. Agent-steward does not inspect terminal history, repository files, provider credentials, live account state, or Herdr, and it does not persist request/response bodies. If context is absent, blank, null, or empty, even action hints produce local manual review without a Jev call or API-key requirement. A meaningful context is required before Jev evaluation.
 
 Before sending, the CLI rejects the configured TypeSafe key if it appears in outbound data and checks a limited set of recognizable credential patterns: private-key headers, common `sk-`/GitHub token prefixes, AWS `AKIA` keys, Bearer tokens, and values under credential-named fields. It also checks caller IDs and output for the configured key. Detection is incomplete and may miss unfamiliar or encoded secrets, while rejecting token-like ordinary text. Do not rely on it to make sensitive input safe. The opt-in evaluation sends the supplied context to TypeSafe.
 
@@ -96,7 +105,7 @@ A recovery proposal waits until its episode-anchored deadline, then re-observes 
 
 Human handoffs emit fixed, credential-free stderr text and, when Herdr supplies its executable path, call Herdr 0.9.1 `notification show` with a fixed title and body. A successful notification call does not prove that a person saw the toast. Socket device/inode is only a local server-instance proxy, not authenticated session identity. Disposable tests exercised live Jev classification on synthetic context and one adapter-originated conditional prompt to a ready Pi with a synthetic recovery decision; they did not prove genuine-error recovery or human notification visibility. Enabling the plugin in a normal session still needs separate review and explicit authorization.
 
-Stable error codes are `invalid_input`, `invalid_config`, `missing_credentials`, `credential_detected`, `invalid_response`, `evaluation_failed`, and `execution_unavailable`. Messages are fixed and do not contain paths, submitted data, credentials, or raw evaluator errors. Diagnostics use stderr; JSON stdout contains one result and a newline.
+Stable error codes are `invalid_input`, `invalid_config`, `missing_credentials`, `credential_detected`, `invalid_response`, `evaluation_failed`, `interactive_terminal_required`, and `launch_failed`. Messages are fixed and do not contain paths, submitted data, credentials, or raw evaluator or process errors. Diagnostics use stderr; JSON stdout contains one result and a newline.
 
 ## Command preview references
 
@@ -104,4 +113,4 @@ Syntax baselines for this implementation are Codex 0.157.1, Pi 0.87.1, and `agy`
 
 A preview includes a safely quoted display command and a separate literal `args` array, but never runs that command or adds task-delivery input. Codex and Pi include explicit provider selectors; agy uses existing settings. Neither syntax nor configuration proves which account authenticates. The card and JSON result label runtime model/effort and authentication/account binding as unverified.
 
-Tests use controlled fixtures and mock HTTP; they do not contact Jev or launch an agent. The bundled skill explains how to provide minimal, user-prepared input and interpret structured decisions without treating them as execution authority.
+Offline tests use controlled fixtures and mock HTTP. A temporary fake native executable verifies the process boundary; tests do not contact Jev or launch real agents or models. The bundled skill distinguishes route previews from foreground starts and explains how to provide minimal, user-prepared stop input without treating a proposal as execution authority.
