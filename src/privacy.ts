@@ -11,7 +11,7 @@ const patterns = [
 const credentialKey = /^(api[_-]?key|access[_-]?token|client[_-]?secret|password)$/i;
 
 function recognizable(value: string, apiKey: string): boolean {
-  return (apiKey.length > 0 && value.includes(apiKey)) || patterns.some(pattern => pattern.test(value));
+  return (apiKey.length > 0 && value.includes(apiKey)) || patterns.some((pattern) => pattern.test(value));
 }
 
 export function assertNoCredentials(content: unknown, apiKey: string): void {
@@ -27,7 +27,7 @@ export function assertNoCredentials(content: unknown, apiKey: string): void {
 
     const entries: [string, unknown][] = Array.isArray(value)
       ? value.map((entry, index) => [String(index), entry])
-      : Object.keys(value).map(key => [key, (value as Record<string, unknown>)[key]]);
+      : Object.keys(value).map((key) => [key, (value as Record<string, unknown>)[key]]);
     for (const [key, child] of entries) {
       if (recognizable(key, apiKey) || (credentialKey.test(key) && typeof child === 'string' && child.length > 0)) {
         throw new StewardError('credential_detected');

@@ -87,7 +87,15 @@ export function parseArgs(argv: readonly string[]): Invocation {
             routeFlags.add(token);
           } else if (token.startsWith('-')) invalidInput();
         }
-      } else if (!(commandTokens[0] === 'approval' && commandTokens[1] === 'check' && commandTokens.length === 2 && separator < 0)) invalidInput();
+      } else if (
+        !(
+          commandTokens[0] === 'approval' &&
+          commandTokens[1] === 'check' &&
+          commandTokens.length === 2 &&
+          separator < 0
+        )
+      )
+        invalidInput();
     }
     return { kind: 'help' };
   }
@@ -185,8 +193,8 @@ export function renderDecisionCard(result: SelectedResult): string {
     `pool status: ${quota.pool_status}`,
   ];
 
-  const accountWindows = quota.windows.filter(window => window.scope.type === 'account');
-  const poolWindows = quota.windows.filter(window => window.scope.type === 'pool');
+  const accountWindows = quota.windows.filter((window) => window.scope.type === 'account');
+  const poolWindows = quota.windows.filter((window) => window.scope.type === 'pool');
   const appendWindows = (label: string, windows: typeof quota.windows): void => {
     if (windows.length === 0) {
       lines.push(`${label} remaining: unknown`);
@@ -195,7 +203,9 @@ export function renderDecisionCard(result: SelectedResult): string {
     }
     for (const window of windows) {
       const suffix = window.scope.type === 'pool' ? ` ${jsonValue(window.scope.pool_id)}` : '';
-      lines.push(`${label}${suffix} remaining: ${window.status === 'known' ? `${window.remaining_percent}%` : 'unknown'}`);
+      lines.push(
+        `${label}${suffix} remaining: ${window.status === 'known' ? `${window.remaining_percent}%` : 'unknown'}`,
+      );
       lines.push(`${label}${suffix} reset at: ${jsonValue(window.reset_at)}`);
       lines.push(`${label}${suffix} observed at: ${jsonValue(window.observed_at)}`);
       lines.push(`${label}${suffix} valid until: ${jsonValue(window.valid_until)}`);
@@ -213,7 +223,9 @@ export function renderDecisionCard(result: SelectedResult): string {
   }
   lines.push(`planned command: ${command.display}`);
   lines.push('runtime model/effort: unverified');
-  lines.push(`authentication/account binding: unverified (${command.provider_selection === 'existing_settings' ? 'provider comes from existing settings' : 'provider selector is explicit'})`);
+  lines.push(
+    `authentication/account binding: unverified (${command.provider_selection === 'existing_settings' ? 'provider comes from existing settings' : 'provider selector is explicit'})`,
+  );
   lines.push('The planned command is display-only; quoting does not authorize execution.');
   return `${lines.join('\n')}\n`;
 }
@@ -232,14 +244,24 @@ function decisionExitCode(result: Result): number {
   }
 }
 
-function emitError(runtime: Runtime, error: unknown, requestId: string | null, apiKey: string, humanRoute: boolean): number {
+function emitError(
+  runtime: Runtime,
+  error: unknown,
+  requestId: string | null,
+  apiKey: string,
+  humanRoute: boolean,
+): number {
   const result = safeError(error, requestId, apiKey);
   emitJson(runtime, result);
   if (humanRoute) runtime.stderr(`agent-steward: ${result.reason_code}\n`);
   return 1;
 }
 
-async function readApprovalInput(runtime: Runtime, onRequestId: (id: string | null) => void, apiKey: string): Promise<ReturnType<typeof ApprovalInputSchema.parse>> {
+async function readApprovalInput(
+  runtime: Runtime,
+  onRequestId: (id: string | null) => void,
+  apiKey: string,
+): Promise<ReturnType<typeof ApprovalInputSchema.parse>> {
   let contents: string;
   try {
     contents = await runtime.readStdin();
@@ -275,7 +297,7 @@ async function readApprovalInput(runtime: Runtime, onRequestId: (id: string | nu
 
 function assertRoutePreflight(config: Awaited<ReturnType<typeof loadConfig>>): void {
   const enabledTools = new Set(config.tools);
-  const candidates = config.candidates.filter(candidate => enabledTools.has(candidate.tool));
+  const candidates = config.candidates.filter((candidate) => enabledTools.has(candidate.tool));
   if (candidates.length === 0 || candidates.length > 255) throw new StewardError('invalid_config');
   for (const candidate of candidates) validateCandidateSyntax(candidate);
 }
@@ -311,11 +333,19 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
   try {
     let approvalInput: ReturnType<typeof ApprovalInputSchema.parse> | undefined;
     if (invocation.kind === 'approval') {
-      approvalInput = await readApprovalInput(runtime, id => { requestId = id; }, apiKey);
+      approvalInput = await readApprovalInput(
+        runtime,
+        (id) => {
+          requestId = id;
+        },
+        apiKey,
+      );
     }
 
     const config = await loadConfig(invocation.config, {
-      env: runtime.env, cwd: runtime.cwd, readText: runtime.readText,
+      env: runtime.env,
+      cwd: runtime.cwd,
+      readText: runtime.readText,
     });
 
     let quota: Awaited<ReturnType<typeof loadQuota>> | undefined;
@@ -324,7 +354,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       quota = await loadQuota(config, {
         readText: runtime.readText,
         now: runtime.now(),
-        diagnostic: code => runtime.stderr(`${DIAGNOSTICS[code] ?? 'agent-steward: quota_diagnostic'}\n`),
+        diagnostic: (code) => runtime.stderr(`${DIAGNOSTICS[code] ?? 'agent-steward: quota_diagnostic'}\n`),
       });
     }
 

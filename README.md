@@ -11,10 +11,14 @@ nix develop path:.
 npm ci --ignore-scripts
 npm test
 npm run typecheck
+npm run lint
+npm run format:check
 nix build path:.#agent-steward --no-update-lock-file
 nix run path:. --no-update-lock-file -- --help
 nix flake check path:. --no-update-lock-file
 ```
+
+`npm run lint` runs Oxlint on `src` and `tests`; `npm run format:check` checks those files with Oxfmt. Run `npm run format` to apply formatting. TypeScript validation remains in `npm run typecheck`.
 
 The package installs the executable as `result/bin/agent-steward` and bundles the skill at `share/agent-steward/skills/agent-steward/SKILL.md`. `nix run` and the installed executable use the packaged Node.js runtime. Offline checks do not need credentials, agent executables, user configuration, or live Jev access.
 

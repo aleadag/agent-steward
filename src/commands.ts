@@ -45,15 +45,20 @@ function effortArgs(tool: Tool, level: string): string[] {
 
 export function buildCommand(candidate: Candidate, level: string): PlannedCommand {
   validateCandidateSyntax(candidate);
-  if (!candidate.thinking_levels.some(configured => configured.id === level)) invalidConfig();
+  if (!candidate.thinking_levels.some((configured) => configured.id === level)) invalidConfig();
 
   const displayProvider = candidate.provider;
   let args: string[];
   let providerSelection: PlannedCommand['provider_selection'];
   switch (candidate.tool) {
     case 'codex':
-      args = ['--model', candidate.model, '-c', `model_provider=${JSON.stringify(displayProvider)}`,
-        ...effortArgs(candidate.tool, level)];
+      args = [
+        '--model',
+        candidate.model,
+        '-c',
+        `model_provider=${JSON.stringify(displayProvider)}`,
+        ...effortArgs(candidate.tool, level),
+      ];
       providerSelection = 'explicit_flag';
       break;
     case 'pi':

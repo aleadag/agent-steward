@@ -7,15 +7,25 @@ import { run } from './cli.js';
 
 const runtime = {
   env: {
-    get HOME() { return process.env.HOME; },
-    get XDG_CONFIG_HOME() { return process.env.XDG_CONFIG_HOME; },
-    get TYPESAFE_API_KEY() { return process.env.TYPESAFE_API_KEY; },
+    get HOME() {
+      return process.env.HOME;
+    },
+    get XDG_CONFIG_HOME() {
+      return process.env.XDG_CONFIG_HOME;
+    },
+    get TYPESAFE_API_KEY() {
+      return process.env.TYPESAFE_API_KEY;
+    },
   },
   cwd: process.cwd(),
   readText: readFileText,
   readStdin: () => readBoundedUtf8(process.stdin),
-  stdout: (text: string) => { process.stdout.write(text); },
-  stderr: (text: string) => { process.stderr.write(text); },
+  stdout: (text: string) => {
+    process.stdout.write(text);
+  },
+  stderr: (text: string) => {
+    process.stderr.write(text);
+  },
   now: () => new Date(),
   newRequestId: () => randomUUID(),
   post: postHttps,

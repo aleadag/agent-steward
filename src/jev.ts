@@ -35,7 +35,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> => {
 
 function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
   const keys = Object.keys(value);
-  return keys.length === expected.length && expected.every(key => Object.hasOwn(value, key));
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
 }
 
 function assertJsonValue(value: unknown): void {
@@ -70,26 +70,41 @@ function assertJsonValue(value: unknown): void {
 function assertQuestions(value: unknown): asserts value is Questions {
   if (!isRecord(value) || Object.keys(value).length === 0) throw new StewardError('invalid_input');
   for (const [id, question] of Object.entries(value)) {
-    if (id.trim().length === 0 || !isRecord(question) || typeof question.instructions !== 'string' || question.instructions.trim().length === 0) {
+    if (
+      id.trim().length === 0 ||
+      !isRecord(question) ||
+      typeof question.instructions !== 'string' ||
+      question.instructions.trim().length === 0
+    ) {
       throw new StewardError('invalid_input');
     }
     if (question.type === 'choice') {
-      if (!exactKeys(question, ['type', 'instructions', 'criteria']) || !isRecord(question.criteria)) throw new StewardError('invalid_input');
+      if (!exactKeys(question, ['type', 'instructions', 'criteria']) || !isRecord(question.criteria))
+        throw new StewardError('invalid_input');
       const options = Object.keys(question.criteria);
-      if (options.length === 0 || options.length > 255 || options.some(option => option.trim().length === 0)) throw new StewardError('invalid_input');
+      if (options.length === 0 || options.length > 255 || options.some((option) => option.trim().length === 0))
+        throw new StewardError('invalid_input');
       for (const option of options) {
         const description = question.criteria[option];
         if (description !== null && typeof description !== 'string') throw new StewardError('invalid_input');
       }
     } else if (question.type === 'noul') {
-      if (!exactKeys(question, Object.hasOwn(question, 'criteria')
-        ? ['type', 'instructions', 'criteria']
-        : ['type', 'instructions'])) throw new StewardError('invalid_input');
+      if (
+        !exactKeys(
+          question,
+          Object.hasOwn(question, 'criteria') ? ['type', 'instructions', 'criteria'] : ['type', 'instructions'],
+        )
+      )
+        throw new StewardError('invalid_input');
       if (Object.hasOwn(question, 'criteria')) {
-        if (!isRecord(question.criteria) || Object.keys(question.criteria).some(key => key !== 'true' && key !== 'false')) {
+        if (
+          !isRecord(question.criteria) ||
+          Object.keys(question.criteria).some((key) => key !== 'true' && key !== 'false')
+        ) {
           throw new StewardError('invalid_input');
         }
-        if (Object.values(question.criteria).some(item => typeof item !== 'string')) throw new StewardError('invalid_input');
+        if (Object.values(question.criteria).some((item) => typeof item !== 'string'))
+          throw new StewardError('invalid_input');
       }
     } else {
       throw new StewardError('invalid_input');
@@ -111,9 +126,8 @@ function decimalParts(value: number): { coefficient: bigint; scale: number } {
 function choiceSumWithinTolerance(values: readonly number[]): boolean {
   // Sum canonical decimal spellings exactly, keeping decimal boundary values inside the specified tolerance.
   const parts = values.map(decimalParts);
-  const scale = Math.max(0, ...parts.map(part => part.scale));
-  const total = parts.reduce((sum, part) =>
-    sum + part.coefficient * 10n ** BigInt(scale - part.scale), 0n);
+  const scale = Math.max(0, ...parts.map((part) => part.scale));
+  const total = parts.reduce((sum, part) => sum + part.coefficient * 10n ** BigInt(scale - part.scale), 0n);
   const unit = 10n ** BigInt(scale);
   const difference = total >= unit ? total - unit : unit - total;
   return difference * 1_000_000n <= unit;
@@ -155,15 +169,18 @@ export function validateEvaluation(raw: unknown, questions: Questions): Evaluati
   return parsed.data;
 }
 
-export function choiceWinner(answer: import('./contracts.js').ChoiceAnswer, order: readonly string[]): {
+export function choiceWinner(
+  answer: import('./contracts.js').ChoiceAnswer,
+  order: readonly string[],
+): {
   winner: string;
   tied: boolean;
 } {
   const probabilities = Object.values(answer.probabilities);
   if (probabilities.length === 0) throw invalidResponse();
   const maximum = Math.max(...probabilities);
-  const maxima = Object.keys(answer.probabilities).filter(key => answer.probabilities[key] === maximum);
-  const winner = order.find(key => Object.hasOwn(answer.probabilities, key) && answer.probabilities[key] === maximum);
+  const maxima = Object.keys(answer.probabilities).filter((key) => answer.probabilities[key] === maximum);
+  const winner = order.find((key) => Object.hasOwn(answer.probabilities, key) && answer.probabilities[key] === maximum);
   if (winner === undefined) throw invalidResponse();
   return { winner, tied: maxima.length > 1 };
 }
@@ -174,7 +191,8 @@ function mapInputError(error: unknown): never {
 }
 
 export function makeEvaluator(options: { model: string; apiKey: string; post: HttpPost }): Evaluate {
-  if (typeof options.apiKey !== 'string' || options.apiKey.trim().length === 0) throw new StewardError('missing_credentials');
+  if (typeof options.apiKey !== 'string' || options.apiKey.trim().length === 0)
+    throw new StewardError('missing_credentials');
 
   return async (state, questions) => {
     let body: string;
@@ -229,7 +247,7 @@ export function postHttps(request: Parameters<HttpPost>[0]): ReturnType<HttpPost
     }
 
     let clientRequest: ClientRequest;
-    let responseStream: NodeJS.ReadableStream & { destroy: (error?: Error) => void } | undefined;
+    let responseStream: (NodeJS.ReadableStream & { destroy: (error?: Error) => void }) | undefined;
     let settled = false;
     const finish = (error?: StewardError, value?: { status: number; body: string }): void => {
       if (settled) return;
@@ -249,25 +267,32 @@ export function postHttps(request: Parameters<HttpPost>[0]): ReturnType<HttpPost
     };
 
     try {
-      clientRequest = https.request(request.url, {
-        method: 'POST',
-        headers: request.headers,
-        signal: request.signal,
-      }, response => {
-        responseStream = response;
-        const status = response.statusCode ?? 0;
-        if (status < 200 || status >= 300) {
-          response.destroy();
-          finish(undefined, { status, body: '' });
-          return;
-        }
-        readBoundedUtf8(response).then(body => finish(undefined, { status, body }), error => {
-          const invalidBody = error instanceof LimitError || error instanceof TypeError;
-          if (!clientRequest.destroyed) clientRequest.destroy();
-          if (!response.destroyed) response.destroy();
-          finish(new StewardError(invalidBody ? 'invalid_response' : 'evaluation_failed'));
-        });
-      });
+      clientRequest = https.request(
+        request.url,
+        {
+          method: 'POST',
+          headers: request.headers,
+          signal: request.signal,
+        },
+        (response) => {
+          responseStream = response;
+          const status = response.statusCode ?? 0;
+          if (status < 200 || status >= 300) {
+            response.destroy();
+            finish(undefined, { status, body: '' });
+            return;
+          }
+          readBoundedUtf8(response).then(
+            (body) => finish(undefined, { status, body }),
+            (error) => {
+              const invalidBody = error instanceof LimitError || error instanceof TypeError;
+              if (!clientRequest.destroyed) clientRequest.destroy();
+              if (!response.destroyed) response.destroy();
+              finish(new StewardError(invalidBody ? 'invalid_response' : 'evaluation_failed'));
+            },
+          );
+        },
+      );
       clientRequest.once('error', onRequestError);
       request.signal.addEventListener('abort', onAbort, { once: true });
       if (request.signal.aborted) onAbort();

@@ -1,5 +1,14 @@
 import { SnapshotSchema, StewardError } from './contracts.js';
-import type { Account, Config, Diagnostic, QuotaFacts, QuotaWindow, QuotaWindowFact, ReadText, Snapshot } from './contracts.js';
+import type {
+  Account,
+  Config,
+  Diagnostic,
+  QuotaFacts,
+  QuotaWindow,
+  QuotaWindowFact,
+  ReadText,
+  Snapshot,
+} from './contracts.js';
 import { assertByteLength, assertJsonDepth } from './limits.js';
 import { compareRfc3339Timestamps } from './timestamps.js';
 
@@ -43,13 +52,14 @@ async function readSnapshot(account: Account, readText: ReadText, diagnostic: Di
 }
 
 function classifyWindow(window: QuotaWindow, now: string): QuotaWindowFact {
-  const reason = compareRfc3339Timestamps(window.observed_at, now) > 0
-    ? 'future_observation'
-    : compareRfc3339Timestamps(window.reset_at, now) <= 0
-      ? 'reset_passed'
-      : compareRfc3339Timestamps(window.valid_until, now) <= 0
-        ? 'expired'
-        : null;
+  const reason =
+    compareRfc3339Timestamps(window.observed_at, now) > 0
+      ? 'future_observation'
+      : compareRfc3339Timestamps(window.reset_at, now) <= 0
+        ? 'reset_passed'
+        : compareRfc3339Timestamps(window.valid_until, now) <= 0
+          ? 'expired'
+          : null;
 
   return {
     status: reason === null ? 'known' : 'unknown',
@@ -63,20 +73,23 @@ function classifyWindow(window: QuotaWindow, now: string): QuotaWindowFact {
 }
 
 function summaryStatus(windows: readonly QuotaWindowFact[]): 'known' | 'unknown' {
-  return windows.length > 0 && windows.every(window => window.status === 'known') ? 'known' : 'unknown';
+  return windows.length > 0 && windows.every((window) => window.status === 'known') ? 'known' : 'unknown';
 }
 
-export async function loadQuota(config: Config, io: {
-  readText: ReadText;
-  now: Date;
-  diagnostic: Diagnostic;
-}): Promise<Map<string, QuotaFacts>> {
+export async function loadQuota(
+  config: Config,
+  io: {
+    readText: ReadText;
+    now: Date;
+    diagnostic: Diagnostic;
+  },
+): Promise<Map<string, QuotaFacts>> {
   const nowMilliseconds = io.now.getTime();
   if (!Number.isFinite(nowMilliseconds)) throw new StewardError('invalid_input');
   const now = io.now.toISOString();
 
   const enabled = new Set(config.tools);
-  const accounts = new Map(config.accounts.map(account => [account.id, account]));
+  const accounts = new Map(config.accounts.map((account) => [account.id, account]));
   const cache = new Map<string, Promise<SnapshotLoad>>();
   const result = new Map<string, QuotaFacts>();
 
@@ -97,13 +110,13 @@ export async function loadQuota(config: Config, io: {
     let accountStatus: 'known' | 'unknown' = 'unknown';
     let poolStatus: 'known' | 'unknown' = 'unknown';
     if (snapshotLoad.status === 'loaded') {
-      const relevant = snapshotLoad.snapshot.windows.filter(window => applies(window, candidate.quota_pool));
-      windows = relevant.map(window => classifyWindow(window, now));
-      const accountWindows = windows.filter(window => window.scope.type === 'account');
-      const poolWindows = windows.filter(window => window.scope.type === 'pool');
+      const relevant = snapshotLoad.snapshot.windows.filter((window) => applies(window, candidate.quota_pool));
+      windows = relevant.map((window) => classifyWindow(window, now));
+      const accountWindows = windows.filter((window) => window.scope.type === 'account');
+      const poolWindows = windows.filter((window) => window.scope.type === 'pool');
       accountStatus = summaryStatus(accountWindows);
       poolStatus = poolWindows.length > 0 ? summaryStatus(windows) : 'unknown';
-      if (windows.some(window => window.status === 'unknown')) io.diagnostic('quota_stale');
+      if (windows.some((window) => window.status === 'unknown')) io.diagnostic('quota_stale');
     }
 
     result.set(candidate.id, {

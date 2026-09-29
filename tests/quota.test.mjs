@@ -20,12 +20,22 @@ test('shared read does not borrow another pool at reset boundary', async () => {
     windowFact({ type: 'pool', pool_id: 'unrelated' }, { remaining_percent: 99 }),
   ]);
   let reads = 0;
-  const quota = await loadQuota(cfg, { now, readText: async () => { reads++; return JSON.stringify(data); }, diagnostic: () => {} });
+  const quota = await loadQuota(cfg, {
+    now,
+    readText: async () => {
+      reads++;
+      return JSON.stringify(data);
+    },
+    diagnostic: () => {},
+  });
   assert.equal(reads, 1);
   assert.equal(quota.get('codex-astra').account_status, 'known');
   assert.equal(quota.get('codex-astra').pool_status, 'unknown');
   assert.equal(quota.get('pi-astra').pool_status, 'unknown');
-  assert.deepEqual(quota.get('pi-astra').windows.map(w => w.scope), [{ type: 'account' }]);
+  assert.deepEqual(
+    quota.get('pi-astra').windows.map((w) => w.scope),
+    [{ type: 'account' }],
+  );
   assert.equal(quota.get('codex-astra').windows[1].remaining_percent, null);
 });
 
@@ -44,12 +54,22 @@ test('reads each referenced account once and does not mix equal pool IDs across 
   });
   const reads = [];
   const files = {
-    '/codex.json': JSON.stringify(snapshot([windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 20 })])),
-    '/agy.json': JSON.stringify(snapshot([windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 80 })], { source: 'antigravity', account_id: 'other' })),
+    '/codex.json': JSON.stringify(
+      snapshot([windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 20 })]),
+    ),
+    '/agy.json': JSON.stringify(
+      snapshot([windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 80 })], {
+        source: 'antigravity',
+        account_id: 'other',
+      }),
+    ),
   };
   const quota = await loadQuota(cfg, {
     now,
-    readText: async path => { reads.push(path); return files[path]; },
+    readText: async (path) => {
+      reads.push(path);
+      return files[path];
+    },
     diagnostic: () => {},
   });
   assert.deepEqual(reads.sort(), ['/agy.json', '/codex.json']);
@@ -61,13 +81,15 @@ test('reads each referenced account once and does not mix equal pool IDs across 
 });
 
 test('disabled candidates and empty inventory do not read snapshots', async () => {
-  for (const cfg of [
-    config({ tools: ['pi'] }),
-    config({ tools: [], accounts: [], candidates: [] }),
-  ]) {
+  for (const cfg of [config({ tools: ['pi'] }), config({ tools: [], accounts: [], candidates: [] })]) {
     let reads = 0;
     const quota = await loadQuota(cfg, {
-      now, readText: async () => { reads++; throw new Error('must not read'); }, diagnostic: () => {},
+      now,
+      readText: async () => {
+        reads++;
+        throw new Error('must not read');
+      },
+      diagnostic: () => {},
     });
     assert.equal(reads, 0);
     assert.equal(quota.size, 0);
@@ -78,7 +100,11 @@ test('missing snapshots and accounts without paths produce unknown facts and saf
   const cfg = config({ accounts: [{ id: 'shared', source: 'codex' }] });
   const diagnostics = [];
   const quota = await loadQuota(cfg, {
-    now, readText: async () => { throw new Error('/private/quota.json'); }, diagnostic: code => diagnostics.push(code),
+    now,
+    readText: async () => {
+      throw new Error('/private/quota.json');
+    },
+    diagnostic: (code) => diagnostics.push(code),
   });
   assertFactsUnknown(quota.get('codex-astra'), 'missing');
   assert.deepEqual(diagnostics, ['quota_missing']);
@@ -87,7 +113,11 @@ test('missing snapshots and accounts without paths produce unknown facts and saf
 test('unreadable snapshots produce unknown facts without exposing read errors', async () => {
   const diagnostics = [];
   const quota = await loadQuota(config(), {
-    now, readText: async () => { throw new Error('private path /home/user/quota.json'); }, diagnostic: code => diagnostics.push(code),
+    now,
+    readText: async () => {
+      throw new Error('private path /home/user/quota.json');
+    },
+    diagnostic: (code) => diagnostics.push(code),
   });
   assertFactsUnknown(quota.get('codex-astra'), 'unreadable');
   assert.deepEqual(diagnostics, ['quota_unreadable']);
@@ -97,16 +127,13 @@ test('bad JSON, invalid dates, oversized text, and excessive depth are malformed
   const invalidDate = snapshot([windowFact({ type: 'account' }, { observed_at: '2026-99-28T10:00:00Z' })]);
   let tooDeep = null;
   for (let i = 0; i < 65; i++) tooDeep = [tooDeep];
-  const inputs = [
-    '{invalid json',
-    JSON.stringify(invalidDate),
-    'x'.repeat(1_048_577),
-    JSON.stringify(tooDeep),
-  ];
+  const inputs = ['{invalid json', JSON.stringify(invalidDate), 'x'.repeat(1_048_577), JSON.stringify(tooDeep)];
   for (const text of inputs) {
     const diagnostics = [];
     const quota = await loadQuota(config(), {
-      now, readText: async () => text, diagnostic: code => diagnostics.push(code),
+      now,
+      readText: async () => text,
+      diagnostic: (code) => diagnostics.push(code),
     });
     assertFactsUnknown(quota.get('codex-astra'), 'malformed');
     assert.deepEqual(diagnostics, ['quota_malformed']);
@@ -120,7 +147,9 @@ test('snapshot account and source identity must match configured account', async
   ]) {
     const diagnostics = [];
     const quota = await loadQuota(config(), {
-      now, readText: async () => JSON.stringify(data), diagnostic: code => diagnostics.push(code),
+      now,
+      readText: async () => JSON.stringify(data),
+      diagnostic: (code) => diagnostics.push(code),
     });
     assertFactsUnknown(quota.get('codex-astra'), 'identity_mismatch');
     assert.deepEqual(diagnostics, ['quota_identity_mismatch']);
@@ -132,18 +161,28 @@ test('expired, reset, and future-observed windows retain dates but never usable 
   const data = snapshot([
     windowFact({ type: 'account' }, { valid_until: '2026-09-28T10:30:00Z' }),
     windowFact({ type: 'pool', pool_id: 'primary' }, { reset_at: '2026-09-28T10:30:00Z' }),
-    windowFact({ type: 'pool', pool_id: 'primary' }, { observed_at: '2026-09-28T10:31:00Z', valid_until: '2026-09-28T11:00:00Z' }),
+    windowFact(
+      { type: 'pool', pool_id: 'primary' },
+      { observed_at: '2026-09-28T10:31:00Z', valid_until: '2026-09-28T11:00:00Z' },
+    ),
   ]);
   const diagnostics = [];
-  const quota = await loadQuota(cfg, { now, readText: async () => JSON.stringify(data), diagnostic: code => diagnostics.push(code) });
+  const quota = await loadQuota(cfg, {
+    now,
+    readText: async () => JSON.stringify(data),
+    diagnostic: (code) => diagnostics.push(code),
+  });
   const facts = quota.get('codex-astra');
   assert.deepEqual(diagnostics, ['quota_stale']);
   assert.equal(facts.snapshot_status, 'loaded');
-  assert.deepEqual(facts.windows.map(w => [w.status, w.reason, w.remaining_percent]), [
-    ['unknown', 'expired', null],
-    ['unknown', 'reset_passed', null],
-    ['unknown', 'future_observation', null],
-  ]);
+  assert.deepEqual(
+    facts.windows.map((w) => [w.status, w.reason, w.remaining_percent]),
+    [
+      ['unknown', 'expired', null],
+      ['unknown', 'reset_passed', null],
+      ['unknown', 'future_observation', null],
+    ],
+  );
   assert.equal(facts.windows[0].valid_until, '2026-09-28T10:30:00Z');
   assert.equal(facts.account_status, 'unknown');
   assert.equal(facts.pool_status, 'unknown');
@@ -158,9 +197,10 @@ test('every relevant window is retained in source order and any stale window mak
   ]);
   const quota = await loadQuota(config(), { now, readText: async () => JSON.stringify(data), diagnostic: () => {} });
   const facts = quota.get('codex-astra');
-  assert.deepEqual(facts.windows.map(w => w.scope), [
-    { type: 'account' }, { type: 'account' }, { type: 'pool', pool_id: 'primary' },
-  ]);
+  assert.deepEqual(
+    facts.windows.map((w) => w.scope),
+    [{ type: 'account' }, { type: 'account' }, { type: 'pool', pool_id: 'primary' }],
+  );
   assert.equal(facts.windows[0].status, 'known');
   assert.equal(facts.windows[0].remaining_percent, 0);
   assert.equal(facts.windows[1].status, 'unknown');
@@ -171,17 +211,23 @@ test('every relevant window is retained in source order and any stale window mak
 
 test('RFC 3339 offsets compare by instant and zero quota remains known', async () => {
   const data = snapshot([
-    windowFact({ type: 'account' }, {
-      observed_at: '2026-09-28T12:00:00+02:00',
-      reset_at: '2026-09-28T14:00:00+02:00',
-      valid_until: '2026-09-28T13:00:00+02:00',
-      remaining_percent: 0,
-    }),
-    windowFact({ type: 'pool', pool_id: 'primary' }, {
-      observed_at: '2026-09-28T12:00:00+02:00',
-      reset_at: '2026-09-28T14:00:00+02:00',
-      valid_until: '2026-09-28T13:00:00+02:00',
-    }),
+    windowFact(
+      { type: 'account' },
+      {
+        observed_at: '2026-09-28T12:00:00+02:00',
+        reset_at: '2026-09-28T14:00:00+02:00',
+        valid_until: '2026-09-28T13:00:00+02:00',
+        remaining_percent: 0,
+      },
+    ),
+    windowFact(
+      { type: 'pool', pool_id: 'primary' },
+      {
+        observed_at: '2026-09-28T12:00:00+02:00',
+        reset_at: '2026-09-28T14:00:00+02:00',
+        valid_until: '2026-09-28T13:00:00+02:00',
+      },
+    ),
   ]);
   const quota = await loadQuota(config(), { now, readText: async () => JSON.stringify(data), diagnostic: () => {} });
   const facts = quota.get('codex-astra');
@@ -191,14 +237,21 @@ test('RFC 3339 offsets compare by instant and zero quota remains known', async (
 });
 
 test('schema-valid sub-millisecond snapshots load before clock freshness classification', async () => {
-  const data = snapshot([windowFact({ type: 'account' }, {
-    observed_at: '2026-09-28T10:30:00.0001Z',
-    reset_at: '2026-09-28T10:30:00.0002Z',
-    valid_until: '2026-09-28T10:30:00.0003Z',
-  })]);
+  const data = snapshot([
+    windowFact(
+      { type: 'account' },
+      {
+        observed_at: '2026-09-28T10:30:00.0001Z',
+        reset_at: '2026-09-28T10:30:00.0002Z',
+        valid_until: '2026-09-28T10:30:00.0003Z',
+      },
+    ),
+  ]);
   const diagnostics = [];
   const quota = await loadQuota(config(), {
-    now, readText: async () => JSON.stringify(data), diagnostic: code => diagnostics.push(code),
+    now,
+    readText: async () => JSON.stringify(data),
+    diagnostic: (code) => diagnostics.push(code),
   });
   const facts = quota.get('codex-astra');
   assert.equal(facts.snapshot_status, 'loaded');
@@ -216,11 +269,14 @@ test('fractional-second RFC 3339 boundaries retain precision beyond Date millise
   ]);
   const quota = await loadQuota(config(), { now, readText: async () => JSON.stringify(data), diagnostic: () => {} });
   const facts = quota.get('codex-astra');
-  assert.deepEqual(facts.windows.map(w => [w.status, w.reason]), [
-    ['known', null],
-    ['unknown', 'future_observation'],
-    ['known', null],
-  ]);
+  assert.deepEqual(
+    facts.windows.map((w) => [w.status, w.reason]),
+    [
+      ['known', null],
+      ['unknown', 'future_observation'],
+      ['known', null],
+    ],
+  );
 });
 
 test('no matching pool window remains unknown despite known account-wide measurements', async () => {

@@ -31,9 +31,7 @@ export function assertJsonDepth(value: unknown): void {
     ancestors.add(frame.value);
     stack.push({ value: frame.value, depth: frame.depth, exit: true });
 
-    const children = Array.isArray(frame.value)
-      ? frame.value
-      : Object.values(frame.value);
+    const children = Array.isArray(frame.value) ? frame.value : Object.values(frame.value);
     for (const child of children) {
       if (child !== null && typeof child === 'object') {
         stack.push({ value: child, depth: frame.depth + 1, exit: false });

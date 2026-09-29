@@ -15,7 +15,7 @@ test('bounded reader accepts exactly the byte cap and decodes UTF-8 split across
 
 test('bounded reader destroys a stream before retaining bytes past the cap', async () => {
   const stream = Readable.from([Buffer.alloc(MAX_JSON_BYTES), Buffer.from('x')]);
-  await assert.rejects(readBoundedUtf8(stream), error => error instanceof LimitError);
+  await assert.rejects(readBoundedUtf8(stream), (error) => error instanceof LimitError);
   assert.equal(stream.destroyed, true);
 });
 
@@ -27,12 +27,18 @@ test('bounded reader rejects aborted streams and settles only once', async () =>
   const stream = new PassThrough();
   let settlements = 0;
   const pending = readBoundedUtf8(stream).then(
-    value => { settlements++; return value; },
-    error => { settlements++; throw error; },
+    (value) => {
+      settlements++;
+      return value;
+    },
+    (error) => {
+      settlements++;
+      throw error;
+    },
   );
   stream.emit('aborted');
   await assert.rejects(pending);
-  await new Promise(resolve => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(settlements, 1);
   assert.equal(stream.destroyed, true);
 });
@@ -52,7 +58,7 @@ test('explicit file reader uses the bounded UTF-8 reader', async () => {
     await writeFile(path, content);
     assert.equal(await readFileText(path), content);
     await writeFile(path, 'x'.repeat(MAX_JSON_BYTES + 1));
-    await assert.rejects(readFileText(path), error => error instanceof LimitError);
+    await assert.rejects(readFileText(path), (error) => error instanceof LimitError);
     assert.equal((await readFile(path, 'utf8')).length, MAX_JSON_BYTES + 1);
   } finally {
     await rm(directory, { recursive: true, force: true });

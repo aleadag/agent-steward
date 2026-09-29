@@ -3,11 +3,14 @@ import { ConfigSchema, StewardError } from './contracts.js';
 import type { Config, ConfigEnv, ReadText } from './contracts.js';
 import { assertByteLength, assertJsonDepth } from './limits.js';
 
-export async function loadConfig(override: string | undefined, io: {
-  env: ConfigEnv;
-  cwd: string;
-  readText: ReadText;
-}): Promise<Config> {
+export async function loadConfig(
+  override: string | undefined,
+  io: {
+    env: ConfigEnv;
+    cwd: string;
+    readText: ReadText;
+  },
+): Promise<Config> {
   try {
     let configPath: string;
     if (override !== undefined) {
@@ -33,9 +36,11 @@ export async function loadConfig(override: string | undefined, io: {
     const configDirectory = dirname(configPath);
     return {
       ...config,
-      accounts: config.accounts.map(account => account.snapshot === undefined || isAbsolute(account.snapshot)
-        ? account
-        : { ...account, snapshot: resolve(configDirectory, account.snapshot) }),
+      accounts: config.accounts.map((account) =>
+        account.snapshot === undefined || isAbsolute(account.snapshot)
+          ? account
+          : { ...account, snapshot: resolve(configDirectory, account.snapshot) },
+      ),
     };
   } catch {
     throw new StewardError('invalid_config');

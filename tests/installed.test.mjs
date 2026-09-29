@@ -11,13 +11,21 @@ const skillSource = process.env.AGENT_STEWARD_SKILL_SOURCE;
 function withIsolatedHome(callback) {
   const root = mkdtempSync(join(tmpdir(), 'steward-installed-'));
   try {
-    const home = join(root, 'home'), xdg = join(root, 'xdg');
-    mkdirSync(home); mkdirSync(xdg);
-    const run = (args, input) => spawnSync(join(pkg, 'bin/agent-steward'), args, {
-      cwd: root, env: { HOME: home, XDG_CONFIG_HOME: xdg, PATH: '' }, encoding: 'utf8', input,
-    });
+    const home = join(root, 'home'),
+      xdg = join(root, 'xdg');
+    mkdirSync(home);
+    mkdirSync(xdg);
+    const run = (args, input) =>
+      spawnSync(join(pkg, 'bin/agent-steward'), args, {
+        cwd: root,
+        env: { HOME: home, XDG_CONFIG_HOME: xdg, PATH: '' },
+        encoding: 'utf8',
+        input,
+      });
     callback({ root, home, xdg, run });
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 function writeConfig(path, config) {
@@ -53,9 +61,18 @@ test('installed failures stay local, structured, and credential-free', { skip: !
 
     const badConfig = join(root, 'bad.json');
     writeFileSync(badConfig, '{');
-    assert.equal(parsed(run(['--config', badConfig, 'session', 'start', 'task', '--dry-run', '--json'])).reason_code, 'invalid_config');
+    assert.equal(
+      parsed(run(['--config', badConfig, 'session', 'start', 'task', '--dry-run', '--json'])).reason_code,
+      'invalid_config',
+    );
 
-    const approval = { schema_version: 1, request_id: 'installed-request', agent: { id: 'agent', tool: 'codex' }, status: 'stopped', context: 'A current stopped task needs an assessment.' };
+    const approval = {
+      schema_version: 1,
+      request_id: 'installed-request',
+      agent: { id: 'agent', tool: 'codex' },
+      status: 'stopped',
+      context: 'A current stopped task needs an assessment.',
+    };
     mkdirSync(join(xdg, 'agent-steward'));
     writeConfig(join(xdg, 'agent-steward', 'config.json'), { tools: [], accounts: [], candidates: [] });
     const missingKey = parsed(run(['approval', 'check'], JSON.stringify(approval)));
@@ -75,12 +92,25 @@ test('installed routing reads a relative quota snapshot before a local missing-k
     writeConfig(join(configDir, 'config.json'), {
       tools: ['codex'],
       accounts: [{ id: 'local', source: 'codex', snapshot: 'quota.json' }],
-      candidates: [{
-        id: 'codex-local', tool: 'codex', provider: 'openai', model: 'example-model', account_id: 'local', quota_pool: 'primary',
-        capabilities: 'test only', thinking_levels: [{ id: 'low', description: 'low' }],
-      }],
+      candidates: [
+        {
+          id: 'codex-local',
+          tool: 'codex',
+          provider: 'openai',
+          model: 'example-model',
+          account_id: 'local',
+          quota_pool: 'primary',
+          capabilities: 'test only',
+          thinking_levels: [{ id: 'low', description: 'low' }],
+        },
+      ],
     });
-    writeConfig(join(configDir, 'quota.json'), { schema_version: 1, source: 'codex', account_id: 'local', windows: [] });
+    writeConfig(join(configDir, 'quota.json'), {
+      schema_version: 1,
+      source: 'codex',
+      account_id: 'local',
+      windows: [],
+    });
     const result = run(['session', 'start', 'task', '--dry-run', '--json']);
     assert.equal(result.status, 1);
     assert.equal(parsed(result).reason_code, 'missing_credentials');
@@ -91,7 +121,7 @@ test('installed routing reads a relative quota snapshot before a local missing-k
 test('installed bundle contains no account, quota, example, or session inputs', { skip: !pkg }, () => {
   const root = join(pkg, 'lib/node_modules/agent-steward');
   const entries = [];
-  const visit = path => {
+  const visit = (path) => {
     for (const entry of readdirSync(path, { withFileTypes: true })) {
       const full = join(path, entry.name);
       entries.push(full);
@@ -100,7 +130,7 @@ test('installed bundle contains no account, quota, example, or session inputs', 
   };
   visit(root);
   visit(join(pkg, 'share/agent-steward'));
-  assert.ok(entries.some(path => path.endsWith('/dist/src/main.js')));
-  assert.ok(entries.every(path => !/(?:^|\/)(?:examples|sessions|\.beads|\.internal)(?:\/|$)/i.test(path)));
-  assert.ok(entries.every(path => !/(?:config|quota|approval|account|session)\.json$/i.test(path)));
+  assert.ok(entries.some((path) => path.endsWith('/dist/src/main.js')));
+  assert.ok(entries.every((path) => !/(?:^|\/)(?:examples|sessions|\.beads|\.internal)(?:\/|$)/i.test(path)));
+  assert.ok(entries.every((path) => !/(?:config|quota|approval|account|session)\.json$/i.test(path)));
 });
