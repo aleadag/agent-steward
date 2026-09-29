@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assessApproval, WAITING_FOR } from '../dist/src/approval.js';
+import { approvalPolicy, assessApproval, WAITING_FOR } from '../dist/src/approval.js';
 import { makeEvaluator } from '../dist/src/jev.js';
 import { ResultSchema, StewardError } from '../dist/src/contracts.js';
 import { approval, choice, evaluation, recordingPost } from './helpers.mjs';
@@ -19,6 +19,18 @@ function assess(waitingFor, risk = 0.1, overrides = {}, thresholdOverrides = {})
     evaluate: async () => answersFor(waitingFor, 0.9, risk),
   });
 }
+
+test('shared stop approval policy preserves restriction precedence and the inclusive risk cutoff', () => {
+  const cases = [
+    [false, 0.5999999, { proposed_action: { kind: 'approve_request' }, reason_code: 'low_risk' }],
+    [false, 0.6, { proposed_action: { kind: 'manual_review' }, reason_code: 'high_risk' }],
+    [true, 0.01, { proposed_action: { kind: 'manual_review' }, reason_code: 'explicit_restriction' }],
+    [true, 0.99, { proposed_action: { kind: 'manual_review' }, reason_code: 'explicit_restriction' }],
+  ];
+  for (const [forbidden, risk, expected] of cases) {
+    assert.deepEqual(approvalPolicy(forbidden, risk, 0.6), expected);
+  }
+});
 
 test('unrounded default risk boundary', async () => {
   for (const [risk, expected] of [[0.5999999, 'approve'], [0.60, 'manual_review']]) {

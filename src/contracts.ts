@@ -117,6 +117,50 @@ export const ApprovalInputSchema = z.strictObject({
   automatic_approval_forbidden: z.boolean().default(false),
 });
 
+const StopAgentSchema = z.strictObject({
+  id: text,
+  tool: z.enum(['codex', 'pi']),
+  pane_id: text,
+  session_id: z.string().nullable(),
+});
+const PendingActionSchema = z.union([z.null(), z.strictObject({
+  action: z.union([z.string(), z.null()]).optional(),
+  target: z.union([z.string(), z.null()]).optional(),
+  permissions: z.union([z.string(), z.null()]).optional(),
+  user_intent: z.union([z.string(), z.null()]).optional(),
+  environment: z.union([z.string(), z.null()]).optional(),
+})]);
+const RetrySchema = z.strictObject({
+  failure_episode_id: text,
+  first_observed_at: dateTime,
+  attempt_count: z.number().int().finite().min(0),
+  last_attempt_at: z.union([z.null(), dateTime]),
+  quota_check_count: z.number().int().finite().min(0),
+  last_quota_check_at: z.union([z.null(), dateTime]),
+});
+// This validates the asserted snapshot shape only; it does not authenticate its source or freshness.
+const ResetSchema = z.strictObject({
+  reset_at: dateTime,
+  observed_at: dateTime,
+  valid_until: dateTime,
+  source: QuotaSourceSchema,
+  account_id: text,
+  pool_id: text,
+  scope: ScopeSchema,
+});
+export const StopInputSchema = z.strictObject({
+  schema_version: z.literal(2),
+  request_id: text,
+  agent: StopAgentSchema,
+  status: z.enum(['blocked', 'idle', 'done', 'unknown']),
+  current_episode_id: text,
+  context: z.union([z.null(), z.string(), ApprovalContextObjectSchema]).optional(),
+  pending_action: PendingActionSchema.optional(),
+  automatic_approval_forbidden: z.boolean().default(false),
+  retry: RetrySchema,
+  reset: ResetSchema.optional(),
+});
+
 export const ChoiceAnswerSchema = z.strictObject({
   type: z.literal('choice'),
   choice: text,
@@ -229,6 +273,113 @@ const ErrorResultSchema = z.strictObject({
   reason_code: z.enum(['invalid_input', 'invalid_config', 'missing_credentials', 'credential_detected', 'invalid_response', 'evaluation_failed', 'execution_unavailable']),
   message: z.string(),
 });
+const StopRecoveryInstructionSchema = z.literal('Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.');
+const StopProposedActionSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('approve_request') }),
+  z.strictObject({
+    kind: z.literal('send_recovery_instruction'),
+    not_before: dateTime,
+    instruction: StopRecoveryInstructionSchema,
+  }),
+  z.strictObject({ kind: z.literal('wait_for_quota'), not_before: dateTime }),
+  z.strictObject({ kind: z.literal('manual_review') }),
+  z.strictObject({ kind: z.literal('no_action') }),
+]);
+const StopDecisionResultSchema = z.strictObject({
+  schema_version: z.literal(2),
+  request_id: text,
+  decision: z.literal('stop_decision'),
+  proposed_action: StopProposedActionSchema,
+  reason_code: z.enum([
+    'low_risk', 'high_risk', 'explicit_restriction', 'unclear_waiting_state', 'insufficient_context',
+    'ordinary_question', 'credentials', 'permanent_error', 'retry_exhausted', 'recoverable_api_error',
+    'quota_limit', 'completed',
+  ]),
+  waiting_for: z.enum([
+    'approve_command', 'approve_edit', 'answer_question', 'credentials', 'recoverable_api_error',
+    'quota_limit', 'permanent_error', 'completed', 'other',
+  ]),
+  waiting_confidence: z.union([z.null(), probability]),
+  risk_probability: z.union([z.null(), probability]),
+  evaluation: z.union([z.null(), EvaluationSchema]),
+}).superRefine((result, context) => {
+  const hasEvaluation = result.evaluation !== null;
+  const hasConfidence = result.waiting_confidence !== null;
+  const evaluated = hasEvaluation && hasConfidence;
+  const metricsConsistent = hasEvaluation === hasConfidence && (hasEvaluation || result.risk_probability === null);
+  if (!metricsConsistent) {
+    context.addIssue({ code: 'custom', path: ['evaluation'], message: 'Evaluation and confidence must be present together; local results have null metrics' });
+  }
+  if (result.evaluation !== null) {
+    const waitingAnswer = result.evaluation.answers.waiting_for;
+    if (waitingAnswer?.type !== 'choice' || waitingAnswer.confidence !== result.waiting_confidence) {
+      context.addIssue({ code: 'custom', path: ['waiting_confidence'], message: 'Confidence must match the waiting-for evaluation' });
+    } else {
+      const maximum = Math.max(...Object.values(waitingAnswer.probabilities));
+      const maximumChoices = Object.entries(waitingAnswer.probabilities).filter(([, value]) => value === maximum);
+      const tied = maximumChoices.length > 1;
+      const ambiguousTie = tied && result.proposed_action.kind === 'manual_review' && result.reason_code === 'unclear_waiting_state';
+      const choiceMatches = tied ? ambiguousTie : waitingAnswer.choice === result.waiting_for;
+      if (waitingAnswer.probabilities[result.waiting_for] !== maximum || waitingAnswer.probabilities[waitingAnswer.choice] !== maximum || !choiceMatches) {
+        context.addIssue({ code: 'custom', path: ['waiting_for'], message: 'Waiting state must match the evaluated choice; ties require unclear manual review' });
+      }
+    }
+    const riskAnswer = result.evaluation.answers.risky;
+    if (result.risk_probability !== null && (riskAnswer?.type !== 'noul' || riskAnswer.noul !== result.risk_probability)) {
+      context.addIssue({ code: 'custom', path: ['risk_probability'], message: 'Risk probability must match the risk evaluation' });
+    }
+  }
+
+  const approvalRequest = result.waiting_for === 'approve_command' || result.waiting_for === 'approve_edit';
+  let matches = false;
+  switch (result.proposed_action.kind) {
+    case 'approve_request':
+      matches = result.reason_code === 'low_risk' && approvalRequest && evaluated && result.risk_probability !== null;
+      break;
+    case 'send_recovery_instruction':
+      matches = result.reason_code === 'recoverable_api_error' && result.waiting_for === 'recoverable_api_error' && evaluated;
+      break;
+    case 'wait_for_quota':
+      matches = result.reason_code === 'quota_limit' && result.waiting_for === 'quota_limit' && evaluated;
+      break;
+    case 'no_action':
+      matches = result.reason_code === 'completed' && result.waiting_for === 'completed';
+      break;
+    case 'manual_review':
+      switch (result.reason_code) {
+        case 'insufficient_context':
+          matches = result.waiting_for === 'other' && !hasEvaluation && !hasConfidence && result.risk_probability === null;
+          break;
+        case 'high_risk':
+        case 'explicit_restriction':
+          matches = approvalRequest && evaluated && result.risk_probability !== null;
+          break;
+        case 'unclear_waiting_state':
+          matches = evaluated;
+          break;
+        case 'ordinary_question':
+          matches = result.waiting_for === 'answer_question' && evaluated;
+          break;
+        case 'credentials':
+          matches = result.waiting_for === 'credentials' && evaluated;
+          break;
+        case 'permanent_error':
+          matches = result.waiting_for === 'permanent_error' && evaluated;
+          break;
+        case 'retry_exhausted':
+          matches = (result.waiting_for === 'recoverable_api_error' || result.waiting_for === 'quota_limit') && evaluated;
+          break;
+        default:
+          matches = false;
+      }
+      break;
+  }
+  if (!matches) {
+    context.addIssue({ code: 'custom', path: ['proposed_action'], message: 'Proposed action, reason, waiting state, and evidence do not agree' });
+  }
+});
+const StopErrorResultSchema = ErrorResultSchema.extend({ schema_version: z.literal(2) });
+export const StopResultSchema = z.union([StopDecisionResultSchema, StopErrorResultSchema]);
 
 export const ResultSchema = z.union([
   SelectedResultSchema,
@@ -244,6 +395,7 @@ export type ThinkingLevel = Candidate['thinking_levels'][number];
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 export type QuotaWindow = Snapshot['windows'][number];
 export type ApprovalInput = z.infer<typeof ApprovalInputSchema>;
+export type StopInput = z.infer<typeof StopInputSchema>;
 export type QuotaFacts = z.infer<typeof QuotaFactsSchema>;
 export type QuotaWindowFact = z.infer<typeof QuotaWindowFactSchema>;
 export type PlannedCommand = z.infer<typeof PlannedCommandSchema>;
@@ -255,6 +407,7 @@ export type ErrorResult = z.infer<typeof ErrorResultSchema>;
 export type ChoiceAnswer = z.infer<typeof ChoiceAnswerSchema>;
 export type NoulAnswer = z.infer<typeof NoulAnswerSchema>;
 export type Evaluation = z.infer<typeof EvaluationSchema>;
+export type StopResult = z.infer<typeof StopResultSchema>;
 export type Result = z.infer<typeof ResultSchema>;
 export type Tool = z.infer<typeof ToolSchema>;
 export type QuotaSource = z.infer<typeof QuotaSourceSchema>;

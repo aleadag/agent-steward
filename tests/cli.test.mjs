@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { run, parseArgs, renderDecisionCard } from '../dist/src/cli.js';
-import { config, approval, candidate, choiceAnswer, jevResponse, snapshot } from './helpers.mjs';
+import { config, candidate, choiceAnswer, jevResponse, snapshot } from './helpers.mjs';
 
 const CONFIG_PATH = '/isolated/xdg/agent-steward/config.json';
 const SNAPSHOT_PATH = '/isolated/xdg/agent-steward/quota.json';
@@ -13,7 +13,7 @@ function runtime(overrides = {}) {
   return { out, err, reads, io: {
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg' }, cwd: '/isolated/work',
     readText: async path => { reads.push(path); return JSON.stringify(cfg); },
-    readStdin: async () => JSON.stringify(approval()),
+    readStdin: async () => JSON.stringify(stopInput()),
     stdout: text => out.push(text), stderr: text => err.push(text),
     now: () => new Date(NOW), newRequestId: () => 'generated-1',
     post: async () => { throw new Error('unexpected post'); }, ...overrides,
@@ -43,15 +43,33 @@ function routeAnswer(wire, index = 1) {
   return jevResponse({ [id]: choiceAnswer(probabilities) });
 }
 
-function approvalAnswer(wire) {
-  const waiting = Object.keys(wire.questions.waiting_for.criteria);
-  return jevResponse({
-    waiting_for: choiceAnswer(Object.fromEntries(waiting.map(key => [key, key === 'approve_command' ? 1 : 0]))),
-    risky: { type: 'noul', noul: 0.2 },
-  });
+const result = out => JSON.parse(out.join(''));
+
+function stopInput(overrides = {}) {
+  return {
+    schema_version: 2,
+    request_id: 'request-1',
+    agent: { id: 'agent-1', tool: 'pi', pane_id: 'w1:p2', session_id: null },
+    status: 'blocked',
+    current_episode_id: 'episode-1',
+    context: 'The stopped agent reports a recoverable API error.',
+    pending_action: { action: 'Retry the current API operation' },
+    automatic_approval_forbidden: false,
+    retry: {
+      failure_episode_id: 'episode-1', first_observed_at: '2026-09-29T10:00:00Z', attempt_count: 0,
+      last_attempt_at: null, quota_check_count: 0, last_quota_check_at: null,
+    },
+    ...overrides,
+  };
 }
 
-const result = out => JSON.parse(out.join(''));
+function stopAnswer(wire, waitingFor = 'recoverable_api_error', risk = 0.1, confidence = 0.9) {
+  const criteria = Object.keys(wire.questions.waiting_for.criteria);
+  return jevResponse({
+    waiting_for: choiceAnswer(Object.fromEntries(criteria.map(key => [key, key === waitingFor ? 1 : 0])), confidence),
+    risky: { type: 'noul', noul: risk },
+  });
+}
 
 test('launch unavailable before config or API and JSON stdout remains one envelope', async () => {
   const { io, out, err, reads } = runtime({
@@ -88,8 +106,10 @@ test('parser preserves the standard task data boundary and rejects options and e
   assert.throws(() => parseArgs(['session', 'show', '1']));
   assert.deepEqual(parseArgs(['--help']), { kind: 'help' });
   assert.throws(() => parseArgs(['--help', '-h']));
-  assert.deepEqual(parseArgs(['approval', 'check']), { kind: 'approval' });
-  assert.throws(() => parseArgs(['approval', 'check', '--json']));
+  assert.deepEqual(parseArgs(['stop', 'check']), { kind: 'stop' });
+  assert.deepEqual(parseArgs(['--config', 'chosen.json', 'stop', 'check']), { kind: 'stop', config: 'chosen.json' });
+  assert.throws(() => parseArgs(['approval', 'check']));
+  assert.throws(() => parseArgs(['stop', 'check', '--json']));
 });
 
 test('help lists exactly implemented forms and requires no configuration or credentials', async () => {
@@ -99,7 +119,8 @@ test('help lists exactly implemented forms and requires no configuration or cred
   });
   assert.equal(await run(['--help'], io), 0);
   assert.match(out.join(''), /session start <task> \[--dry-run\] \[--json\]/);
-  assert.match(out.join(''), /approval check/);
+  assert.match(out.join(''), /stop check/);
+  assert.doesNotMatch(out.join(''), /approval check/);
   assert.doesNotMatch(out.join(''), /session show|account list|usage refresh|choose-effort/);
   assert.deepEqual(reads, []);
   assert.deepEqual(err, []);
@@ -207,76 +228,99 @@ test('fixed and selected effort use explicit safe human rendering', () => {
   assert.match(card, /freshness: unknown/);
 });
 
-test('approval JSON exits are approve 0, manual review 2, no action 3, errors 1', async () => {
-  for (const [waitingFor, risk, confidence, decision, exit] of [
-    ['approve_command', 0.2, 0.9, 'approve', 0],
-    ['approve_edit', 0.6, 0.9, 'manual_review', 2],
-    ['other', 0.1, 0.9, 'manual_review', 2],
-    ['answer_question', 0.1, 0.9, 'no_action', 3],
+test('stop JSON exits are proposal 0, manual review 2, no action 3, errors 1', async () => {
+  for (const [waitingFor, risk, status, decision, action, exit] of [
+    ['approve_command', 0.2, 'blocked', 'stop_decision', 'approve_request', 0],
+    ['approve_edit', 0.6, 'blocked', 'stop_decision', 'manual_review', 2],
+    ['other', 0.1, 'blocked', 'stop_decision', 'manual_review', 2],
+    ['answer_question', 0.1, 'blocked', 'stop_decision', 'manual_review', 2],
+    ['completed', 0.1, 'done', 'stop_decision', 'no_action', 3],
+    ['recoverable_api_error', 0.1, 'blocked', 'stop_decision', 'send_recovery_instruction', 0],
+    ['quota_limit', 0.1, 'blocked', 'stop_decision', 'wait_for_quota', 0],
   ]) {
-    const { post } = fakePost(() => jevResponse({
-      waiting_for: choiceAnswer(Object.fromEntries(['approve_command', 'approve_edit', 'answer_question', 'credentials', 'error_help', 'other'].map(key => [key, key === waitingFor ? 1 : 0])), confidence),
-      risky: { type: 'noul', noul: risk },
-    }));
+    const { post } = fakePost(wire => stopAnswer(wire, waitingFor, risk));
     const { io, out, err } = runtime({
-      env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' }, post,
+      env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
+      readStdin: async () => JSON.stringify(stopInput({ status })),
+      now: () => new Date('2026-09-29T10:00:00Z'), post,
     });
-    assert.equal(await run(['approval', 'check'], io), exit, waitingFor);
+    assert.equal(await run(['stop', 'check'], io), exit, waitingFor);
+    assert.equal(result(out).schema_version, 2, waitingFor);
     assert.equal(result(out).decision, decision, waitingFor);
+    assert.equal(result(out).proposed_action.kind, action, waitingFor);
     assert.equal(out.length, 1);
     assert.ok(out[0].endsWith('\n'));
     assert.deepEqual(err, []);
   }
   const { io, out } = runtime({ readStdin: async () => '{' });
-  assert.equal(await run(['approval', 'check'], io), 1);
+  assert.equal(await run(['stop', 'check'], io), 1);
+  assert.equal(result(out).schema_version, 2);
   assert.equal(result(out).reason_code, 'invalid_input');
 });
 
-test('insufficient-context approval remains local without an API key or transport', async () => {
+test('insufficient-context stop remains local without an API key or transport', async () => {
+  let posts = 0;
   const { io, out, reads, err } = runtime({
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg' },
-    readStdin: async () => JSON.stringify(approval({ context: {}, pending_action: null })),
-    post: async () => { throw new Error('must not post'); },
+    readStdin: async () => JSON.stringify(stopInput({ context: null, pending_action: { action: 'Retry the operation', target: 'current task' } })),
+    post: async () => { posts++; throw new Error('must not post'); },
   });
-  assert.equal(await run(['approval', 'check'], io), 2);
+  assert.equal(await run(['stop', 'check'], io), 2);
   const value = result(out);
+  assert.equal(value.schema_version, 2);
   assert.equal(value.reason_code, 'insufficient_context');
-  assert.equal(value.waiting_for, null);
+  assert.equal(value.proposed_action.kind, 'manual_review');
+  assert.equal(value.waiting_for, 'other');
   assert.equal(value.evaluation, null);
   assert.deepEqual(reads, [CONFIG_PATH]);
+  assert.equal(posts, 0);
   assert.deepEqual(err, []);
 });
 
-test('captured optional key does not leak through local results or safe error IDs', async () => {
+test('configured optional key is captured for local and early-error request-ID privacy', async () => {
   const apiKey = 'SyntheticKey-Not-Pattern-4f91';
   const assertSafe = (out, err) => assert.equal((out.join('') + err.join('')).includes(apiKey), false);
   const env = { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: apiKey };
 
   const local = runtime({
     env,
-    readStdin: async () => JSON.stringify(approval({ request_id: 'local-safe-id', context: {}, pending_action: null })),
+    readStdin: async () => JSON.stringify(stopInput({ request_id: 'local-safe-id', context: {}, pending_action: null })),
     post: async () => { throw new Error('must not post'); },
   });
-  assert.equal(await run(['approval', 'check'], local.io), 2);
-  assert.equal(result(local.out).decision, 'manual_review');
+  assert.equal(await run(['stop', 'check'], local.io), 2);
+  assert.equal(result(local.out).schema_version, 2);
+  assert.equal(result(local.out).decision, 'stop_decision');
   assert.equal(result(local.out).request_id, 'local-safe-id');
   assertSafe(local.out, local.err);
 
+  const contaminatedLocalId = runtime({
+    env,
+    readStdin: async () => JSON.stringify(stopInput({ request_id: `prefix-${apiKey}-suffix`, context: {}, pending_action: null })),
+    post: async () => { throw new Error('must not post'); },
+  });
+  assert.equal(await run(['stop', 'check'], contaminatedLocalId.io), 1);
+  assert.equal(result(contaminatedLocalId.out).schema_version, 2);
+  assert.equal(result(contaminatedLocalId.out).reason_code, 'credential_detected');
+  assert.equal(result(contaminatedLocalId.out).request_id, null);
+  assertSafe(contaminatedLocalId.out, contaminatedLocalId.err);
+
   const invalidInput = runtime({
     env,
-    readStdin: async () => JSON.stringify(approval({ request_id: 'invalid-input-safe-id', agent: { id: '', tool: 'codex' } })),
+    readStdin: async () => JSON.stringify(stopInput({ request_id: `early-${apiKey}-error`, agent: { id: '', tool: 'pi', pane_id: 'p', session_id: null } })),
   });
-  assert.equal(await run(['approval', 'check'], invalidInput.io), 1);
-  assert.equal(result(invalidInput.out).reason_code, 'invalid_input');
-  assert.equal(result(invalidInput.out).request_id, 'invalid-input-safe-id');
+  assert.equal(await run(['stop', 'check'], invalidInput.io), 1);
+  assert.equal(result(invalidInput.out).schema_version, 2);
+  assert.equal(result(invalidInput.out).reason_code, 'credential_detected');
+  assert.equal(result(invalidInput.out).request_id, null);
   assertSafe(invalidInput.out, invalidInput.err);
 
   const invalidConfig = runtime({
     env,
-    readStdin: async () => JSON.stringify(approval({ request_id: 'invalid-config-safe-id' })),
+    readStdin: async () => JSON.stringify(stopInput({ request_id: 'invalid-config-safe-id' })),
     readText: async () => '{',
   });
-  assert.equal(await run(['approval', 'check'], invalidConfig.io), 1);
+  assert.equal(await run(['stop', 'check'], invalidConfig.io), 1);
+  assert.equal(result(invalidConfig.out).schema_version, 2);
   assert.equal(result(invalidConfig.out).reason_code, 'invalid_config');
   assert.equal(result(invalidConfig.out).request_id, 'invalid-config-safe-id');
   assertSafe(invalidConfig.out, invalidConfig.err);
@@ -321,13 +365,14 @@ test('configured non-pattern key rejects generated and caller IDs containing it 
   const apiKey = 'SyntheticKey-Not-Pattern-4f91';
   const contaminatedId = `prefix-${apiKey}-suffix`;
   const env = { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: apiKey };
-  for (const [args, overrides] of [
-    [['session', 'start', 'task'], { newRequestId: () => contaminatedId }],
-    [['approval', 'check'], { readStdin: async () => JSON.stringify(approval({ request_id: contaminatedId })) }],
+  for (const [args, overrides, version] of [
+    [['session', 'start', 'task'], { newRequestId: () => contaminatedId }, 1],
+    [['stop', 'check'], { readStdin: async () => JSON.stringify(stopInput({ request_id: contaminatedId })) }, 2],
   ]) {
     const { io, out, err, reads } = runtime({ ...overrides, env, post: async () => { throw new Error('must not post'); } });
     assert.equal(await run(args, io), 1);
     assert.equal((out.join('') + err.join('')).includes(apiKey), false);
+    assert.equal(result(out).schema_version, version);
     assert.equal(result(out).reason_code, 'credential_detected');
     assert.equal(result(out).request_id, null);
     assert.equal(out.length, 1);
@@ -338,27 +383,33 @@ test('configured non-pattern key rejects generated and caller IDs containing it 
   }
 });
 
-test('approval reads no quota and needs no non-empty routing inventory', async () => {
+test('stop assessment reads no quota and needs no routing inventory', async () => {
   const empty = config({ accounts: [], candidates: [] });
-  const { post } = fakePost(approvalAnswer);
+  const { post } = fakePost(wire => stopAnswer(wire, 'approve_edit'));
   const { io, out, reads } = runtime({
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
+    readStdin: async () => JSON.stringify(stopInput({ pending_action: { action: 'Edit the current draft' } })),
     readText: async path => { reads.push(path); return JSON.stringify(empty); }, post,
   });
-  assert.equal(await run(['approval', 'check'], io), 0);
+  assert.equal(await run(['stop', 'check'], io), 0);
   assert.deepEqual(reads, [CONFIG_PATH]);
-  assert.equal(result(out).decision, 'approve');
+  assert.equal(result(out).schema_version, 2);
+  assert.equal(result(out).proposed_action.kind, 'approve_request');
 });
 
-test('lazy credential lookup reports missing API key only when evaluation is needed', async () => {
-  for (const args of [['session', 'start', 'task', '--dry-run'], ['approval', 'check']]) {
+test('lazy credentials fail only when evaluation is needed and never make a live request without a key', async () => {
+  for (const args of [['session', 'start', 'task', '--dry-run'], ['stop', 'check']]) {
+    let posts = 0;
     const cfg = routeConfig();
     const { io, out } = runtime({
       env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg' },
       readText: async path => path === CONFIG_PATH ? JSON.stringify(cfg) : JSON.stringify(snapshot([])),
+      post: async () => { posts++; throw new Error('must not make a live request'); },
     });
     assert.equal(await run(args, io), 1);
     assert.equal(result(out).reason_code, 'missing_credentials');
+    if (args[0] === 'stop') assert.equal(result(out).schema_version, 2);
+    assert.equal(posts, 0);
   }
 });
 
@@ -376,39 +427,72 @@ test('custom config, enabled-tool filtering, and quota diagnostics remain local 
   assert.equal(result(out).selected.candidate_id, 'codex-astra');
 });
 
-test('invalid input and configuration produce one safe JSON error envelope', async () => {
-  for (const [args, overrides, reason] of [
-    [['approval', 'check'], { readStdin: async () => '{' }, 'invalid_input'],
-    [['approval', 'check'], { readText: async () => '{' }, 'invalid_config'],
-    [['session', 'start', ''], {}, 'invalid_input'],
+test('stop input and configuration errors use v2; malformed argv remains generic v1', async () => {
+  for (const [overrides, reason] of [
+    [{ readStdin: async () => '{' }, 'invalid_input'],
+    [{ readText: async () => '{' }, 'invalid_config'],
   ]) {
     const { io, out } = runtime(overrides);
-    assert.equal(await run(args, io), 1);
+    assert.equal(await run(['stop', 'check'], io), 1);
     assert.equal(out.length, 1);
+    assert.equal(result(out).schema_version, 2);
     assert.equal(result(out).reason_code, reason);
   }
-  const { io, out } = runtime();
-  assert.equal(await run(['not-a-command'], io), 1);
-  assert.equal(result(out).decision, 'error');
+  let reads = 0, posts = 0;
+  const obsolete = runtime({
+    readStdin: async () => { reads++; return JSON.stringify(stopInput()); },
+    post: async () => { posts++; throw new Error('must not post'); },
+  });
+  assert.equal(await run(['approval', 'check'], obsolete.io), 1);
+  assert.equal(result(obsolete.out).schema_version, 1);
+  assert.equal(result(obsolete.out).reason_code, 'invalid_input');
+  assert.equal(reads, 0);
+  assert.equal(posts, 0);
+
+  const malformed = runtime();
+  assert.equal(await run(['not-a-command'], malformed.io), 1);
+  assert.equal(result(malformed.out).schema_version, 1);
+  assert.equal(result(malformed.out).decision, 'error');
 });
 
-test('approval request IDs are preserved on later validation errors and malformed JSON uses null', async () => {
-  const withId = approval({ agent: { id: '', tool: 'codex' } });
+test('stop stdin retains the bounded byte and JSON-depth limits', async () => {
+  let posts = 0;
+  let nestedContext = 'deep';
+  for (let index = 0; index < 64; index++) nestedContext = [nestedContext];
+  for (const body of ['x'.repeat(1_048_577), JSON.stringify(stopInput({ context: nestedContext }))]) {
+    const { io, out } = runtime({
+      readStdin: async () => body,
+      post: async () => { posts++; throw new Error('must not post'); },
+    });
+    assert.equal(await run(['stop', 'check'], io), 1);
+    assert.equal(result(out).schema_version, 2);
+    assert.equal(result(out).reason_code, 'invalid_input');
+    assert.equal(result(out).request_id, null);
+  }
+  assert.equal(posts, 0);
+});
+
+test('stop request IDs are preserved after validation errors and malformed JSON uses null', async () => {
+  const withId = stopInput({ agent: { id: '', tool: 'pi', pane_id: 'p', session_id: null } });
   const first = runtime({ readStdin: async () => JSON.stringify(withId) });
-  assert.equal(await run(['approval', 'check'], first.io), 1);
+  assert.equal(await run(['stop', 'check'], first.io), 1);
+  assert.equal(result(first.out).schema_version, 2);
   assert.equal(result(first.out).request_id, 'request-1');
   const second = runtime({ readStdin: async () => '{"request_id":"secret' });
-  assert.equal(await run(['approval', 'check'], second.io), 1);
+  assert.equal(await run(['stop', 'check'], second.io), 1);
+  assert.equal(result(second.out).schema_version, 2);
   assert.equal(result(second.out).request_id, null);
-  const third = runtime({ readStdin: async () => JSON.stringify(approval({ request_id: '   ' })) });
-  assert.equal(await run(['approval', 'check'], third.io), 1);
+  const third = runtime({ readStdin: async () => JSON.stringify(stopInput({ request_id: '   ' })) });
+  assert.equal(await run(['stop', 'check'], third.io), 1);
+  assert.equal(result(third.out).schema_version, 2);
   assert.equal(result(third.out).request_id, null);
 });
 
 test('secret-containing caller IDs and untrusted evaluator metadata never reach output', async () => {
   const secret = 'sk-12345678901234567890';
-  const badId = runtime({ readStdin: async () => JSON.stringify(approval({ request_id: secret })) });
-  assert.equal(await run(['approval', 'check'], badId.io), 1);
+  const badId = runtime({ readStdin: async () => JSON.stringify(stopInput({ request_id: secret })) });
+  assert.equal(await run(['stop', 'check'], badId.io), 1);
+  assert.equal(result(badId.out).schema_version, 2);
   assert.equal(result(badId.out).reason_code, 'credential_detected');
   assert.equal(result(badId.out).request_id, null);
   assert.doesNotMatch(badId.out.join('') + badId.err.join(''), /12345678901234567890/);
@@ -438,18 +522,17 @@ test('secret-containing caller IDs and untrusted evaluator metadata never reach 
   assert.doesNotMatch(human.out.join('') + human.err.join(''), /12345678901234567890/);
 });
 
-test('approval evaluator metadata is checked before JSON output too', async () => {
+test('stop evaluator metadata is checked before JSON output with no partial proposal', async () => {
   const secret = 'sk-12345678901234567890';
-  const { post } = fakePost(() => jevResponse({
-    waiting_for: choiceAnswer({ approve_command: 1, approve_edit: 0, answer_question: 0, credentials: 0, error_help: 0, other: 0 }),
-    risky: { type: 'noul', noul: 0.1 },
-  }, { model: secret }));
+  const { post } = fakePost(wire => ({ ...stopAnswer(wire, 'approve_command'), model: secret }));
   const { io, out, err } = runtime({
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: secret }, post,
   });
-  assert.equal(await run(['approval', 'check'], io), 1);
+  assert.equal(await run(['stop', 'check'], io), 1);
+  assert.equal(result(out).schema_version, 2);
   assert.equal(result(out).reason_code, 'credential_detected');
   assert.equal(result(out).decision, 'error');
+  assert.equal(out.length, 1);
   assert.doesNotMatch(out.join('') + err.join(''), /12345678901234567890/);
 });
 
@@ -466,6 +549,35 @@ test('failed second evaluation emits only one error and never a partial route', 
   assert.equal(out.length, 1);
   assert.equal(result(out).decision, 'error');
   assert.equal(result(out).reason_code, 'invalid_response');
+});
+
+test('configured non-pattern key in evaluator metadata suppresses a partial stop proposal', async () => {
+  const apiKey = 'SyntheticKey-Not-Pattern-4f91';
+  const { post } = fakePost(wire => ({ ...stopAnswer(wire, 'approve_command'), model: apiKey }));
+  const { io, out } = runtime({
+    env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: apiKey }, post,
+  });
+  assert.equal(await run(['stop', 'check'], io), 1);
+  const value = result(out);
+  assert.equal(value.schema_version, 2);
+  assert.equal(value.decision, 'error');
+  assert.equal(value.reason_code, 'credential_detected');
+  assert.equal(Object.hasOwn(value, 'proposed_action'), false);
+  assert.doesNotMatch(out.join(''), /SyntheticKey-Not-Pattern-4f91/);
+});
+
+test('stop transport failures return one v2 error and never a partial proposal', async () => {
+  const { io, out } = runtime({
+    env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
+    post: async () => { throw new Error('private evaluator response'); },
+  });
+  assert.equal(await run(['stop', 'check'], io), 1);
+  assert.equal(out.length, 1);
+  assert.equal(result(out).schema_version, 2);
+  assert.equal(result(out).decision, 'error');
+  assert.equal(result(out).reason_code, 'evaluation_failed');
+  assert.equal(result(out).request_id, 'request-1');
+  assert.doesNotMatch(out.join(''), /private evaluator response|proposed_action/);
 });
 
 test('human cards JSON-escape untrusted metadata and generated IDs are credential checked', async () => {

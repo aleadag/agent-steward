@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { ApprovalInputSchema } from '../dist/src/contracts.js';
+import { StopInputSchema } from '../dist/src/contracts.js';
 import { parseArgs, run } from '../dist/src/cli.js';
 
 const skill = readFileSync(new URL('../skills/agent-steward/SKILL.md', import.meta.url), 'utf8');
 const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+const stopExample = JSON.parse(readFileSync(new URL('../examples/stop.json', import.meta.url), 'utf8'));
 
 function parseSkillCommands(text) {
   return [...text.matchAll(/^```bash\n([\s\S]*?)\n```/gm)].flatMap(match => match[1].split('\n'))
@@ -18,7 +19,7 @@ function shellWords(command) {
 
 function invocationForm(invocation) {
   if (invocation.kind === 'help') return 'help';
-  if (invocation.kind === 'approval') return 'approval-stdin';
+  if (invocation.kind === 'stop') return 'stop-stdin';
   return invocation.task.startsWith('-') ? 'route-literal-task' : 'route-task';
 }
 
@@ -27,7 +28,7 @@ function parseUsageForm(line) {
   form = form.replace(/^\[--config <path>\]\s+/, '--config config.json ');
   form = form.replace('session start <task> [--dry-run] [--json]', 'session start Review --dry-run --json');
   form = form.replace('session start --dry-run -- <task>', 'session start --dry-run -- --help');
-  form = form.replace('approval check < stopped-state.json', 'approval check');
+  form = form.replace('stop check < stopped-state.json', 'stop check');
   return parseArgs(shellWords(form));
 }
 
@@ -57,7 +58,8 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
     const command = line.slice('agent-steward '.length).replace(/\s+<\s+stopped-state\.json$/, '');
     return parseArgs(shellWords(command));
   });
-  assert.deepEqual(invocations.map(item => item.kind), ['help', 'route', 'route', 'approval']);
+  assert.deepEqual(invocations.map(item => item.kind), ['help', 'route', 'route', 'stop']);
+  assert.doesNotMatch(skill, /approval check/);
   assert.equal(invocations[2].task, '--help');
   for (const unavailable of ['session show', 'account list', 'usage refresh', 'session choose-effort']) {
     assert.match(skill, new RegExp(unavailable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '.{0,100}(?:unavailable|not available|does not)', 'is'));
@@ -65,12 +67,14 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
   assert.match(skill, /does not launch agents/i);
 });
 
-test('skill approval example parses with the real strict schema and identifies user-supplied input', () => {
+test('skill stop example parses with the real strict schema and identifies user-prepared input', () => {
   const block = skill.match(/```json\n([\s\S]*?)\n```/);
-  assert.ok(block, 'skill must include an actual approval JSON example');
+  assert.ok(block, 'skill must include an actual stop JSON example');
   const input = JSON.parse(block[1]);
-  assert.equal(ApprovalInputSchema.parse(input).status, 'stopped');
-  assert.match(skill, /user-prepared input/i);
+  assert.equal(StopInputSchema.parse(input).status, 'blocked');
+  assert.equal(input.current_episode_id, input.retry.failure_episode_id);
+  assert.equal(StopInputSchema.parse(stopExample).current_episode_id, stopExample.retry.failure_episode_id);
+  assert.match(skill, /user-prepared/i);
   assert.match(skill, /TYPESAFE_API_KEY/);
   assert.match(skill, /no launch|does not launch/i);
   assert.match(skill, /recognizable credential/i);
@@ -85,12 +89,13 @@ test('README documents offline distribution, option boundary, schemas, baselines
   for (const phrase of [
     'nix develop path:.', 'nix build path:.#agent-steward', 'nix flake check path:.',
     'nix run path:. --no-update-lock-file -- --help',
-    'session start --dry-run -- "--help"', 'schema_version', 'request_id',
+    'session start --dry-run -- "--help"', '`stop check`', 'schema_version', 'request_id',
     '1,048,576', '64', 'Codex 0.157.1', 'Pi 0.87.1', '`agy` 1.2.11',
     'jev-1.13.0', 'skills/agent-steward/SKILL.md', 'manual', 'user-selected',
     'runtime model/effort', 'authentication/account binding',
   ]) assert.ok(readme.includes(phrase), `README missing ${phrase}`);
   assert.match(readme, /not available|unavailable/i);
+  assert.doesNotMatch(readme, /approval check/);
   assert.match(readme, /copy|link/i);
   assert.doesNotMatch(readme, /\/nix\/store\/[0-9a-z]{32}/);
 });
