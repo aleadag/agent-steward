@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "source": "codex",
+  "account_id": "codex-subscription-example",
+  "windows": [
+    {
+      "scope": { "type": "account" },
+      "remaining_percent": 65,
+      "observed_at": "2026-09-28T09:00:00Z",
+      "reset_at": "2026-09-28T17:00:00Z",
+      "valid_until": "2026-09-28T12:00:00Z"
+    },
+    {
+      "scope": { "type": "pool", "pool_id": "primary" },
+      "remaining_percent": 42,
+      "observed_at": "2026-09-28T09:00:00Z",
+      "reset_at": "2026-09-28T17:00:00Z",
+      "valid_until": "2026-09-28T12:00:00Z"
+    }
+  ]
+}

@@ -125,3 +125,20 @@ bd prime                # Refresh Beads context
 
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/core-concepts/sync-concepts.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
+
+## Build & Test
+
+Use the pinned Nix development shell and locked npm dependencies:
+
+```bash
+nix develop path:.
+npm ci --ignore-scripts
+npm test
+npm run typecheck
+nix build path:.#agent-steward --no-update-lock-file
+nix flake check path:. --no-update-lock-file
+```
+
+## Architecture Overview
+
+The CLI in `src/cli.ts` injects bounded filesystem/stdin IO and Jev transport from the single `src/main.ts` entry point. Routing, approval, config, quota, syntax, and response validation remain separate modules. The Nix package supplies its Node.js runtime and bundles the standalone skill without installing or activating it.

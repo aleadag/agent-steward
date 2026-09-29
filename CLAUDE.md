@@ -60,17 +60,20 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
+Use the pinned Nix development shell and locked npm dependencies:
 
 ```bash
-# Example:
-# npm install
-# npm test
+nix develop path:.
+npm ci --ignore-scripts
+npm test
+npm run typecheck
+nix build path:.#agent-steward --no-update-lock-file
+nix flake check path:. --no-update-lock-file
 ```
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+The CLI in `src/cli.ts` injects bounded filesystem/stdin IO and mocked-or-real Jev transport from the single `src/main.ts` entry point. Routing, approval, config, quota, syntax, and response validation remain separate modules. The Nix package supplies its Node.js runtime and bundles the standalone skill without installing or activating it.
 
 ## Conventions & Patterns
 
