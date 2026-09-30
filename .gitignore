@@ -6,6 +6,7 @@
 .beads/proxieddb/
 *.gate.lock*
 node_modules/
+temp/
 dist/
 result
 result-*
