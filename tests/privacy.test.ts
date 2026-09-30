@@ -1,10 +1,12 @@
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { StewardError } from '../dist/src/contracts.js';
-import { assertNoCredentials } from '../dist/src/privacy.js';
-import { makeEvaluator } from '../dist/src/jev.js';
+import { StewardError } from '../src/contracts.ts';
+import { LimitError } from '../src/limits.ts';
+import type { HttpPost, Questions } from '../src/jev.ts';
+import { assertNoCredentials } from '../src/privacy.ts';
+import { makeEvaluator } from '../src/jev.ts';
 
-const patterns = [
+const patterns: [string, string][] = [
   ['private key', '-----BEGIN PRIVATE KEY-----'],
   ['RSA private key', '-----BEGIN RSA PRIVATE KEY-----'],
   ['EC private key', '-----BEGIN EC PRIVATE KEY-----'],
@@ -50,7 +52,7 @@ test('serialized caller-derived content is checked even if its enumerable form d
   const content = { toJSON: () => ({ derived: secret }) };
   assert.throws(
     () => assertNoCredentials(content, ''),
-    (error) => error.code === 'credential_detected',
+    (error) => error instanceof StewardError && error.code === 'credential_detected',
   );
 });
 
@@ -76,11 +78,11 @@ test('benign descriptions, flags, short token prefixes, filenames, and risk text
 });
 
 test('privacy traversal rejects excess container depth before walking contents', () => {
-  let nested = 'ordinary';
+  let nested: unknown = 'ordinary';
   for (let index = 0; index < 65; index++) nested = [nested];
   assert.throws(
     () => assertNoCredentials(nested, ''),
-    (error) => error.name === 'LimitError',
+    (error) => error instanceof LimitError,
   );
 });
 
@@ -102,18 +104,24 @@ test('recognizable credentials in caller criteria never reach transport', async 
         pair: { type: 'choice', instructions: 'Choose a supplied option', criteria: { a: secret } },
       },
     ),
-    (error) => error.code === 'credential_detected' && !error.message.includes(secret),
+    (error) => error instanceof StewardError && error.code === 'credential_detected' && !error.message.includes(secret),
   );
   assert.equal(calls, 0);
 });
 
 test('configured evaluator model and option names are included in the privacy scan', async () => {
   let calls = 0;
-  const questions = { pair: { type: 'choice', instructions: 'Choose one.', criteria: { safe: 'Only option' } } };
-  for (const configure of [
+  const pairQuestion = {
+    type: 'choice',
+    instructions: 'Choose one.',
+    criteria: { safe: 'Only option' },
+  } satisfies Questions[string];
+  const questions: Questions = { pair: pairQuestion };
+  const configs: { model: string; apiKey: string; option?: string }[] = [
     { model: 'sk-' + 'M'.repeat(20), apiKey: 'unit-key-not-live' },
     { model: 'jev-1.13.0', apiKey: 'unit-key-not-live', option: 'ghp_' + 'O'.repeat(20) },
-  ]) {
+  ];
+  for (const configure of configs) {
     const evaluate = makeEvaluator({
       model: configure.model,
       apiKey: configure.apiKey,
@@ -122,13 +130,16 @@ test('configured evaluator model and option names are included in the privacy sc
         return { status: 200, body: '{}' };
       },
     });
-    const question =
+    const question: Questions =
       configure.option === undefined
         ? questions
         : {
-            pair: { ...questions.pair, criteria: Object.fromEntries([[configure.option, 'Only option']]) },
+            pair: { ...pairQuestion, criteria: Object.fromEntries([[configure.option, 'Only option']]) },
           };
-    await assert.rejects(evaluate({}, question), (error) => error.code === 'credential_detected');
+    await assert.rejects(
+      evaluate({}, question),
+      (error) => error instanceof StewardError && error.code === 'credential_detected',
+    );
   }
   assert.equal(calls, 0);
 });
@@ -137,10 +148,10 @@ test('API keys must be nonblank and supplied keys are not trimmed', async () => 
   for (const apiKey of ['', '  \t']) {
     assert.throws(
       () => makeEvaluator({ model: 'jev-1.13.0', apiKey, post: async () => ({ status: 200, body: '{}' }) }),
-      (error) => error.code === 'missing_credentials',
+      (error) => error instanceof StewardError && error.code === 'missing_credentials',
     );
   }
-  let captured;
+  let captured: Parameters<HttpPost>[0] | undefined;
   const evaluate = makeEvaluator({
     model: 'jev-1.13.0',
     apiKey: ' key ',
@@ -157,5 +168,6 @@ test('API keys must be nonblank and supplied keys are not trimmed', async () => 
     },
   });
   await evaluate({}, { pair: { type: 'choice', instructions: 'Choose one.', criteria: { a: 'Only option' } } });
+  assert.ok(captured);
   assert.equal(captured.headers.authorization, 'Bearer  key ');
 });

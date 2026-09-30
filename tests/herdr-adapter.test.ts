@@ -1,15 +1,27 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { test } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, cp, chmod, readFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { handleEvent, runEvent } from '../dist/src/herdr-adapter/entry.js';
-import { observeStop } from '../dist/src/herdr-adapter/observe.js';
+import { handleEvent, runEvent } from '../src/herdr-adapter/entry.ts';
+import { observeStop } from '../src/herdr-adapter/observe.ts';
+import type { HerdrControl } from '../src/herdr-adapter/deliver.ts';
+import type { EventDeps } from '../src/herdr-adapter/entry.ts';
+import type { AgentSnapshot, HerdrReader, ReadSnapshot } from '../src/herdr-adapter/observe.ts';
+import type { Episode } from '../src/herdr-adapter/state.ts';
+import type { StopInput, StopResult } from '../src/contracts.ts';
+
+type TestHandoffReason = Parameters<EventDeps['handoff']>[0];
+type AdapterHerdr = HerdrReader &
+  HerdrControl & {
+    replace: (next: AgentSnapshot | null) => void;
+    sendKeys: (paneId: string, keys: string[]) => Promise<void>;
+  };
 
 const event = { type: 'pane_agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent_status: 'blocked' };
-const agent = (overrides = {}) => ({
+const agent = (overrides: Partial<AgentSnapshot> = {}): AgentSnapshot => ({
   pane_id: 'w1:p1',
   workspace_id: 'w1',
   agent: 'pi',
@@ -19,15 +31,16 @@ const agent = (overrides = {}) => ({
   revision: 8,
   ...overrides,
 });
-const output = (overrides = {}) => ({
-  pane_id: 'w1:p1',
-  source: 'detection',
-  revision: 8,
-  text: 'Current API failure: request timed out',
-  truncated: false,
-  ...overrides,
-});
-function fakeHerdr(pane = agent(), read = output()) {
+const output = (overrides: Omit<Partial<ReadSnapshot>, 'truncated'> & { truncated?: unknown } = {}): ReadSnapshot =>
+  ({
+    pane_id: 'w1:p1',
+    source: 'detection',
+    revision: 8,
+    text: 'Current API failure: request timed out',
+    truncated: false,
+    ...overrides,
+  }) as ReadSnapshot;
+function fakeHerdr(pane: AgentSnapshot | null = agent(), read: ReadSnapshot = output()): AdapterHerdr {
   let current = pane;
   return {
     get: async () => current,
@@ -43,7 +56,12 @@ function fakeHerdr(pane = agent(), read = output()) {
     },
   };
 }
-function localDecision(input) {
+function firstCall(calls: StopInput[]): StopInput {
+  const input = calls[0];
+  assert.ok(input);
+  return input;
+}
+function localDecision(input: StopInput): StopResult {
   return {
     schema_version: 2,
     request_id: input.request_id,
@@ -56,12 +74,12 @@ function localDecision(input) {
     evaluation: null,
   };
 }
-function fixture(herdr = fakeHerdr()) {
-  const calls = [];
-  const handoffs = [];
-  const records = [];
-  let history = null;
-  const deps = {
+function fixture(herdr: EventDeps['herdr'] = fakeHerdr()) {
+  const calls: StopInput[] = [];
+  const handoffs: TestHandoffReason[] = [];
+  const records: Episode[] = [];
+  let history: Episode | null = null;
+  const deps: EventDeps = {
     herdr,
     decide: async (input) => {
       calls.push(input);
@@ -90,9 +108,10 @@ test('bounded detection snapshot is classified, but event agent mismatch rejects
   const identifiedEvent = { ...event, agent: 'pi' };
   await handleEvent(identifiedEvent, deps);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].schema_version, 2);
-  assert.equal(calls[0].context, 'Current API failure: request timed out');
-  assert.deepEqual(calls[0].agent, { id: 's1', tool: 'pi', pane_id: 'w1:p1', session_id: 's1' });
+  const input = firstCall(calls);
+  assert.equal(input.schema_version, 2);
+  assert.equal(input.context, 'Current API failure: request timed out');
+  assert.deepEqual(input.agent, { id: 's1', tool: 'pi', pane_id: 'w1:p1', session_id: 's1' });
   herdr.replace(
     agent({ agent: 'codex', agent_session: { agent: 'codex', source: 'integration:codex', kind: 'id', value: 's2' } }),
   );
@@ -117,7 +136,7 @@ test('Herdr event envelope is only a trigger and is re-read before deciding', as
   const { deps, calls } = fixture();
   await handleEvent({ event: 'pane_agent_status_changed', data: event }, deps);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].agent.session_id, 's1');
+  assert.equal(firstCall(calls).agent.session_id, 's1');
 });
 
 test('moving occupant during read prevents decision', async () => {
@@ -133,7 +152,7 @@ test('moving occupant during read prevents decision', async () => {
 });
 
 test('rejected detection or unsupported identity emits only a local handoff and no decision', async () => {
-  for (const [pane, read] of [
+  const rejectedCases: [AgentSnapshot | null, ReadSnapshot][] = [
     [agent(), output({ source: 'recent', text: 'Old terminal history\nCurrent API failure: request timed out' })],
     [agent(), output({ text: 'api_key=supersecretvalue1234' })],
     [agent(), output({ text: 'x'.repeat(4096) })],
@@ -145,7 +164,8 @@ test('rejected detection or unsupported identity emits only a local handoff and 
     [agent({ agent_status: 'unknown' }), output()],
     [agent({ agent_status: 'working' }), output()],
     [null, output()],
-  ]) {
+  ];
+  for (const [pane, read] of rejectedCases) {
     const { deps, calls, handoffs, records } = fixture(fakeHerdr(pane, read));
     await handleEvent(event, deps);
     assert.equal(calls.length, 0);
@@ -212,6 +232,8 @@ test('package-relative script uses only its sibling wrapper and rejects other co
   await chmod(wrapper, 0o755);
   await writeFile(join(base, 'node'), '#!/bin/sh\nexit 43\n');
   await chmod(join(base, 'node'), 0o755);
+  await writeFile(join(base, 'bun'), '#!/bin/sh\nexit 43\n');
+  await chmod(join(base, 'bun'), 0o755);
   const result = spawnSync('sh', [script, 'event'], { encoding: 'utf8', env: { PATH: `${base}:${process.env.PATH}` } });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, 'event');
@@ -222,16 +244,18 @@ test('package-relative script uses only its sibling wrapper and rejects other co
 test('plain detection text is untrusted evidence: accepted without asserting an isolated stop', async () => {
   const text = 'Old screen line\nCurrent API failure: request timed out';
   const observed = await observeStop(fakeHerdr(agent(), output({ text })), 'w1:p1');
+  assert.ok(observed);
   assert.equal(observed.context, text);
   const { deps, calls } = fixture(fakeHerdr(agent(), output({ text })));
   await handleEvent(event, deps);
-  assert.equal(calls[0].context, text);
-  assert.equal(calls[0].pending_action, undefined);
-  assert.equal(calls[0].automatic_approval_forbidden, true);
+  const decision = firstCall(calls);
+  assert.equal(decision.context, text);
+  assert.equal(decision.pending_action, undefined);
+  assert.equal(decision.automatic_approval_forbidden, true);
 });
 
 test('invalid decision output, error envelope, mismatch and transport failure never record an assessed episode', async () => {
-  for (const decide of [
+  const invalidDecisions: EventDeps['decide'][] = [
     async () => undefined,
     async () => ({
       schema_version: 2,
@@ -240,11 +264,12 @@ test('invalid decision output, error envelope, mismatch and transport failure ne
       reason_code: 'invalid_response',
       message: 'invalid response',
     }),
-    async (input) => ({ ...localDecision(input), request_id: 'other-request' }),
+    async (input: StopInput) => ({ ...localDecision(input), request_id: 'other-request' }),
     async () => {
       throw new Error('sensitive transport details');
     },
-  ]) {
+  ];
+  for (const decide of invalidDecisions) {
     const { deps, records, handoffs } = fixture();
     await handleEvent(event, { ...deps, decide });
     assert.equal(records.length, 0);
@@ -253,7 +278,7 @@ test('invalid decision output, error envelope, mismatch and transport failure ne
 });
 
 test('valid human-only proposals hand off locally before any episode can suppress the handoff', async () => {
-  const approvals = (input) => ({
+  const approvals = (input: StopInput): StopResult => ({
     schema_version: 2,
     request_id: input.request_id,
     decision: 'stop_decision',
@@ -303,7 +328,7 @@ test('non-human-only valid decisions record only episode metadata', async () => 
 test('read-only Herdr 0.9.1 socket result and event envelope provide bounded classification evidence', async () => {
   const base = await mkdtemp(join(tmpdir(), 'steward-socket-'));
   const path = join(base, 'herdr.sock');
-  const methods = [];
+  const methods: [string, unknown][] = [];
   const server = createServer((socket) => {
     let request = '';
     socket.on('data', (chunk) => {
@@ -326,13 +351,13 @@ test('read-only Herdr 0.9.1 socket result and event envelope provide bounded cla
       socket.end(JSON.stringify({ id, result }) + '\n');
     });
   });
-  await new Promise((resolve) => server.listen(path, resolve));
+  await new Promise<void>((resolve) => server.listen(path, () => resolve()));
   try {
-    const adapter = await import('../dist/src/herdr-adapter/entry.js');
+    const adapter = await import('../src/herdr-adapter/entry.ts');
     const { deps, calls } = fixture(adapter.socketReader(path));
     await handleEvent({ event: 'pane_agent_status_changed', data: { ...event, type: undefined } }, deps);
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].context, 'Old screen line\nAPI failed');
+    assert.equal(firstCall(calls).context, 'Old screen line\nAPI failed');
     assert.deepEqual(methods, [
       ['agent.get', { target: 'w1:p1' }],
       ['agent.read', { target: 'w1:p1', source: 'detection', lines: 12, format: 'text' }],
@@ -347,10 +372,10 @@ test('read-only Herdr 0.9.1 socket result and event envelope provide bounded cla
 test('fake decision subprocess sends version-2 stop check JSON and rejects malformed JSON, exit and error envelope', async () => {
   const base = await mkdtemp(join(tmpdir(), 'steward-cli-'));
   const script = join(base, 'fake.mjs');
-  const adapter = await import('../dist/src/herdr-adapter/entry.js');
+  const adapter = await import('../src/herdr-adapter/entry.ts');
   const { deps, calls } = fixture();
   await handleEvent(event, deps);
-  const input = calls[0];
+  const input = firstCall(calls);
   await writeFile(
     script,
     `let data = ''; for await (const chunk of process.stdin) data += chunk;
@@ -383,7 +408,7 @@ test('stalled stop check is killed at a short test deadline and handed off witho
     `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetTimeout(() => { writeFileSync(${JSON.stringify(finishedFile)}, 'done'); process.exit(0); }, 2_500);\n`,
   );
   const { deps, records, handoffs } = fixture();
-  const adapter = await import('../dist/src/herdr-adapter/entry.js');
+  const adapter = await import('../src/herdr-adapter/entry.ts');
   const started = Date.now();
   await handleEvent(event, { ...deps, decide: (input) => adapter.decideWithCli(input, script, 1_000) });
   assert.ok(Date.now() - started < 2_000, 'decision exceeded the bounded subprocess deadline');
@@ -413,10 +438,11 @@ test('Pi 0.9.1 path session classifies only the bounded untrusted detection exce
   const { deps, calls, records, handoffs } = fixture(fakeHerdr(pane, read));
   await handleEvent({ ...event, agent: 'pi', agent_status: 'idle' }, deps);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].context, piExcerpt);
-  assert.deepEqual(calls[0].agent, { id: piPath, tool: 'pi', pane_id: 'w1:p1', session_id: piPath });
-  assert.equal(calls[0].pending_action, undefined);
-  assert.equal(calls[0].automatic_approval_forbidden, true);
+  const decision = firstCall(calls);
+  assert.equal(decision.context, piExcerpt);
+  assert.deepEqual(decision.agent, { id: piPath, tool: 'pi', pane_id: 'w1:p1', session_id: piPath });
+  assert.equal(decision.pending_action, undefined);
+  assert.equal(decision.automatic_approval_forbidden, true);
   assert.deepEqual(records, []);
   assert.deepEqual(handoffs, ['human_review_required']);
 });
@@ -469,5 +495,6 @@ test('Pi 0.9.1 requires an authentic-looking native path and Codex without sessi
 test('explicit 12-line/2048-byte detection limits accept boundary without clipping', async () => {
   const within = 'a'.repeat(2037) + '\n'.repeat(11);
   const observed = await observeStop(fakeHerdr(agent(), output({ text: within })), 'w1:p1');
+  assert.ok(observed);
   assert.equal(observed.context, within);
 });

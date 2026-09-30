@@ -1,11 +1,11 @@
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
-import { LimitError, MAX_JSON_BYTES } from '../dist/src/limits.js';
-import { readBoundedUtf8, readFileText } from '../dist/src/io.js';
+import { LimitError, MAX_JSON_BYTES } from '../src/limits.ts';
+import { readBoundedUtf8, readFileText } from '../src/io.ts';
 
 test('bounded reader accepts exactly the byte cap and decodes UTF-8 split across chunks', async () => {
   const exact = await readBoundedUtf8(Readable.from([Buffer.from('é'.repeat(MAX_JSON_BYTES / 2))]));

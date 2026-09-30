@@ -1,8 +1,9 @@
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { buildCommand } from '../dist/src/commands.js';
-import { assertLiveTask, buildNativeLaunch } from '../dist/src/launch.js';
-import { candidate } from './helpers.mjs';
+import { buildCommand } from '../src/commands.ts';
+import { assertLiveTask, buildNativeLaunch } from '../src/launch.ts';
+import { candidate } from './helpers.ts';
+import type { Candidate } from '../src/contracts.ts';
 
 const toolCandidates = [
   candidate({ tool: 'codex', provider: 'openai' }),
@@ -11,7 +12,7 @@ const toolCandidates = [
 ];
 const tasks = ['@private.md', '--help', "x';$(touch /tmp/never)", 'first line\nsecond line'];
 
-function expectedPromptArgs(tool, task) {
+function expectedPromptArgs(tool: Candidate['tool'], task: string): string[] {
   const message = `User task:\n${task}`;
   return tool === 'agy' ? [`--prompt-interactive=${message}`] : ['--', message];
 }
@@ -28,7 +29,7 @@ test('native launch appends one prefixed task argument without changing configur
 });
 
 test('native launch preserves default effort omission for every tool', () => {
-  const defaultArgs = {
+  const defaultArgs: Record<Candidate['tool'], string[]> = {
     codex: ['--model', 'gpt-astra-example', '-c', 'model_provider="openai"'],
     pi: ['--provider', 'openai-codex', '--model', 'gpt-astra-example'],
     agy: ['--model=gpt-astra-example'],
@@ -55,7 +56,7 @@ test('live tasks reject blank text and ASCII controls other than tab and newline
     assert.throws(() => assertLiveTask(`before${String.fromCharCode(code)}after`), { code: 'invalid_input' });
   }
   assert.doesNotThrow(() => assertLiveTask('tab\there\nand newline'));
-  assert.throws(() => buildNativeLaunch(buildCommand(toolCandidates[0], 'low'), 'bad\x1b[2J'), {
+  assert.throws(() => buildNativeLaunch(buildCommand(toolCandidates[0]!, 'low'), 'bad\x1b[2J'), {
     code: 'invalid_input',
   });
 });

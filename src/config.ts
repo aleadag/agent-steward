@@ -1,7 +1,7 @@
 import { dirname, isAbsolute, resolve } from 'node:path';
-import { ConfigSchema, StewardError } from './contracts.js';
-import type { Config, ConfigEnv, ReadText } from './contracts.js';
-import { assertByteLength, assertJsonDepth } from './limits.js';
+import { ConfigSchema, StewardError } from './contracts.ts';
+import type { Config, ConfigEnv, ReadText } from './contracts.ts';
+import { assertByteLength, assertJsonDepth } from './limits.ts';
 
 export async function loadConfig(
   override: string | undefined,

@@ -1,13 +1,21 @@
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { loadConfig } from '../dist/src/config.js';
-import { StewardError } from '../dist/src/contracts.js';
-import { config } from './helpers.mjs';
+import { loadConfig } from '../src/config.ts';
+import { StewardError } from '../src/contracts.ts';
+import type { ConfigEnv, ReadText } from '../src/contracts.ts';
+import { config } from './helpers.ts';
 
 const cwd = '/work';
-const jsonReader = (raw) => async (path) => JSON.stringify(raw);
+const jsonReader =
+  (raw: unknown): ReadText =>
+  async (_path: string) =>
+    JSON.stringify(raw) ?? '';
 
-async function rejectsConfig(readText, env = { HOME: '/isolated/home' }, override) {
+async function rejectsConfig(
+  readText: ReadText,
+  env: ConfigEnv = { HOME: '/isolated/home' },
+  override: string | undefined = undefined,
+) {
   await assert.rejects(
     loadConfig(override, { env, cwd, readText }),
     (error) => error instanceof StewardError && error.code === 'invalid_config',
@@ -15,11 +23,15 @@ async function rejectsConfig(readText, env = { HOME: '/isolated/home' }, overrid
 }
 
 test('XDG config, relative quota path, and nested defaults', async () => {
-  const raw = config();
-  raw.accounts[0].snapshot = 'quota.json';
-  delete raw.jev;
-  raw.thresholds = { risky: 0.7 };
-  const reads = [];
+  const { jev: _jev, ...rawWithoutJev } = config();
+  const [firstAccount] = rawWithoutJev.accounts;
+  assert.ok(firstAccount);
+  const raw = {
+    ...rawWithoutJev,
+    accounts: [{ ...firstAccount, snapshot: 'quota.json' }],
+    thresholds: { risky: 0.7 },
+  };
+  const reads: string[] = [];
   const result = await loadConfig(undefined, {
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg' },
     cwd: '/work',
@@ -29,15 +41,19 @@ test('XDG config, relative quota path, and nested defaults', async () => {
     },
   });
   assert.deepEqual(reads, ['/isolated/xdg/agent-steward/config.json']);
-  assert.equal(result.accounts[0].snapshot, '/isolated/xdg/agent-steward/quota.json');
+  const [resolvedAccount] = result.accounts;
+  assert.ok(resolvedAccount);
+  assert.equal(resolvedAccount.snapshot, '/isolated/xdg/agent-steward/quota.json');
   assert.equal(result.jev.model, 'jev-1.13.0');
   assert.deepEqual(result.thresholds, { risky: 0.7, choiceConfidence: 0.45 });
 });
 
 test('HOME fallback and relative explicit config resolve snapshots from its directory', async () => {
   const raw = config();
-  raw.accounts[0].snapshot = '../quota.json';
-  const reads = [];
+  const firstAccount = raw.accounts[0];
+  assert.ok(firstAccount);
+  firstAccount.snapshot = '../quota.json';
+  const reads: string[] = [];
   const result = await loadConfig('settings/config.json', {
     env: { HOME: '/isolated/home' },
     cwd,
@@ -47,9 +63,11 @@ test('HOME fallback and relative explicit config resolve snapshots from its dire
     },
   });
   assert.deepEqual(reads, ['/work/settings/config.json']);
-  assert.equal(result.accounts[0].snapshot, '/work/quota.json');
+  const [resolvedAccount] = result.accounts;
+  assert.ok(resolvedAccount);
+  assert.equal(resolvedAccount.snapshot, '/work/quota.json');
 
-  const homeReads = [];
+  const homeReads: string[] = [];
   await loadConfig(undefined, {
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '' },
     cwd,
@@ -63,8 +81,10 @@ test('HOME fallback and relative explicit config resolve snapshots from its dire
 
 test('absolute override is used as-is and absolute snapshot remains absolute', async () => {
   const raw = config();
-  raw.accounts[0].snapshot = '/snapshots/quota.json';
-  const reads = [];
+  const firstAccount = raw.accounts[0];
+  assert.ok(firstAccount);
+  firstAccount.snapshot = '/snapshots/quota.json';
+  const reads: string[] = [];
   const result = await loadConfig('/isolated/custom.json', {
     env: {},
     cwd,
@@ -74,7 +94,9 @@ test('absolute override is used as-is and absolute snapshot remains absolute', a
     },
   });
   assert.deepEqual(reads, ['/isolated/custom.json']);
-  assert.equal(result.accounts[0].snapshot, '/snapshots/quota.json');
+  const [resolvedAccount] = result.accounts;
+  assert.ok(resolvedAccount);
+  assert.equal(resolvedAccount.snapshot, '/snapshots/quota.json');
 });
 
 test('rejects relative XDG paths and missing HOME without fallback reads', async () => {
@@ -106,7 +128,8 @@ test('missing and unreadable config files become safe invalid_config errors', as
           throw failure;
         },
       }),
-      (error) => error.code === 'invalid_config' && !error.message.includes('/private'),
+      (error) =>
+        error instanceof StewardError && error.code === 'invalid_config' && !error.message.includes('/private'),
     );
   }
 });
@@ -119,25 +142,29 @@ test('malformed or oversized JSON is rejected without echoing its contents', asy
         cwd,
         readText: async () => content,
       }),
-      (error) => error.code === 'invalid_config' && !error.message.includes(content.slice(0, 40)),
+      (error) =>
+        error instanceof StewardError &&
+        error.code === 'invalid_config' &&
+        !error.message.includes(content.slice(0, 40)),
     );
   }
 });
 
 test('unknown fields, credential fields, and prototype keys fail without mutation', async () => {
-  const raw = config();
-  raw.api_key = 'not-a-real-secret';
+  const raw: Record<string, unknown> = { ...config(), api_key: 'not-a-real-secret' };
   await rejectsConfig(jsonReader(raw));
 
-  const parsed = JSON.parse(
+  const parsed: unknown = JSON.parse(
     '{"tools":["codex"],"accounts":[],"candidates":[],"__proto__":{"polluted":true},"constructor":{"polluted":true}}',
   );
-  const before = Object.prototype.polluted;
+  const before = Object.getOwnPropertyDescriptor(Object.prototype, 'polluted');
   await rejectsConfig(jsonReader(parsed));
-  assert.equal(Object.prototype.polluted, before);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(Object.prototype, 'polluted'), before);
 });
 
 test('invalid references and duplicate identities fail before returning config', async () => {
+  const configuredCandidate = config().candidates[0];
+  assert.ok(configuredCandidate);
   const cases = [
     config({
       accounts: [
@@ -145,9 +172,9 @@ test('invalid references and duplicate identities fail before returning config',
         { id: 'shared', source: 'antigravity' },
       ],
     }),
-    config({ candidates: [config().candidates[0], config().candidates[0]] }),
-    config({ candidates: [config().candidates[0], { ...config().candidates[0], id: 'other', account_id: 'missing' }] }),
-    config({ candidates: [config().candidates[0], { ...config().candidates[0], id: 'other', tool: 'unknown' }] }),
+    config({ candidates: [configuredCandidate, configuredCandidate] }),
+    config({ candidates: [configuredCandidate, { ...configuredCandidate, id: 'other', account_id: 'missing' }] }),
+    config({ candidates: [configuredCandidate, { ...configuredCandidate, id: 'other', tool: 'unknown' }] }),
     config({
       candidates: [
         {
@@ -165,14 +192,18 @@ test('invalid references and duplicate identities fail before returning config',
 });
 
 test('disabled candidates remain configured and empty inventory is valid for approval', async () => {
-  const raw = config({ tools: ['pi'], candidates: [config().candidates[0]] });
+  const configuredCandidate = config().candidates[0];
+  assert.ok(configuredCandidate);
+  const raw = config({ tools: ['pi'], candidates: [configuredCandidate] });
   const result = await loadConfig(undefined, {
     env: { HOME: '/isolated/home' },
     cwd,
     readText: jsonReader(raw),
   });
   assert.equal(result.candidates.length, 1);
-  assert.equal(result.candidates[0].tool, 'codex');
+  const [retainedCandidate] = result.candidates;
+  assert.ok(retainedCandidate);
+  assert.equal(retainedCandidate.tool, 'codex');
 
   const empty = await loadConfig(undefined, {
     env: { HOME: '/isolated/home' },
@@ -190,6 +221,6 @@ test('all config errors use safe constant messages', async () => {
       cwd,
       readText: async () => JSON.stringify({ ...config(), extra: text }),
     }),
-    (error) => error.code === 'invalid_config' && !error.message.includes(text),
+    (error) => error instanceof StewardError && error.code === 'invalid_config' && !error.message.includes(text),
   );
 });

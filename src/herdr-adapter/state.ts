@@ -3,8 +3,9 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { compareRfc3339Timestamps } from '../timestamps.js';
-import type { StopInput } from '../contracts.js';
+import { compareRfc3339Timestamps } from '../timestamps.ts';
+import type { StopInput } from '../contracts.ts';
+import { SchedulerLeaseStore, type LeaseAttempt, type LeaseOptions } from './lease.ts';
 
 type Retry = StopInput['retry'];
 export type Episode = Retry & {
@@ -111,10 +112,15 @@ function filename(pane: string): string {
 }
 
 export class EpisodeStore {
+  private readonly leases: SchedulerLeaseStore;
+
   constructor(
     readonly directory: string,
     private readonly nowMilliseconds: () => number = () => Date.now(),
-  ) {}
+    options: LeaseOptions = {},
+  ) {
+    this.leases = new SchedulerLeaseStore(directory, () => this.prepare(), nowMilliseconds, options);
+  }
   async prepare(): Promise<void> {
     const uid = process.getuid?.();
     if (uid === undefined) throw new Error('unsafe plugin state directory');
@@ -232,86 +238,29 @@ export class EpisodeStore {
     }
     return next;
   }
-  private leasePath(): string {
-    return join(this.directory, 'scheduler-lease');
+  beginAcquire(session: string): LeaseAttempt {
+    return this.leases.beginAcquire(session);
   }
-  async active(session?: string): Promise<boolean> {
-    const lease = await owner(this.leasePath());
-    return (
-      !!lease &&
-      (session === undefined || lease.session === session) &&
-      lease.heartbeat + ttl > this.nowMilliseconds() &&
-      alive(lease.pid) === true
-    );
+  acquire(session: string): Promise<string | null> {
+    return this.leases.acquire(session);
   }
-  // A separate event-hook process may inspect the scheduler's lease but cannot
-  // claim its PID. Bind that hook to the exact token observed at invocation.
-  async activeToken(session: string): Promise<string | null> {
-    const lease = await owner(this.leasePath());
-    return lease &&
-      lease.session === session &&
-      lease.token &&
-      lease.heartbeat + ttl > this.nowMilliseconds() &&
-      alive(lease.pid) === true
-      ? lease.token
-      : null;
+  active(session?: string): Promise<boolean> {
+    return this.leases.active(session);
   }
-  async leaseMatches(token: string, session: string): Promise<boolean> {
-    return !!token && (await this.activeToken(session)) === token;
+  activeToken(session: string): Promise<string | null> {
+    return this.leases.activeToken(session);
   }
-  async acquire(session: string): Promise<string | null> {
-    await this.prepare();
-    const path = this.leasePath();
-    const token = randomUUID();
-    try {
-      await mkdir(path, { mode: 0o700 });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      // A stale timestamp alone is not proof of death. Serialize takeover and re-read owner
-      // before deleting it. Unknown ownership never authorizes two runners.
-      const guard = join(this.directory, 'takeover-guard');
-      try {
-        await mkdir(guard, { mode: 0o700 });
-      } catch {
-        return null;
-      }
-      try {
-        const previous = await owner(path);
-        if (!previous || previous.heartbeat + ttl > this.nowMilliseconds() || alive(previous.pid) !== false)
-          return null;
-        await rm(path, { recursive: true });
-        await mkdir(path, { mode: 0o700 });
-      } finally {
-        await rm(guard, { recursive: true, force: true });
-      }
-    }
-    await this.atomic(join(path, 'owner.json'), {
-      pid: process.pid,
-      token,
-      session,
-      heartbeat: this.nowMilliseconds(),
-    });
-    return token;
+  leaseMatches(token: string, session: string): Promise<boolean> {
+    return this.leases.leaseMatches(token, session);
   }
-  async owned(token: string, session: string): Promise<boolean> {
-    const current = await owner(this.leasePath());
-    return (
-      !!current &&
-      current.token === token &&
-      current.session === session &&
-      current.pid === process.pid &&
-      current.heartbeat + ttl > this.nowMilliseconds()
-    );
+  owned(token: string, session: string): Promise<boolean> {
+    return this.leases.owned(token, session);
   }
-  async heartbeat(token: string, session: string): Promise<boolean> {
-    if (!(await this.owned(token, session))) return false;
-    const current = await owner(this.leasePath());
-    if (!current || current.token !== token) return false;
-    await this.atomic(join(this.leasePath(), 'owner.json'), { ...current, heartbeat: this.nowMilliseconds() });
-    return true;
+  heartbeat(token: string, session: string): Promise<boolean> {
+    return this.leases.heartbeat(token, session);
   }
-  async release(token: string): Promise<void> {
-    if ((await owner(this.leasePath()))?.token === token) await rm(this.leasePath(), { recursive: true });
+  release(token: string): Promise<void> {
+    return this.leases.release(token);
   }
   async withEpisodeLock<T>(pane: string, action: () => Promise<T>): Promise<T | null> {
     await this.prepare();

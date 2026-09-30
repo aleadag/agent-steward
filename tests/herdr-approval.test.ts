@@ -1,15 +1,27 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { test } from 'bun:test';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { verifyPendingApproval } from '../dist/src/herdr-adapter/approval.js';
-import { deliverProposal } from '../dist/src/herdr-adapter/deliver.js';
-import { observeStop } from '../dist/src/herdr-adapter/observe.js';
-import { EpisodeStore } from '../dist/src/herdr-adapter/state.js';
-import { handleEvent } from '../dist/src/herdr-adapter/entry.js';
+import { verifyPendingApproval } from '../src/herdr-adapter/approval.ts';
+import { deliverProposal } from '../src/herdr-adapter/deliver.ts';
+import { observeStop } from '../src/herdr-adapter/observe.ts';
+import { EpisodeStore } from '../src/herdr-adapter/state.ts';
+import { handleEvent, type EventDeps } from '../src/herdr-adapter/entry.ts';
+import type { HerdrControl } from '../src/herdr-adapter/deliver.ts';
+import type { AgentSnapshot } from '../src/herdr-adapter/observe.ts';
+import type { StopResult } from '../src/contracts.ts';
 
-const pane = (tool = 'pi') => ({
+type TestHandoffReason = Parameters<EventDeps['handoff']>[0];
+type ApprovalHerdr = HerdrControl & {
+  sendKeys: (paneId: string, keys: string[]) => Promise<void>;
+  replace: (pane: AgentSnapshot) => void;
+  sentKeys: [string, string[]][];
+  prompts: [string, string][];
+  pendingApproval?: { request_id: string; action: string; control: string };
+};
+
+const pane = (tool = 'pi'): AgentSnapshot => ({
   pane_id: 'w1:p1',
   workspace_id: 'w1',
   agent: tool,
@@ -18,7 +30,7 @@ const pane = (tool = 'pi') => ({
   revision: 8,
   state_change_seq: 4,
 });
-const approveProposal = (request_id) => ({
+const approveProposal = (request_id: string): StopResult => ({
   schema_version: 2,
   request_id,
   decision: 'stop_decision',
@@ -43,9 +55,9 @@ const approveProposal = (request_id) => ({
 });
 async function fixture(tool = 'pi') {
   let current = pane(tool);
-  const sentKeys = [],
-    prompts = [];
-  const herdr = {
+  const sentKeys: [string, string[]][] = [];
+  const prompts: [string, string][] = [];
+  const herdr: ApprovalHerdr = {
     get: async () => current,
     read: async () => ({
       pane_id: 'w1:p1',
@@ -54,8 +66,12 @@ async function fixture(tool = 'pi') {
       text: 'Allow proposed command?',
       truncated: false,
     }),
-    prompt: async (...args) => prompts.push(args),
-    sendKeys: async (...args) => sentKeys.push(args),
+    prompt: async (paneId, text) => {
+      prompts.push([paneId, text]);
+    },
+    sendKeys: async (paneId, keys) => {
+      sentKeys.push([paneId, keys]);
+    },
     replace: (next) => {
       current = next;
     },
@@ -63,6 +79,7 @@ async function fixture(tool = 'pi') {
     prompts,
   };
   const observation = await observeStop(herdr, 'w1:p1');
+  assert.ok(observation);
   const store = new EpisodeStore(await mkdtemp(join(tmpdir(), 'steward-approval-')));
   await store.record('w1:p1', {
     pane_id: 'w1:p1',
@@ -134,21 +151,25 @@ test('event approval proposal emits human handoff and never sends keys', async (
   const f = await fixture();
   await f.store.clear('w1:p1');
   const token = await f.store.acquire('server-1');
-  const handoffs = [];
+  assert.ok(token);
+  const handoffs: TestHandoffReason[] = [];
   try {
+    const deps: EventDeps = {
+      herdr: f.herdr,
+      store: f.store,
+      clock: { now: () => new Date('2026-09-29T10:00:00Z') },
+      targets: ['w1:p1'],
+      sessionId: 'server-1',
+      leaseToken: token,
+      sessionValid: async () => true,
+      decide: async (input) => approveProposal(input.request_id),
+      handoff: async (reason) => {
+        handoffs.push(reason);
+      },
+    };
     await handleEvent(
       { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent: 'pi', agent_status: 'blocked' },
-      {
-        herdr: f.herdr,
-        store: f.store,
-        clock: { now: () => new Date('2026-09-29T10:00:00Z') },
-        targets: ['w1:p1'],
-        sessionId: 'server-1',
-        leaseToken: token,
-        sessionValid: async () => true,
-        decide: async (input) => approveProposal(input.request_id),
-        handoff: async (reason) => handoffs.push(reason),
-      },
+      deps,
     );
     assert.deepEqual(handoffs, ['human_review_required']);
     assert.deepEqual(f.herdr.sentKeys, []);

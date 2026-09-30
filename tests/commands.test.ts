@@ -1,12 +1,14 @@
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { buildCommand, shellQuote, validateCandidateSyntax } from '../dist/src/commands.js';
-import { candidate } from './helpers.mjs';
+import { buildCommand, shellQuote, validateCandidateSyntax } from '../src/commands.ts';
+import { StewardError } from '../src/contracts.ts';
+import type { Candidate } from '../src/contracts.ts';
+import { candidate } from './helpers.ts';
 
-function rejectsInvalid(candidateValue, level = candidateValue.thinking_levels[0]?.id ?? 'low') {
+function rejectsInvalid(candidateValue: Candidate, level = candidateValue.thinking_levels[0]?.id ?? 'low') {
   assert.throws(
     () => buildCommand(candidateValue, level),
-    (error) => error.code === 'invalid_config',
+    (error) => error instanceof StewardError && error.code === 'invalid_config',
   );
 }
 
@@ -64,7 +66,7 @@ test('Pi and agy preserve their exact provider and nondefault effort argv', () =
 });
 
 test('default omits effort overrides for all tools without claiming effective effort', () => {
-  const cases = [
+  const cases: [Candidate, string[]][] = [
     [
       candidate({ thinking_levels: [{ id: 'default', description: 'Omit override' }] }),
       ['--model', 'gpt-astra-example', '-c', 'model_provider="openai"'],
@@ -117,7 +119,7 @@ test('preflight rejects ASCII controls and leading-option model/provider values'
   ]) {
     assert.throws(
       () => validateCandidateSyntax(value),
-      (error) => error.code === 'invalid_config',
+      (error) => error instanceof StewardError && error.code === 'invalid_config',
     );
   }
 });
@@ -130,7 +132,7 @@ test('preflight rejects unsupported Pi and agy efforts and empty effort lists', 
   ])
     assert.throws(
       () => validateCandidateSyntax(value),
-      (error) => error.code === 'invalid_config',
+      (error) => error instanceof StewardError && error.code === 'invalid_config',
     );
 });
 

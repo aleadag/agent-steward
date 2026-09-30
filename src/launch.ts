@@ -1,5 +1,5 @@
-import { StewardError } from './contracts.js';
-import type { PlannedCommand } from './contracts.js';
+import { StewardError } from './contracts.ts';
+import type { PlannedCommand } from './contracts.ts';
 
 export type NativeLaunch = { executable: PlannedCommand['executable']; args: string[] };
 

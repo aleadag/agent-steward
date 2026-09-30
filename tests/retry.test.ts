@@ -1,12 +1,13 @@
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { StopInputSchema } from '../dist/src/contracts.js';
-import { retryProposal } from '../dist/src/retry.js';
+import { StopInputSchema } from '../src/contracts.ts';
+import type { StopInput } from '../src/contracts.ts';
+import { retryProposal } from '../src/retry.ts';
 
 const first = '2026-09-29T10:00:00Z';
 const now = new Date('2026-09-29T10:00:00Z');
 
-function input(overrides = {}) {
+function input(overrides: Partial<StopInput> = {}): StopInput {
   return StopInputSchema.parse({
     schema_version: 2,
     request_id: 'r1',
@@ -28,7 +29,7 @@ function input(overrides = {}) {
 }
 
 test('recovery deliveries use episode-anchored 30s, 2m, and 8m deadlines then escalate', () => {
-  const cases = [
+  const cases: [StopInput, Date, string][] = [
     [input(), now, '2026-09-29T10:00:30.000Z'],
     [
       input({
@@ -169,7 +170,7 @@ test('asserted resets without independently verified account and all-window bind
 });
 
 test('quota without a fresh usable reset backs off from recorded check history', () => {
-  const cases = [
+  const cases: [StopInput, Date, string][] = [
     [input(), now, '2026-09-29T10:05:00.000Z'],
     [
       input({

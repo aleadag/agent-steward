@@ -1,26 +1,36 @@
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const pkg = process.env.AGENT_STEWARD_PACKAGE;
 const skillSource = process.env.AGENT_STEWARD_SKILL_SOURCE;
-const packagedProcess = pkg
-  ? await import(pathToFileURL(join(pkg, 'lib/node_modules/agent-steward/dist/src/process.js')).href)
-  : undefined;
+const packagedProcessPath = pkg ? join(pkg, 'lib/agent-steward/dist/src/process.js') : undefined;
+const packagedProcess =
+  packagedProcessPath && existsSync(packagedProcessPath)
+    ? await import(pathToFileURL(packagedProcessPath).href)
+    : undefined;
 
-function withIsolatedHome(callback) {
+type IsolatedHome = {
+  root: string;
+  home: string;
+  xdg: string;
+  run: (args: string[], input?: string) => SpawnSyncReturns<string>;
+};
+function withIsolatedHome(callback: (context: IsolatedHome) => void): void {
+  assert.ok(pkg, 'installed tests require the explicit package path');
+  const packagePath = pkg;
   const root = mkdtempSync(join(tmpdir(), 'steward-installed-'));
   try {
     const home = join(root, 'home'),
       xdg = join(root, 'xdg');
     mkdirSync(home);
     mkdirSync(xdg);
-    const run = (args, input) =>
-      spawnSync(join(pkg, 'bin/agent-steward'), args, {
+    const run = (args: string[], input?: string): SpawnSyncReturns<string> =>
+      spawnSync(join(packagePath, 'bin/agent-steward'), args, {
         cwd: root,
         env: { HOME: home, XDG_CONFIG_HOME: xdg, PATH: '' },
         encoding: 'utf8',
@@ -32,19 +42,28 @@ function withIsolatedHome(callback) {
   }
 }
 
-function writeConfig(path, config) {
+function writeConfig(path: string, config: unknown): void {
   writeFileSync(path, JSON.stringify(config));
 }
 
-function parsed(result) {
+function parsed(result: SpawnSyncReturns<string>) {
   assert.equal(result.stdout.split('\n').filter(Boolean).length, 1, result.stderr);
   return JSON.parse(result.stdout);
 }
 
-test('installed help needs neither checkout nor global Node and skill bytes match', { skip: !pkg }, () => {
+test.skipIf(!pkg)('installed help needs neither checkout nor global runtimes and skill bytes match', () => {
+  assert.ok(pkg, 'installed check must receive the explicit package path');
   assert.ok(isAbsolute(pkg), 'package path is absolute');
   assert.ok(skillSource, 'installed check must receive the explicit source skill path');
   withIsolatedHome(({ run }) => {
+    for (const command of ['node', 'bun', 'npm']) {
+      const unavailable = spawnSync(command, ['--version'], { env: { PATH: '' }, encoding: 'utf8' });
+      assert.equal(
+        (unavailable.error as NodeJS.ErrnoException | undefined)?.code,
+        'ENOENT',
+        `${command} must not be available on PATH`,
+      );
+    }
     const result = run(['--help']);
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /session start/);
@@ -56,7 +75,7 @@ test('installed help needs neither checkout nor global Node and skill bytes matc
   });
 });
 
-test('installed failures stay local, structured, and credential-free', { skip: !pkg }, () => {
+test.skipIf(!pkg)('installed failures stay local, structured, and credential-free', () => {
   withIsolatedHome(({ root, xdg, run }) => {
     const missing = parsed(run(['session', 'start', 'task', '--dry-run', '--json']));
     assert.equal(missing.reason_code, 'invalid_config');
@@ -118,9 +137,8 @@ test('installed failures stay local, structured, and credential-free', { skip: !
   });
 });
 
-test(
+test.skipIf(!pkg || !packagedProcess)(
   'packaged foreground adapter launches one offline fake executable with selected task argv',
-  { skip: !pkg },
   async () => {
     const root = mkdtempSync(join(tmpdir(), 'steward-fake-native-'));
     try {
@@ -164,9 +182,10 @@ test(
       rmSync(root, { recursive: true, force: true });
     }
   },
+  12000,
 );
 
-test('installed routing reads a relative quota snapshot before a local missing-key failure', { skip: !pkg }, () => {
+test.skipIf(!pkg)('installed routing reads a relative quota snapshot before a local missing-key failure', () => {
   withIsolatedHome(({ root, xdg, run }) => {
     const configDir = join(xdg, 'agent-steward');
     mkdirSync(configDir);
@@ -199,10 +218,12 @@ test('installed routing reads a relative quota snapshot before a local missing-k
   });
 });
 
-test('installed bundle contains no account, quota, example, or session inputs', { skip: !pkg }, () => {
-  const root = join(pkg, 'lib/node_modules/agent-steward');
-  const entries = [];
-  const visit = (path) => {
+test.skipIf(!pkg)('installed bundle contains no account, quota, example, or session inputs', () => {
+  assert.ok(pkg, 'installed check must receive the explicit package path');
+  const root = join(pkg, 'lib/agent-steward');
+  assert.ok(existsSync(root), 'application bundle must use the runtime-neutral lib path');
+  const entries: string[] = [];
+  const visit = (path: string): void => {
     for (const entry of readdirSync(path, { withFileTypes: true })) {
       const full = join(path, entry.name);
       entries.push(full);
@@ -211,7 +232,13 @@ test('installed bundle contains no account, quota, example, or session inputs', 
   };
   visit(root);
   visit(join(pkg, 'share/agent-steward'));
+  assert.ok(packagedProcess, 'installed app must be under lib/agent-steward');
+  assert.ok(existsSync(join(root, 'bun/bin/bun')), 'package-local Bun must be present');
   assert.ok(entries.some((path) => path.endsWith('/dist/src/main.js')));
-  assert.ok(entries.every((path) => !/(?:^|\/)(?:examples|sessions|\.beads|\.internal)(?:\/|$)/i.test(path)));
+  for (const dependency of ['@types', 'typescript', 'oxlint', 'oxfmt']) {
+    assert.equal(existsSync(join(root, 'node_modules', dependency)), false, `package must exclude ${dependency}`);
+  }
+  assert.ok(entries.every((path) => !/(?:^|\/)(?:examples|sessions|tests|\.beads|\.internal)(?:\/|$)/i.test(path)));
+  assert.ok(entries.every((path) => !path.endsWith('.ts')));
   assert.ok(entries.every((path) => !/(?:config|quota|approval|account|session)\.json$/i.test(path)));
 });

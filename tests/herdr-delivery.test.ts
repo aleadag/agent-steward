@@ -1,18 +1,23 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import { mkdtemp, writeFile, mkdir, chmod, readFile, stat } from 'node:fs/promises';
+import { test } from 'bun:test';
+import { mkdtemp, writeFile, mkdir, chmod, readFile, stat, rename } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { EpisodeStore } from '../dist/src/herdr-adapter/state.js';
-import { observeStop } from '../dist/src/herdr-adapter/observe.js';
-import { reconcileDue } from '../dist/src/herdr-adapter/scheduler.js';
-import { deliverProposal } from '../dist/src/herdr-adapter/deliver.js';
-import { decideWithCli, handleEvent, runEvent } from '../dist/src/herdr-adapter/entry.js';
+import { EpisodeStore } from '../src/herdr-adapter/state.ts';
+import { observeStop } from '../src/herdr-adapter/observe.ts';
+import { reconcileDue } from '../src/herdr-adapter/scheduler.ts';
+import { deliverProposal, type HerdrControl } from '../src/herdr-adapter/deliver.ts';
+import { decideWithCli, handleEvent, runEvent, type EventDeps } from '../src/herdr-adapter/entry.ts';
+import type { AgentSnapshot } from '../src/herdr-adapter/observe.ts';
+import type { Episode } from '../src/herdr-adapter/state.ts';
+import type { StopInput, StopResult } from '../src/contracts.ts';
+import { deferred, within } from './herdr-lease-helpers.ts';
 
+type TestHandoffReason = Parameters<EventDeps['handoff']>[0];
 const at = '2026-09-29T10:00:30Z';
 const text = 'Current API failure: request timed out';
-const pane = (change = {}) => ({
+const pane = (change: Partial<AgentSnapshot> = {}): AgentSnapshot => ({
   pane_id: 'w1:p1',
   workspace_id: 'w1',
   agent: 'pi',
@@ -22,7 +27,13 @@ const pane = (change = {}) => ({
   state_change_seq: 4,
   ...change,
 });
-const recovery = (input) => ({
+type RecoveryResult = Extract<StopResult, { decision: 'stop_decision' }> & {
+  proposed_action: Extract<
+    Extract<StopResult, { decision: 'stop_decision' }>['proposed_action'],
+    { kind: 'send_recovery_instruction' }
+  >;
+};
+const recovery = (input: Pick<StopInput, 'request_id'>): RecoveryResult => ({
   schema_version: 2,
   request_id: input.request_id,
   decision: 'stop_decision',
@@ -50,7 +61,12 @@ const recovery = (input) => ({
     },
   },
 });
-async function setup(tool = 'pi', livePi = false) {
+type DeliveryHerdr = HerdrControl & {
+  change: (pane: AgentSnapshot) => void;
+  excerpt: (text: string) => void;
+  writes: () => [string, string][];
+};
+async function setup(tool: string = 'pi', livePi = false) {
   let current = pane({
       agent: tool,
       agent_session: livePi
@@ -62,9 +78,9 @@ async function setup(tool = 'pi', livePi = false) {
           }
         : { agent: tool, source: `integration:${tool}`, kind: 'id', value: 's1' },
     }),
-    excerpt = text,
-    writes = [];
-  const herdr = {
+    excerpt = text;
+  const writes: [string, string][] = [];
+  const herdr: DeliveryHerdr = {
     get: async () => current,
     read: async () => ({
       pane_id: 'w1:p1',
@@ -86,6 +102,7 @@ async function setup(tool = 'pi', livePi = false) {
   };
   const store = new EpisodeStore(await mkdtemp(join(tmpdir(), 'steward-delivery-')));
   const observation = await observeStop(herdr, 'w1:p1');
+  assert.ok(observation);
   await store.record('w1:p1', {
     pane_id: 'w1:p1',
     session_id: observation.session_id,
@@ -102,8 +119,227 @@ async function setup(tool = 'pi', livePi = false) {
   const clock = { now: () => new Date(at) };
   return { herdr, store, observation, clock, proposal: recovery({ request_id: 'old' }) };
 }
-const deliver = (f, decide = async (input) => recovery(input), guard = async () => true) =>
-  deliverProposal(f.herdr, f.observation, f.proposal, f.store, f.clock, decide, guard);
+type DeliveryFixture = Awaited<ReturnType<typeof setup>>;
+async function retryEpisode(f: DeliveryFixture): Promise<Episode> {
+  const record = await f.store.retry('w1:p1');
+  assert.ok(record);
+  return record;
+}
+const deliver = (
+  f: DeliveryFixture,
+  decide: (input: StopInput) => Promise<StopResult> = async (input) => recovery(input),
+  guard: () => Promise<boolean> = async () => true,
+) => deliverProposal(f.herdr, f.observation, f.proposal, f.store, f.clock, decide, guard);
+
+test('local closure during authorization cannot admit a write', async () => {
+  const f = await setup();
+  let open = true;
+  const entered = deferred<void>();
+  const resume = deferred<void>();
+  const original = await retryEpisode(f);
+  const running = deliverProposal(
+    f.herdr,
+    f.observation,
+    f.proposal,
+    f.store,
+    f.clock,
+    async (input) => recovery(input),
+    async () => {
+      entered.resolve();
+      await resume.promise;
+      return true;
+    },
+    false,
+    () => open,
+  );
+  await within(entered.promise);
+  open = false;
+  resume.resolve();
+  assert.equal(await within(running), 'human');
+  assert.deepEqual(await retryEpisode(f), original);
+  assert.deepEqual(f.herdr.writes(), []);
+});
+
+test('pre-admitted prompt remains uncertain across release', async () => {
+  const f = await setup();
+  const lease = await f.store.acquire('server-1');
+  assert.ok(lease);
+  const entered = deferred<void>();
+  const resume = deferred<void>();
+  f.herdr.prompt = async (target, instruction) => {
+    f.herdr.writes().push([target, instruction]);
+    entered.resolve();
+    await resume.promise;
+  };
+  const running = deliver(
+    f,
+    async (input) => recovery(input),
+    () => f.store.leaseMatches(lease, 'server-1'),
+  );
+  await within(entered.promise);
+  assert.equal((await retryEpisode(f)).last_delivery_state, 'uncertain');
+  await f.store.release(lease);
+  resume.resolve();
+  assert.equal(await within(running), 'uncertain');
+  assert.equal(f.herdr.writes().length, 1);
+  assert.equal((await retryEpisode(f)).last_delivery_state, 'uncertain');
+  assert.equal(await deliver(f), 'uncertain');
+  assert.equal(f.herdr.writes().length, 1);
+});
+
+test('local closure after uncertain prewrite prevents prompt', async () => {
+  const f = await setup();
+  let open = true;
+  const record = f.store.record.bind(f.store);
+  f.store.record = async (paneId, episode) => {
+    await record(paneId, episode);
+    open = false;
+  };
+  const result = await deliverProposal(
+    f.herdr,
+    f.observation,
+    f.proposal,
+    f.store,
+    f.clock,
+    async (input) => recovery(input),
+    async () => true,
+    false,
+    () => open,
+  );
+  assert.equal(result, 'uncertain');
+  assert.equal(f.herdr.writes().length, 0);
+  assert.equal((await retryEpisode(f)).last_delivery_state, 'uncertain');
+});
+
+test('local closure during decision leaves the episode unchanged', async () => {
+  const f = await setup();
+  await f.store.clear('w1:p1');
+  const lease = await f.store.acquire('server-1');
+  assert.ok(lease);
+  let open = true;
+  const entered = deferred<void>();
+  const resume = deferred<void>();
+  const handoffs: TestHandoffReason[] = [];
+  const running = handleEvent(
+    { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent: 'pi', agent_status: 'idle' },
+    {
+      herdr: f.herdr,
+      store: f.store,
+      clock: f.clock,
+      targets: ['w1:p1'],
+      sessionId: 'server-1',
+      leaseToken: lease,
+      sessionValid: async () => true,
+      admissionOpen: () => open,
+      handoff: async (reason) => {
+        handoffs.push(reason);
+      },
+      decide: async (input) => {
+        entered.resolve();
+        await resume.promise;
+        return recovery(input);
+      },
+    },
+  );
+  try {
+    await within(entered.promise);
+    open = false;
+    resume.resolve();
+    await within(running);
+    assert.equal(await f.store.retry('w1:p1'), null);
+    assert.deepEqual(f.herdr.writes(), []);
+    assert.deepEqual(handoffs, []);
+  } finally {
+    resume.resolve();
+    await f.store.release(lease);
+  }
+});
+
+test('session validation finishes before the final token-bound ownership read', async () => {
+  const f = await setup();
+  const lease = await f.store.acquire('server-1');
+  assert.ok(lease);
+  let leaseReads = 0;
+  const leaseMatches = f.store.leaseMatches.bind(f.store);
+  f.store.leaseMatches = async (token, session) => {
+    leaseReads++;
+    return leaseMatches(token, session);
+  };
+  const entered = deferred<void>();
+  const resume = deferred<void>();
+  const original = await retryEpisode(f);
+  const running = handleEvent(
+    { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent: 'pi', agent_status: 'idle' },
+    {
+      herdr: f.herdr,
+      store: f.store,
+      clock: f.clock,
+      targets: ['w1:p1'],
+      sessionId: 'server-1',
+      leaseToken: lease,
+      sessionValid: async () => {
+        entered.resolve();
+        await resume.promise;
+        return false;
+      },
+      handoff: async () => {},
+      decide: async (input) => recovery(input),
+    },
+  );
+  await within(entered.promise);
+  assert.equal(await f.store.active('server-1'), true);
+  assert.equal(leaseReads, 0);
+  resume.resolve();
+  await within(running);
+  assert.equal(leaseReads, 0);
+  assert.deepEqual(await retryEpisode(f), original);
+  assert.deepEqual(f.herdr.writes(), []);
+});
+
+test('a successful ownership snapshot may finish after release without claiming atomic revocation', async () => {
+  const f = await setup();
+  await f.store.clear('w1:p1');
+  const lease = await f.store.acquire('server-1');
+  assert.ok(lease);
+  const entered = deferred<void>();
+  const resume = deferred<void>();
+  const leaseMatches = f.store.leaseMatches.bind(f.store);
+  let hold = true;
+  f.store.leaseMatches = async (token, session) => {
+    const matched = await leaseMatches(token, session);
+    if (hold) {
+      hold = false;
+      entered.resolve();
+      await resume.promise;
+    }
+    return matched;
+  };
+  let decisions = 0;
+  const running = handleEvent(
+    { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent: 'pi', agent_status: 'idle' },
+    {
+      herdr: f.herdr,
+      store: f.store,
+      clock: f.clock,
+      targets: ['w1:p1'],
+      sessionId: 'server-1',
+      leaseToken: lease,
+      sessionValid: async () => true,
+      handoff: async () => {},
+      decide: async (input) => {
+        decisions++;
+        return recovery(input);
+      },
+    },
+  );
+  await within(entered.promise);
+  await f.store.release(lease);
+  resume.resolve();
+  await within(running);
+  assert.equal(decisions, 1, 'the already-admitted check may finish and start work before a fresh check');
+  assert.equal(await f.store.retry('w1:p1'), null);
+  assert.deepEqual(f.herdr.writes(), []);
+});
 
 test('concurrent deliveries for one episode have one prompt submission', async () => {
   const f = await setup();
@@ -121,7 +357,7 @@ test('submission timeout persists uncertainty before write and a duplicate event
   };
   assert.equal(await deliver(f), 'uncertain');
   assert.equal(f.herdr.writes().length, 1);
-  assert.equal((await f.store.retry('w1:p1')).last_delivery_state, 'uncertain');
+  assert.equal((await retryEpisode(f)).last_delivery_state, 'uncertain');
   assert.equal(await deliver(f), 'uncertain');
   assert.equal(f.herdr.writes().length, 1);
 });
@@ -142,7 +378,7 @@ test('idle ready Pi and Codex submit fixed instruction once and count only submi
     const f = await setup(tool);
     assert.equal(await deliver(f), 'delivered');
     assert.deepEqual(f.herdr.writes(), [['w1:p1', f.proposal.proposed_action.instruction]]);
-    assert.equal((await f.store.retry('w1:p1')).attempt_count, 1);
+    assert.equal((await retryEpisode(f)).attempt_count, 1);
     assert.equal(await deliver(f), 'delivered');
     assert.equal(f.herdr.writes().length, 1);
   }
@@ -152,7 +388,7 @@ test('best-effort Pi recovery accepts a bounded truncated excerpt but sends only
   const f = await setup('pi', true);
   assert.equal(await deliver(f), 'delivered');
   assert.deepEqual(f.herdr.writes(), [['w1:p1', f.proposal.proposed_action.instruction]]);
-  assert.equal((await f.store.retry('w1:p1')).attempt_count, 1);
+  assert.equal((await retryEpisode(f)).attempt_count, 1);
   assert.equal(await deliver(f), 'delivered');
   assert.equal(f.herdr.writes().length, 1);
 });
@@ -162,14 +398,15 @@ test('future deadline schedules only, and due recheck still needs same deadline'
   f.clock.now = () => new Date('2026-09-29T10:00:29Z');
   let calls = 0;
   assert.equal(
-    await deliver(f, async () => {
+    await deliver(f, async (input) => {
       calls++;
+      return recovery(input);
     }),
     'wait',
   );
   assert.equal(calls, 0);
   assert.equal(f.herdr.writes().length, 0);
-  assert.equal((await f.store.retry('w1:p1')).next_check_at, at);
+  assert.equal((await retryEpisode(f)).next_check_at, at);
   f.clock.now = () => new Date(at);
   assert.equal(
     await deliver(f, async (input) => ({
@@ -186,13 +423,13 @@ test('future deadline schedules only, and due recheck still needs same deadline'
 
 test('changed evidence, revision, session, blocked UI and permission UI never prompt', async () => {
   for (const change of [
-    (f) => f.herdr.excerpt('Another API failure'),
-    (f) => f.herdr.change(pane({ revision: 9 })),
-    (f) => f.herdr.change(pane({ agent_session: { ...pane().agent_session, value: 's2' } })),
-    (f) => f.herdr.change(pane({ agent_status: 'blocked' })),
-    (f) => f.herdr.change(pane({ agent_status: 'unknown' })),
-    (f) => f.herdr.change(pane({ agent_status: 'working' })),
-    (f) => f.herdr.change(pane({ agent_status: 'done' })),
+    (f: DeliveryFixture) => f.herdr.excerpt('Another API failure'),
+    (f: DeliveryFixture) => f.herdr.change(pane({ revision: 9 })),
+    (f: DeliveryFixture) => f.herdr.change(pane({ agent_session: { ...pane().agent_session!, value: 's2' } })),
+    (f: DeliveryFixture) => f.herdr.change(pane({ agent_status: 'blocked' })),
+    (f: DeliveryFixture) => f.herdr.change(pane({ agent_status: 'unknown' })),
+    (f: DeliveryFixture) => f.herdr.change(pane({ agent_status: 'working' })),
+    (f: DeliveryFixture) => f.herdr.change(pane({ agent_status: 'done' })),
   ]) {
     const f = await setup();
     change(f);
@@ -270,13 +507,14 @@ test('lease loss after prewrite but before prompt never submits', async () => {
     'uncertain',
   );
   assert.equal(f.herdr.writes().length, 0);
-  assert.equal((await f.store.retry('w1:p1')).last_delivery_state, 'uncertain');
+  assert.equal((await retryEpisode(f)).last_delivery_state, 'uncertain');
 });
 
 test('lease replacement during prompt cannot overwrite the uncertain episode afterward', async () => {
   const f = await setup();
   const oldToken = await f.store.acquire('server-1');
-  let replacement;
+  assert.ok(oldToken);
+  let replacement: string | null = null;
   f.herdr.prompt = async (target, instruction) => {
     f.herdr.writes().push([target, instruction]);
     await f.store.release(oldToken);
@@ -292,7 +530,7 @@ test('lease replacement during prompt cannot overwrite the uncertain episode aft
       'uncertain',
     );
     assert.ok(replacement && replacement !== oldToken);
-    assert.equal((await f.store.retry('w1:p1')).last_delivery_state, 'uncertain');
+    assert.equal((await retryEpisode(f)).last_delivery_state, 'uncertain');
     assert.equal(f.herdr.writes().length, 1);
   } finally {
     if (replacement) await f.store.release(replacement);
@@ -303,6 +541,7 @@ test('old hook does not quarantine a successor episode when lease changes during
   const f = await setup();
   await f.store.clear('w1:p1');
   const oldToken = await f.store.acquire('server-1');
+  assert.ok(oldToken);
   const retry = f.store.retry.bind(f.store);
   let reads = 0,
     decisions = 0,
@@ -315,7 +554,7 @@ test('old hook does not quarantine a successor episode when lease changes during
     }
     return record;
   };
-  const deps = {
+  const deps: EventDeps = {
     herdr: f.herdr,
     store: f.store,
     clock: f.clock,
@@ -338,7 +577,9 @@ test('old hook does not quarantine a successor episode when lease changes during
     );
     assert.equal(reads, 3);
     assert.ok(replacement && replacement !== oldToken);
-    assert.equal((await retry('w1:p1')).last_delivery_state, 'none');
+    const successor = await retry('w1:p1');
+    assert.ok(successor);
+    assert.equal(successor.last_delivery_state, 'none');
     assert.equal(f.herdr.writes().length, 0);
   } finally {
     if (replacement) await f.store.release(replacement);
@@ -348,10 +589,11 @@ test('old hook does not quarantine a successor episode when lease changes during
 test('no Herdr prompt binary quarantines a new episode after one human handoff', async () => {
   const f = await setup();
   await f.store.clear('w1:p1');
-  delete f.herdr.prompt;
+  delete (f.herdr as Partial<HerdrControl>).prompt;
   const token = await f.store.acquire('server-1');
-  const handoffs = [];
-  const deps = {
+  assert.ok(token);
+  const handoffs: TestHandoffReason[] = [];
+  const deps: EventDeps = {
     herdr: f.herdr,
     store: f.store,
     clock: f.clock,
@@ -359,7 +601,9 @@ test('no Herdr prompt binary quarantines a new episode after one human handoff',
     sessionId: 'server-1',
     leaseToken: token,
     sessionValid: async () => true,
-    handoff: async (reason) => handoffs.push(reason),
+    handoff: async (reason) => {
+      handoffs.push(reason);
+    },
     decide: async (input) => recovery(input),
   };
   const event = { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent_status: 'idle' };
@@ -367,7 +611,7 @@ test('no Herdr prompt binary quarantines a new episode after one human handoff',
     await handleEvent(event, deps);
     await handleEvent(event, deps);
     assert.deepEqual(handoffs, ['human_review_required']);
-    assert.equal((await f.store.retry('w1:p1')).last_delivery_state, 'human');
+    assert.equal((await retryEpisode(f)).last_delivery_state, 'human');
   } finally {
     await f.store.release(token);
   }
@@ -384,9 +628,10 @@ test('moved idle pane without an episode cannot classify, record or receive reco
   await f.store.clear('w1:p1');
   f.herdr.change(pane({ workspace_id: 'w2' }));
   const token = await f.store.acquire('server-1');
-  const handoffs = [];
+  assert.ok(token);
+  const handoffs: TestHandoffReason[] = [];
   let decisions = 0;
-  const deps = {
+  const deps: EventDeps = {
     herdr: f.herdr,
     store: f.store,
     clock: f.clock,
@@ -394,7 +639,9 @@ test('moved idle pane without an episode cannot classify, record or receive reco
     sessionId: 'server-1',
     leaseToken: token,
     sessionValid: async () => true,
-    handoff: async (reason) => handoffs.push(reason),
+    handoff: async (reason) => {
+      handoffs.push(reason);
+    },
     decide: async (input) => {
       decisions++;
       return recovery(input);
@@ -427,16 +674,17 @@ test('final delivery rejects a moved workspace even when the pane snapshot stays
   );
   assert.equal(decisions, 0);
   assert.deepEqual(f.herdr.writes(), []);
-  assert.equal((await f.store.retry('w1:p1')).last_delivery_state, 'none');
+  assert.equal((await retryEpisode(f)).last_delivery_state, 'none');
 });
 
 test('event path passes recovery through a second fresh decision and never resends', async () => {
   const f = await setup();
   await f.store.clear('w1:p1');
   const token = await f.store.acquire('server-1');
-  const handoffs = [];
+  assert.ok(token);
+  const handoffs: TestHandoffReason[] = [];
   let decisions = 0;
-  const deps = {
+  const deps: EventDeps = {
     herdr: f.herdr,
     store: f.store,
     clock: f.clock,
@@ -444,7 +692,9 @@ test('event path passes recovery through a second fresh decision and never resen
     sessionId: 'server-1',
     leaseToken: token,
     sessionValid: async () => true,
-    handoff: async (reason) => handoffs.push(reason),
+    handoff: async (reason) => {
+      handoffs.push(reason);
+    },
     decide: async (input) => {
       decisions++;
       return recovery(input);
@@ -462,7 +712,7 @@ test('event path passes recovery through a second fresh decision and never resen
     await handleEvent(event, deps);
     assert.equal(decisions, 2);
     assert.equal(f.herdr.writes().length, 1);
-    assert.equal((await f.store.retry('w1:p1')).last_delivery_state, 'delivered');
+    assert.equal((await retryEpisode(f)).last_delivery_state, 'delivered');
     assert.deepEqual(handoffs, []);
   } finally {
     await f.store.release(token);
@@ -473,9 +723,10 @@ test('delivered recovery survives working then idle with the same old detection 
   const f = await setup();
   await f.store.clear('w1:p1');
   const token = await f.store.acquire('server-1');
-  const handoffs = [];
+  assert.ok(token);
+  const handoffs: TestHandoffReason[] = [];
   let decisions = 0;
-  const deps = {
+  const deps: EventDeps = {
     herdr: f.herdr,
     store: f.store,
     clock: f.clock,
@@ -483,13 +734,15 @@ test('delivered recovery survives working then idle with the same old detection 
     sessionId: 'server-1',
     leaseToken: token,
     sessionValid: async () => true,
-    handoff: async (reason) => handoffs.push(reason),
+    handoff: async (reason) => {
+      handoffs.push(reason);
+    },
     decide: async (input) => {
       decisions++;
       return recovery(input);
     },
   };
-  const status = (agent_status) => ({
+  const status = (agent_status: string) => ({
     type: 'pane.agent_status_changed',
     pane_id: 'w1:p1',
     workspace_id: 'w1',
@@ -507,8 +760,8 @@ test('delivered recovery survives working then idle with the same old detection 
     }
     assert.equal(f.herdr.writes().length, 1, 'status churn must not authorize a fourth or any duplicate prompt');
     assert.equal(decisions, 2);
-    assert.equal((await f.store.retry('w1:p1')).attempt_count, 1);
-    assert.equal((await f.store.retry('w1:p1')).first_observed_at, '2026-09-29T10:00:30.000Z');
+    assert.equal((await retryEpisode(f)).attempt_count, 1);
+    assert.equal((await retryEpisode(f)).first_observed_at, '2026-09-29T10:00:30.000Z');
     assert.ok(handoffs.includes('observation_unavailable'));
   } finally {
     await f.store.release(token);
@@ -523,7 +776,8 @@ test('unknown prompt delivery remains uncertain after same-session status change
     throw new Error('unknown outcome');
   };
   const token = await f.store.acquire('server-1');
-  const deps = {
+  assert.ok(token);
+  const deps: EventDeps = {
     herdr: f.herdr,
     store: f.store,
     clock: f.clock,
@@ -534,7 +788,7 @@ test('unknown prompt delivery remains uncertain after same-session status change
     handoff: async () => {},
     decide: async (input) => recovery(input),
   };
-  const status = (agent_status) => ({
+  const status = (agent_status: string) => ({
     type: 'pane.agent_status_changed',
     pane_id: 'w1:p1',
     workspace_id: 'w1',
@@ -548,7 +802,7 @@ test('unknown prompt delivery remains uncertain after same-session status change
     f.herdr.change(pane({ revision: 10, state_change_seq: 6 }));
     await handleEvent(status('idle'), deps);
     assert.equal(f.herdr.writes().length, 1);
-    assert.equal((await f.store.retry('w1:p1')).last_delivery_state, 'uncertain');
+    assert.equal((await retryEpisode(f)).last_delivery_state, 'uncertain');
   } finally {
     await f.store.release(token);
   }
@@ -559,12 +813,18 @@ test('future recovery event schedules a due re-observation, not a cached prompt'
   await f.store.clear('w1:p1');
   f.clock.now = () => new Date('2026-09-29T10:00:00Z');
   const token = await f.store.acquire('server-1');
+  assert.ok(token);
   let decisions = 0;
-  const decide = async (input) => {
+  const decide: EventDeps['decide'] = async (input) => {
     decisions++;
     return recovery(input);
   };
-  const ownership = { sessionId: 'server-1', leaseToken: token, sessionValid: async () => true };
+  const ownership = {
+    sessionId: 'server-1',
+    leaseToken: token,
+    sessionValid: async () => true,
+    admissionOpen: () => true,
+  };
   try {
     await handleEvent(
       { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent: 'pi', agent_status: 'idle' },
@@ -580,7 +840,7 @@ test('future recovery event schedules a due re-observation, not a cached prompt'
     );
     assert.equal(decisions, 1);
     assert.equal(f.herdr.writes().length, 0);
-    assert.equal((await f.store.retry('w1:p1')).next_check_at, at);
+    assert.equal((await retryEpisode(f)).next_check_at, at);
     await reconcileDue(new Date(at), f.store, f.herdr, decide, ['w1:p1'], async () => {}, ownership);
     assert.equal(decisions, 3);
     assert.equal(f.herdr.writes().length, 1);
@@ -591,18 +851,22 @@ test('future recovery event schedules a due re-observation, not a cached prompt'
 
 test('due scheduler keeps its original lease token across a held decision', async () => {
   const f = await setup();
-  const original = { ...(await f.store.retry('w1:p1')), next_check_at: at };
+  const record = await f.store.retry('w1:p1');
+  assert.ok(record);
+  const original: Episode = { ...record, next_check_at: at };
   await f.store.record('w1:p1', original);
   const oldToken = await f.store.acquire('server-1');
-  let entered, releaseDecision;
-  const pending = new Promise((resolve) => {
+  assert.ok(oldToken);
+  let entered!: () => void;
+  let releaseDecision!: () => void;
+  const pending = new Promise<void>((resolve) => {
     entered = resolve;
   });
-  const held = new Promise((resolve) => {
+  const held = new Promise<void>((resolve) => {
     releaseDecision = resolve;
   });
-  const handoffs = [];
-  let replacement;
+  const handoffs: TestHandoffReason[] = [];
+  let replacement: string | null = null;
   try {
     const oldDue = reconcileDue(
       new Date(at),
@@ -617,7 +881,12 @@ test('due scheduler keeps its original lease token across a held decision', asyn
       async (reason) => {
         handoffs.push(reason);
       },
-      { sessionId: 'server-1', leaseToken: oldToken, sessionValid: async () => true },
+      {
+        sessionId: 'server-1',
+        leaseToken: oldToken,
+        sessionValid: async () => true,
+        admissionOpen: () => true,
+      },
     );
     await pending;
     await f.store.release(oldToken);
@@ -634,7 +903,7 @@ test('due scheduler keeps its original lease token across a held decision', asyn
   }
 });
 
-test('old event hook cannot submit under a replacement lease on the same socket', async () => {
+test('late decision cannot adopt a successor after old heartbeat commit', async () => {
   let milliseconds = Date.now();
   const directory = await mkdtemp(join(tmpdir(), 'steward-lease-swap-'));
   const socket = join(directory, 'herdr.sock'),
@@ -668,10 +937,25 @@ test('old event hook cannot submit under a replacement lease on the same socket'
       );
     });
   });
-  await new Promise((resolve) => server.listen(socket, resolve));
+  await new Promise<void>((resolve) => server.listen(socket, () => resolve()));
   const info = await stat(socket),
     session = `${info.dev}:${info.ino}`;
-  const store = new EpisodeStore(directory, () => milliseconds);
+  const heartbeatEntered = deferred<void>();
+  const finishHeartbeat = deferred<void>();
+  let holdHeartbeat = false;
+  let oldToken = '';
+  const store = new EpisodeStore(directory, () => milliseconds, {
+    io: {
+      rename: async (from, to) => {
+        if (holdHeartbeat && to === join(directory, 'scheduler-lease', 'generations', oldToken, 'heartbeat.json')) {
+          holdHeartbeat = false;
+          heartbeatEntered.resolve();
+          await finishHeartbeat.promise;
+        }
+        await rename(from, to);
+      },
+    },
+  });
   const observation = await observeStop(
     {
       get: async () => pane(),
@@ -679,7 +963,8 @@ test('old event hook cannot submit under a replacement lease on the same socket'
     },
     'w1:p1',
   );
-  const original = {
+  assert.ok(observation);
+  const original: Episode = {
     pane_id: 'w1:p1',
     session_id: 's1',
     failure_episode_id: observation.current_episode_id,
@@ -693,12 +978,15 @@ test('old event hook cannot submit under a replacement lease on the same socket'
     last_delivery_state: 'none',
   };
   await store.record('w1:p1', original);
-  const oldToken = await store.acquire(session);
-  let entered, releaseDecision;
-  const pending = new Promise((resolve) => {
+  const acquired = await store.acquire(session);
+  assert.ok(acquired);
+  oldToken = acquired;
+  let entered!: () => void;
+  let releaseDecision!: () => void;
+  const pending = new Promise<void>((resolve) => {
     entered = resolve;
   });
-  const held = new Promise((resolve) => {
+  const held = new Promise<void>((resolve) => {
     releaseDecision = resolve;
   });
   const env = {
@@ -723,10 +1011,15 @@ test('old event hook cannot submit under a replacement lease on the same socket'
       return recovery(input);
     });
     await pending;
+    holdHeartbeat = true;
+    const heartbeat = store.heartbeat(oldToken, session);
+    await within(heartbeatEntered.promise);
     await store.release(oldToken);
     milliseconds += 1_000;
     replacement = await store.acquire(session);
     assert.ok(replacement && replacement !== oldToken);
+    finishHeartbeat.resolve();
+    assert.equal(await within(heartbeat), false);
     releaseDecision();
     await oldHook;
     assert.deepEqual(await store.retry('w1:p1'), original);
@@ -738,8 +1031,9 @@ test('old event hook cannot submit under a replacement lease on the same socket'
     assert.equal(commands.includes('"agent","prompt"'), false);
   } finally {
     releaseDecision?.();
+    finishHeartbeat.resolve();
     if (replacement) await store.release(replacement);
-    await new Promise((resolve) => server.close(resolve));
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
 
@@ -776,10 +1070,11 @@ test('installed event uses the supplied Herdr 0.9.1 agent prompt CLI, not raw pa
       );
     });
   });
-  await new Promise((resolve) => server.listen(socket, resolve));
+  await new Promise<void>((resolve) => server.listen(socket, () => resolve()));
   const info = await stat(socket);
   const store = new EpisodeStore(directory),
     token = await store.acquire(`${info.dev}:${info.ino}`);
+  assert.ok(token);
   try {
     await runEvent(
       {
@@ -798,9 +1093,13 @@ test('installed event uses the supplied Herdr 0.9.1 agent prompt CLI, not raw pa
       },
       async (input) => recovery(input),
     );
-    assert.deepEqual((await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse), [
-      ['agent', 'prompt', 'w1:p1', recovery({ request_id: 'unused' }).proposed_action.instruction],
-    ]);
+    assert.deepEqual(
+      (await readFile(calls, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line)),
+      [['agent', 'prompt', 'w1:p1', recovery({ request_id: 'unused' }).proposed_action.instruction]],
+    );
     await store.clear('w1:p1');
     await runEvent(
       {
@@ -823,16 +1122,16 @@ test('installed event uses the supplied Herdr 0.9.1 agent prompt CLI, not raw pa
         reason_code: 'retry_exhausted',
       }),
     );
-    assert.deepEqual((await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse)[1], [
-      'notification',
-      'show',
-      'Agent Steward: human review required',
-      '--body',
-      'Review the stopped agent manually.',
-    ]);
+    assert.deepEqual(
+      (await readFile(calls, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))[1],
+      ['notification', 'show', 'Agent Steward: human review required', '--body', 'Review the stopped agent manually.'],
+    );
   } finally {
     await store.release(token);
-    await new Promise((resolve) => server.close(resolve));
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
 

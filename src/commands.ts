@@ -1,5 +1,5 @@
-import { StewardError } from './contracts.js';
-import type { Candidate, PlannedCommand, ThinkingLevel, Tool } from './contracts.js';
+import { StewardError } from './contracts.ts';
+import type { Candidate, PlannedCommand, ThinkingLevel, Tool } from './contracts.ts';
 
 const PI_EFFORTS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const AGY_EFFORTS = new Set(['low', 'medium', 'high', 'max']);

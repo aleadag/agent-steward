@@ -1,16 +1,16 @@
-import { StopInputSchema, StopResultSchema, StewardError, errorResult } from './contracts.js';
-import type { ErrorResult, Result, SelectedResult, StopInput, StopResult } from './contracts.js';
-import { loadConfig } from './config.js';
-import { validateCandidateSyntax } from './commands.js';
-import { assertByteLength, assertJsonDepth } from './limits.js';
-import { loadQuota } from './quota.js';
-import { assertNoCredentials } from './privacy.js';
-import { makeEvaluator } from './jev.js';
-import type { Evaluate, HttpPost, Questions } from './jev.js';
-import { route } from './routing.js';
-import { assessStop } from './triage.js';
-import { assertLiveTask, buildNativeLaunch } from './launch.js';
-import type { NativeLaunch } from './launch.js';
+import { StopInputSchema, StopResultSchema, StewardError, errorResult } from './contracts.ts';
+import type { ErrorResult, Result, SelectedResult, StopInput, StopResult } from './contracts.ts';
+import { loadConfig } from './config.ts';
+import { validateCandidateSyntax } from './commands.ts';
+import { assertByteLength, assertJsonDepth } from './limits.ts';
+import { loadQuota } from './quota.ts';
+import { assertNoCredentials } from './privacy.ts';
+import { makeEvaluator } from './jev.ts';
+import type { Evaluate, HttpPost, Questions } from './jev.ts';
+import { route } from './routing.ts';
+import { assessStop } from './triage.ts';
+import { assertLiveTask, buildNativeLaunch } from './launch.ts';
+import type { NativeLaunch } from './launch.ts';
 
 export type Invocation =
   | { kind: 'help' }

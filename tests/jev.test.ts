@@ -1,14 +1,92 @@
-import test from 'node:test';
+import { afterEach, mock, spyOn, test } from 'bun:test';
 import assert from 'node:assert/strict';
 import https from 'node:https';
+import type { ClientRequest, IncomingMessage, RequestOptions } from 'node:http';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { ResultSchema, StewardError } from '../dist/src/contracts.js';
-import { MAX_JSON_BYTES } from '../dist/src/limits.js';
-import { choiceWinner, makeEvaluator, postHttps, validateEvaluation } from '../dist/src/jev.js';
-import { choiceAnswer, jevResponse, noulAnswer } from './helpers.mjs';
+import type { ChoiceAnswer, Evaluation, NoulAnswer } from '../src/contracts.ts';
+import { ResultSchema, StewardError } from '../src/contracts.ts';
+import { MAX_JSON_BYTES } from '../src/limits.ts';
+import { choiceWinner, makeEvaluator, postHttps, validateEvaluation } from '../src/jev.ts';
+import type { HttpPost, Questions } from '../src/jev.ts';
+import { choiceAnswer, jevResponse, noulAnswer } from './helpers.ts';
 
-function requestedQuestions() {
+afterEach(() => mock.restore());
+
+type FakeRequest = EventEmitter & {
+  destroyedByCaller: boolean;
+  destroy: (error?: Error) => FakeRequest;
+  end: (body?: string) => FakeRequest;
+};
+type FakeResponse = PassThrough & { statusCode: number };
+type RequestMockImplementation = (
+  url: string | URL,
+  options: RequestOptions,
+  callback: ((response: IncomingMessage) => void) | undefined,
+) => ClientRequest;
+type HttpsCall = {
+  url: string | URL;
+  options: RequestOptions;
+  body?: string;
+  request: FakeRequest;
+  response?: FakeResponse;
+};
+
+function mockHttpsRequest(implementation: RequestMockImplementation): void {
+  spyOn(https, 'request').mockImplementation(implementation as unknown as typeof https.request);
+}
+
+function respond(callback: ((response: IncomingMessage) => void) | undefined, response: FakeResponse): void {
+  if (callback === undefined) throw new Error('missing HTTPS response callback');
+  callback(response as unknown as IncomingMessage);
+}
+
+function fakeResponse(statusCode: number): FakeResponse {
+  return Object.assign(new PassThrough(), { statusCode });
+}
+
+function fakeRequest(onEnd: (body: string | undefined, request: FakeRequest) => void): FakeRequest {
+  const request = new EventEmitter() as FakeRequest;
+  request.destroyedByCaller = false;
+  request.destroy = () => {
+    request.destroyedByCaller = true;
+    request.emit('close');
+    return request;
+  };
+  request.end = (body) => {
+    onEnd(body, request);
+    return request;
+  };
+  return request;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('expected record');
+  return value as Record<string, unknown>;
+}
+
+function rawValidResponse(): Record<string, unknown> {
+  const value: unknown = JSON.parse(JSON.stringify(validResponse()));
+  return asRecord(value);
+}
+
+function rawAnswer(value: Record<string, unknown>, id: string): Record<string, unknown> {
+  return asRecord(asRecord(value['answers'])[id]);
+}
+
+function choiceIn(value: Evaluation, id: string): ChoiceAnswer {
+  const answer = value.answers[id];
+  if (answer?.type !== 'choice') throw new Error(`expected choice answer: ${id}`);
+  return answer;
+}
+
+function noulIn(value: Evaluation, id: string): NoulAnswer {
+  const answer = value.answers[id];
+  if (answer?.type !== 'noul') throw new Error(`expected Noul answer: ${id}`);
+  return answer;
+}
+
+function requestedQuestions(): Questions {
   return {
     pair: {
       type: 'choice',
@@ -19,48 +97,52 @@ function requestedQuestions() {
   };
 }
 
-function validResponse() {
+function validResponse(): Evaluation {
   return jevResponse({
     pair: choiceAnswer({ alpha: 0.75, beta: 0.25 }),
     risk: noulAnswer(0.2),
   });
 }
 
-function assertStewardCode(fn, code) {
-  assert.throws(fn, (error) => error instanceof StewardError && error.code === code);
+function hasCode(error: unknown, code: StewardError['code']): error is StewardError {
+  return error instanceof StewardError && error.code === code;
 }
 
-function mockHttpsResponse(
-  t,
-  { status = 200, chunks = [Buffer.from(JSON.stringify(validResponse()))], requestError } = {},
-) {
-  const calls = [];
-  const requestMock = t.mock.method(https, 'request', (url, options, callback) => {
-    const request = new EventEmitter();
-    request.destroyedByCaller = false;
-    request.destroy = () => {
-      request.destroyedByCaller = true;
-      request.emit('close');
-      return request;
-    };
-    request.end = (body) => {
-      calls.push({ url, options, body, request });
+function assertStewardCode(fn: () => unknown, code: StewardError['code']): void {
+  assert.throws(fn, (error) => hasCode(error, code));
+}
+
+function callAt(calls: HttpsCall[], index = 0): HttpsCall {
+  const call = calls[index];
+  if (call === undefined) throw new Error(`missing HTTPS call at index ${index}`);
+  return call;
+}
+
+function mockHttpsResponse({
+  status = 200,
+  chunks = [Buffer.from(JSON.stringify(validResponse()))],
+  requestError,
+}: { status?: number; chunks?: Buffer[]; requestError?: Error } = {}): { calls: HttpsCall[] } {
+  const calls: HttpsCall[] = [];
+  mockHttpsRequest((url, options, callback) => {
+    const request = fakeRequest((body) => {
+      const call: HttpsCall = { url, options, body, request };
+      calls.push(call);
       queueMicrotask(() => {
         if (requestError !== undefined) {
           request.emit('error', requestError);
           return;
         }
-        const response = new PassThrough();
-        response.statusCode = status;
-        calls.at(-1).response = response;
-        callback(response);
+        const response = fakeResponse(status);
+        call.response = response;
+        respond(callback, response);
         for (const chunk of chunks) response.write(chunk);
         response.end();
       });
-    };
-    return request;
+    });
+    return request as unknown as ClientRequest;
   });
-  return { calls, requestMock };
+  return { calls };
 }
 
 test('typed validation accepts complete choice and Noul answers and preserves omitted token counters', () => {
@@ -69,7 +151,7 @@ test('typed validation accepts complete choice and Noul answers and preserves om
   const parsed = validateEvaluation(response, requestedQuestions());
   assert.equal(parsed.model, 'jev-1.13.0');
   assert.deepEqual(parsed.usage, {});
-  assert.equal(parsed.answers.risk.noul, 0.2);
+  assert.equal(noulIn(parsed, 'risk').noul, 0.2);
 });
 
 test('evaluation validation rejects incomplete, extra, or wrong-type answer sets', () => {
@@ -85,13 +167,13 @@ test('evaluation validation rejects incomplete, extra, or wrong-type answer sets
 
 test('evaluation validation requires exact choice options and a maximal returned choice', () => {
   const good = validResponse();
-  good.answers.pair.probabilities = { alpha: 0.75, beta: 0.25, extra: 0 };
+  choiceIn(good, 'pair').probabilities = { alpha: 0.75, beta: 0.25, extra: 0 };
   const missing = validResponse();
-  missing.answers.pair.probabilities = { alpha: 1 };
+  choiceIn(missing, 'pair').probabilities = { alpha: 1 };
   const nonMaximum = validResponse();
-  nonMaximum.answers.pair.choice = 'beta';
+  choiceIn(nonMaximum, 'pair').choice = 'beta';
   const unknownChoice = validResponse();
-  unknownChoice.answers.pair.choice = 'invented';
+  choiceIn(unknownChoice, 'pair').choice = 'invented';
   for (const value of [good, missing, nonMaximum, unknownChoice]) {
     assertStewardCode(() => validateEvaluation(value, requestedQuestions()), 'invalid_response');
   }
@@ -99,8 +181,8 @@ test('evaluation validation requires exact choice options and a maximal returned
 
 test('choice distributions enforce finite range and an absolute sum tolerance of 0.000001', () => {
   const atTolerance = validResponse();
-  atTolerance.answers.pair.probabilities = { alpha: 0.5, beta: 0.500001 };
-  atTolerance.answers.pair.choice = 'beta';
+  choiceIn(atTolerance, 'pair').probabilities = { alpha: 0.5, beta: 0.500001 };
+  choiceIn(atTolerance, 'pair').choice = 'beta';
   assert.doesNotThrow(() => validateEvaluation(atTolerance, requestedQuestions()));
 
   for (const probabilities of [
@@ -109,31 +191,31 @@ test('choice distributions enforce finite range and an absolute sum tolerance of
     { alpha: Number.NaN, beta: Number.POSITIVE_INFINITY },
   ]) {
     const response = validResponse();
-    response.answers.pair.probabilities = probabilities;
+    choiceIn(response, 'pair').probabilities = probabilities;
     assertStewardCode(() => validateEvaluation(response, requestedQuestions()), 'invalid_response');
   }
 });
 
 test('decimal sum tolerance accepts both exact edges and rejects values just outside', () => {
-  const accepted = [
+  const accepted: [Record<string, number>, string][] = [
     [{ alpha: 0.5, beta: 0.500001 }, 'beta'],
     [{ alpha: 0.5, beta: 0.499999 }, 'alpha'],
   ];
   for (const [probabilities, winner] of accepted) {
     const response = validResponse();
-    response.answers.pair.probabilities = probabilities;
-    response.answers.pair.choice = winner;
+    choiceIn(response, 'pair').probabilities = probabilities;
+    choiceIn(response, 'pair').choice = winner;
     assert.doesNotThrow(() => validateEvaluation(response, requestedQuestions()));
   }
 
-  const rejected = [
+  const rejected: [Record<string, number>, string][] = [
     [{ alpha: 0.5, beta: 0.50000100000001 }, 'beta'],
     [{ alpha: 0.5, beta: 0.49999899999999 }, 'alpha'],
   ];
   for (const [probabilities, winner] of rejected) {
     const response = validResponse();
-    response.answers.pair.probabilities = probabilities;
-    response.answers.pair.choice = winner;
+    choiceIn(response, 'pair').probabilities = probabilities;
+    choiceIn(response, 'pair').choice = winner;
     assertStewardCode(() => validateEvaluation(response, requestedQuestions()), 'invalid_response');
   }
 });
@@ -157,85 +239,85 @@ test('255-option distribution just outside the absolute tolerance is rejected', 
 });
 
 test('confidence, Noul risk, resolved model, usage and token counters are all validated', () => {
-  const bad = [
+  const bad: unknown[] = [
     (() => {
-      const value = validResponse();
-      delete value.answers.pair.confidence;
+      const value = rawValidResponse();
+      delete rawAnswer(value, 'pair')['confidence'];
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.answers.pair.confidence = 1.01;
+      const value = rawValidResponse();
+      rawAnswer(value, 'pair')['confidence'] = 1.01;
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.answers.pair.confidence = Number.NaN;
+      const value = rawValidResponse();
+      rawAnswer(value, 'pair')['confidence'] = Number.NaN;
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.answers.pair.confidence = Number.POSITIVE_INFINITY;
+      const value = rawValidResponse();
+      rawAnswer(value, 'pair')['confidence'] = Number.POSITIVE_INFINITY;
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.answers.risk.noul = -0.01;
+      const value = rawValidResponse();
+      rawAnswer(value, 'risk')['noul'] = -0.01;
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.answers.risk.noul = Number.NaN;
+      const value = rawValidResponse();
+      rawAnswer(value, 'risk')['noul'] = Number.NaN;
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.answers.risk.noul = Number.POSITIVE_INFINITY;
+      const value = rawValidResponse();
+      rawAnswer(value, 'risk')['noul'] = Number.POSITIVE_INFINITY;
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.model = '';
+      const value = rawValidResponse();
+      value['model'] = '';
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      delete value.model;
+      const value = rawValidResponse();
+      delete value['model'];
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      delete value.usage;
+      const value = rawValidResponse();
+      delete value['usage'];
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.usage = { input_tokens: -1 };
+      const value = rawValidResponse();
+      value['usage'] = { input_tokens: -1 };
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.usage = { output_tokens: 1.5 };
+      const value = rawValidResponse();
+      value['usage'] = { output_tokens: 1.5 };
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.usage = { input_tokens: Number.NaN };
+      const value = rawValidResponse();
+      value['usage'] = { input_tokens: Number.NaN };
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.usage = { output_tokens: Number.POSITIVE_INFINITY };
+      const value = rawValidResponse();
+      value['usage'] = { output_tokens: Number.POSITIVE_INFINITY };
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.usage = { input_tokens: '12' };
+      const value = rawValidResponse();
+      value['usage'] = { input_tokens: '12' };
       return value;
     })(),
     (() => {
-      const value = validResponse();
-      value.usage = { unexpected: 1 };
+      const value = rawValidResponse();
+      value['usage'] = { unexpected: 1 };
       return value;
     })(),
   ];
@@ -251,9 +333,9 @@ test('choice ties use supplied order even when integer-like keys enumerate diffe
 test('prototype-like question and option IDs survive API and ResultSchema record parsing', () => {
   const ids = ['__proto__', 'constructor'];
   const criteria = Object.fromEntries(ids.map((id) => [id, `Option ${id}`]));
-  const questions = Object.fromEntries([
-    ['__proto__', { type: 'choice', instructions: 'Choose one.', criteria }],
-    ['constructor', { type: 'noul', instructions: 'Is this risky?' }],
+  const questions: Questions = Object.fromEntries([
+    ['__proto__', { type: 'choice' as const, instructions: 'Choose one.', criteria }],
+    ['constructor', { type: 'noul' as const, instructions: 'Is this risky?' }],
   ]);
   const probabilities = Object.fromEntries(ids.map((id) => [id, 0.5]));
   const answers = Object.fromEntries([
@@ -261,10 +343,11 @@ test('prototype-like question and option IDs survive API and ResultSchema record
     ['constructor', noulAnswer(0.2)],
   ]);
   const evaluation = validateEvaluation(jevResponse(answers), questions);
+  const prototypeChoice = choiceIn(evaluation, '__proto__');
   for (const key of ids) {
     assert.equal(Object.hasOwn(evaluation.answers, key), true);
-    assert.equal(Object.hasOwn(evaluation.answers.__proto__.probabilities, key), true);
-    assert.equal(evaluation.answers.__proto__.probabilities[key], 0.5);
+    assert.equal(Object.hasOwn(prototypeChoice.probabilities, key), true);
+    assert.equal(prototypeChoice.probabilities[key], 0.5);
   }
   const result = ResultSchema.parse({
     schema_version: 1,
@@ -276,10 +359,12 @@ test('prototype-like question and option IDs survive API and ResultSchema record
     risk_probability: 0.2,
     evaluation,
   });
+  if (!('evaluation' in result) || result.evaluation === null) throw new Error('expected evaluated approval result');
+  const resultChoice = choiceIn(result.evaluation, '__proto__');
   for (const key of ids) {
     assert.equal(Object.hasOwn(result.evaluation.answers, key), true);
-    assert.equal(Object.hasOwn(result.evaluation.answers.__proto__.probabilities, key), true);
-    assert.equal(result.evaluation.answers.__proto__.probabilities[key], 0.5);
+    assert.equal(Object.hasOwn(resultChoice.probabilities, key), true);
+    assert.equal(resultChoice.probabilities[key], 0.5);
   }
 });
 
@@ -297,24 +382,23 @@ test('Choice criteria must have 1 through 255 options before any post', async ()
     {},
     Object.fromEntries(Array.from({ length: 256 }, (_, index) => [`o-${index}`, 'Option'])),
   ]) {
-    await assert.rejects(
-      evaluate({}, { pair: { type: 'choice', instructions: 'Choose.', criteria } }),
-      (error) => error.code === 'invalid_input',
+    await assert.rejects(evaluate({}, { pair: { type: 'choice', instructions: 'Choose.', criteria } }), (error) =>
+      hasCode(error, 'invalid_input'),
     );
   }
   assert.equal(calls, 0);
 });
 
-test('evaluator sends exact POST wire request, preserves separate adversarial state, and uses a fresh deadline per call', async (t) => {
-  const durations = [];
-  const signals = [];
-  t.mock.method(AbortSignal, 'timeout', (milliseconds) => {
+test('evaluator sends exact POST wire request, preserves separate adversarial state, and uses a fresh deadline per call', async () => {
+  const durations: number[] = [];
+  const signals: AbortSignal[] = [];
+  spyOn(AbortSignal, 'timeout').mockImplementation((milliseconds) => {
     durations.push(milliseconds);
     const signal = new AbortController().signal;
     signals.push(signal);
     return signal;
   });
-  const requests = [];
+  const requests: Parameters<HttpPost>[0][] = [];
   const evaluate = makeEvaluator({
     model: 'jev-1.13.0',
     apiKey: 'unit-key-not-live',
@@ -343,14 +427,14 @@ test('evaluator sends exact POST wire request, preserves separate adversarial st
   }
 });
 
-test('fake post observes the 30-second deadline abort and exposes no request or upstream text', async (t) => {
+test('fake post observes the 30-second deadline abort and exposes no request or upstream text', async () => {
   const controller = new AbortController();
-  const deadlines = [];
+  const deadlines: number[] = [];
   const upstreamSecret = 'fake-post-upstream-secret';
   const bodyMarker = 'request-body-marker-not-for-errors';
   let calls = 0;
   let capturedSignal;
-  t.mock.method(AbortSignal, 'timeout', (milliseconds) => {
+  spyOn(AbortSignal, 'timeout').mockImplementation((milliseconds) => {
     deadlines.push(milliseconds);
     return controller.signal;
   });
@@ -374,7 +458,7 @@ test('fake post observes the 30-second deadline abort and exposes no request or 
   await assert.rejects(
     pending,
     (error) =>
-      error.code === 'evaluation_failed' &&
+      hasCode(error, 'evaluation_failed') &&
       !error.message.includes(upstreamSecret) &&
       !error.message.includes(bodyMarker) &&
       !error.message.includes('unit-key-not-live'),
@@ -392,13 +476,12 @@ test('oversized or excessively nested outbound content fails locally without a p
       return { status: 200, body: JSON.stringify(validResponse()) };
     },
   });
-  await assert.rejects(
-    evaluate({ task: 'x'.repeat(MAX_JSON_BYTES) }, requestedQuestions()),
-    (error) => error.code === 'invalid_input',
+  await assert.rejects(evaluate({ task: 'x'.repeat(MAX_JSON_BYTES) }, requestedQuestions()), (error) =>
+    hasCode(error, 'invalid_input'),
   );
   let deep = null;
   for (let index = 0; index < 65; index++) deep = [deep];
-  await assert.rejects(evaluate(deep, requestedQuestions()), (error) => error.code === 'invalid_input');
+  await assert.rejects(evaluate(deep, requestedQuestions()), (error) => hasCode(error, 'invalid_input'));
   assert.equal(calls, 0);
 });
 
@@ -415,7 +498,7 @@ test('transport exceptions and non-success statuses are safe and never retried',
   });
   await assert.rejects(
     evaluateThrows({}, requestedQuestions()),
-    (error) => error.code === 'evaluation_failed' && !error.message.includes(secret),
+    (error) => hasCode(error, 'evaluation_failed') && !error.message.includes(secret),
   );
 
   for (const status of [401, 422, 429, 529, 302]) {
@@ -429,7 +512,7 @@ test('transport exceptions and non-success statuses are safe and never retried',
     });
     await assert.rejects(
       failed({}, requestedQuestions()),
-      (error) => error.code === 'evaluation_failed' && !error.message.includes(secret),
+      (error) => hasCode(error, 'evaluation_failed') && !error.message.includes(secret),
     );
   }
   assert.equal(calls, 6);
@@ -450,13 +533,13 @@ test('malformed, oversized, and deeply nested fake-post responses fail as invali
       apiKey: 'unit-key-not-live',
       post: async () => ({ status: 200, body }),
     });
-    await assert.rejects(evaluate({}, requestedQuestions()), (error) => error.code === 'invalid_response');
+    await assert.rejects(evaluate({}, requestedQuestions()), (error) => hasCode(error, 'invalid_response'));
   }
 });
 
-test('HTTPS adapter sends POST headers and body through one request for every status, including redirects', async (t) => {
+test('HTTPS adapter sends POST headers and body through one request for every status, including redirects', async () => {
   for (const status of [200, 401, 422, 429, 529, 302]) {
-    const { calls } = mockHttpsResponse(t, { status, chunks: [Buffer.from('response body')] });
+    const { calls } = mockHttpsResponse({ status, chunks: [Buffer.from('response body')] });
     const controller = new AbortController();
     const result = await postHttps({
       url: 'https://api.typesafe.ai/v1/systemone',
@@ -467,21 +550,25 @@ test('HTTPS adapter sends POST headers and body through one request for every st
     assert.equal(result.status, status);
     assert.equal(result.body, status === 200 ? 'response body' : '');
     assert.equal(calls.length, 1);
-    if (status !== 200) assert.equal(calls[0].response.destroyed, true);
-    assert.equal(calls[0].url, 'https://api.typesafe.ai/v1/systemone');
-    assert.equal(calls[0].options.method, 'POST');
-    assert.deepEqual(calls[0].options.headers, {
+    const call = callAt(calls);
+    if (status !== 200) {
+      assert.ok(call.response !== undefined);
+      assert.equal(call.response.destroyed, true);
+    }
+    assert.equal(call.url, 'https://api.typesafe.ai/v1/systemone');
+    assert.equal(call.options.method, 'POST');
+    assert.deepEqual(call.options.headers, {
       authorization: 'Bearer unit-key-not-live',
       'content-type': 'application/json',
     });
-    assert.equal(calls[0].options.signal, controller.signal);
-    assert.equal(calls[0].body, '{"data":true}');
-    t.mock.restoreAll();
+    assert.equal(call.options.signal, controller.signal);
+    assert.equal(call.body, '{"data":true}');
+    mock.restore();
   }
 });
 
-test('HTTPS adapter bounds response chunks and rejects malformed UTF-8 before returning a body', async (t) => {
-  const oversized = mockHttpsResponse(t, { chunks: [Buffer.alloc(MAX_JSON_BYTES), Buffer.from('x')] });
+test('HTTPS adapter bounds response chunks and rejects malformed UTF-8 before returning a body', async () => {
+  const oversized = mockHttpsResponse({ chunks: [Buffer.alloc(MAX_JSON_BYTES), Buffer.from('x')] });
   await assert.rejects(
     postHttps({
       url: 'https://api.typesafe.ai/v1/systemone',
@@ -489,14 +576,16 @@ test('HTTPS adapter bounds response chunks and rejects malformed UTF-8 before re
       body: '{}',
       signal: new AbortController().signal,
     }),
-    (error) => error.code === 'invalid_response',
+    (error) => hasCode(error, 'invalid_response'),
   );
   assert.equal(oversized.calls.length, 1);
-  assert.equal(oversized.calls[0].response.destroyed, true);
-  assert.equal(oversized.calls[0].request.destroyedByCaller, true);
-  t.mock.restoreAll();
+  const oversizedCall = callAt(oversized.calls);
+  assert.ok(oversizedCall.response !== undefined);
+  assert.equal(oversizedCall.response.destroyed, true);
+  assert.equal(oversizedCall.request.destroyedByCaller, true);
+  mock.restore();
 
-  const malformed = mockHttpsResponse(t, { chunks: [Buffer.from([0xff])] });
+  const malformed = mockHttpsResponse({ chunks: [Buffer.from([0xff])] });
   await assert.rejects(
     postHttps({
       url: 'https://api.typesafe.ai/v1/systemone',
@@ -504,14 +593,14 @@ test('HTTPS adapter bounds response chunks and rejects malformed UTF-8 before re
       body: '{}',
       signal: new AbortController().signal,
     }),
-    (error) => error.code === 'invalid_response',
+    (error) => hasCode(error, 'invalid_response'),
   );
   assert.equal(malformed.calls.length, 1);
 });
 
-test('HTTPS transport errors never expose exception text', async (t) => {
+test('HTTPS transport errors never expose exception text', async () => {
   const secret = 'network-error-containing-secret';
-  const { calls } = mockHttpsResponse(t, { requestError: new Error(secret) });
+  const { calls } = mockHttpsResponse({ requestError: new Error(secret) });
   await assert.rejects(
     postHttps({
       url: 'https://api.typesafe.ai/v1/systemone',
@@ -519,29 +608,24 @@ test('HTTPS transport errors never expose exception text', async (t) => {
       body: '{}',
       signal: new AbortController().signal,
     }),
-    (error) => error.code === 'evaluation_failed' && !error.message.includes(secret),
+    (error) => hasCode(error, 'evaluation_failed') && !error.message.includes(secret),
   );
   assert.equal(calls.length, 1);
 });
 
-test('request error mid-response destroys the active reader and settles once', async (t) => {
-  let request;
-  let response;
+test('request error mid-response destroys the active reader and settles once', async () => {
+  let request: FakeRequest | undefined;
+  let response: FakeResponse | undefined;
   let promiseSettlements = 0;
-  t.mock.method(https, 'request', (_url, _options, callback) => {
-    request = new EventEmitter();
-    request.destroyedByCaller = false;
-    request.destroy = () => {
-      request.destroyedByCaller = true;
-      return request;
-    };
-    request.end = () => {
-      response = new PassThrough();
-      response.statusCode = 200;
-      callback(response);
-      response.write('partial response');
-    };
-    return request;
+  mockHttpsRequest((_url, _options, callback) => {
+    const fake = fakeRequest(() => {
+      const stream = fakeResponse(200);
+      response = stream;
+      respond(callback, stream);
+      stream.write('partial response');
+    });
+    request = fake;
+    return fake as unknown as ClientRequest;
   });
 
   const pending = postHttps({
@@ -559,30 +643,25 @@ test('request error mid-response destroys the active reader and settles once', a
       throw error;
     },
   );
+  assert.ok(response !== undefined && request !== undefined);
   assert.equal(response.destroyed, false);
   request.emit('error', new Error('mid-response transport failure'));
-  await assert.rejects(pending, (error) => error.code === 'evaluation_failed');
+  await assert.rejects(pending, (error) => hasCode(error, 'evaluation_failed'));
   assert.equal(response.destroyed, true);
   assert.equal(promiseSettlements, 1);
 });
 
-test('HTTPS adapter destroys active request and response stream on abort', async (t) => {
-  let response;
-  let request;
-  t.mock.method(https, 'request', (_url, _options, callback) => {
-    request = new EventEmitter();
-    request.destroyedByCaller = false;
-    request.destroy = () => {
-      request.destroyedByCaller = true;
-      request.emit('close');
-      return request;
-    };
-    request.end = () => {
-      response = new PassThrough();
-      response.statusCode = 200;
-      callback(response);
-    };
-    return request;
+test('HTTPS adapter destroys active request and response stream on abort', async () => {
+  let response: FakeResponse | undefined;
+  let request: FakeRequest | undefined;
+  mockHttpsRequest((_url, _options, callback) => {
+    const fake = fakeRequest(() => {
+      const stream = fakeResponse(200);
+      response = stream;
+      respond(callback, stream);
+    });
+    request = fake;
+    return fake as unknown as ClientRequest;
   });
   const controller = new AbortController();
   const pending = postHttps({
@@ -591,25 +670,24 @@ test('HTTPS adapter destroys active request and response stream on abort', async
     body: '{}',
     signal: controller.signal,
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
   controller.abort();
-  await assert.rejects(pending, (error) => error.code === 'evaluation_failed');
+  await assert.rejects(pending, (error) => hasCode(error, 'evaluation_failed'));
+  assert.ok(request !== undefined && response !== undefined);
   assert.equal(request.destroyedByCaller, true);
   assert.equal(response.destroyed, true);
 });
 
-test('aborted HTTPS response stream rejects without hanging', async (t) => {
-  let response;
-  t.mock.method(https, 'request', (_url, _options, callback) => {
-    const request = new EventEmitter();
-    request.destroy = () => request;
-    request.end = () => {
-      response = new PassThrough();
-      response.statusCode = 200;
-      callback(response);
-      queueMicrotask(() => response.emit('aborted'));
-    };
-    return request;
+test('aborted HTTPS response stream rejects without hanging', async () => {
+  let response: FakeResponse | undefined;
+  mockHttpsRequest((_url, _options, callback) => {
+    const request = fakeRequest(() => {
+      const stream = fakeResponse(200);
+      response = stream;
+      respond(callback, stream);
+      queueMicrotask(() => stream.emit('aborted'));
+    });
+    return request as unknown as ClientRequest;
   });
   await assert.rejects(
     postHttps({
@@ -618,7 +696,8 @@ test('aborted HTTPS response stream rejects without hanging', async (t) => {
       body: '{}',
       signal: new AbortController().signal,
     }),
-    (error) => error.code === 'evaluation_failed',
+    (error) => hasCode(error, 'evaluation_failed'),
   );
+  assert.ok(response !== undefined);
   assert.equal(response.destroyed, true);
 });

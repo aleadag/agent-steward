@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process';
 import process from 'node:process';
 import { delimiter, isAbsolute } from 'node:path';
-import { StewardError } from './contracts.js';
-import type { NativeLaunch } from './launch.js';
+import { StewardError } from './contracts.ts';
+import type { NativeLaunch } from './launch.ts';
 
 type SignalSource = {
   on(signal: 'SIGTERM', listener: () => void): void;

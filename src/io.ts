@@ -1,6 +1,6 @@
 import { createReadStream } from 'node:fs';
 import type { Readable } from 'node:stream';
-import { LimitError, MAX_JSON_BYTES } from './limits.js';
+import { LimitError, MAX_JSON_BYTES } from './limits.ts';
 
 export function readBoundedUtf8(stream: Readable): Promise<string> {
   return new Promise((resolve, reject) => {

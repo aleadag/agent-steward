@@ -1,9 +1,9 @@
 import { z } from 'zod';
-import { ApprovalInputSchema, ResultSchema, StewardError } from './contracts.js';
-import type { ApprovalInput, ApprovalResult, Config, Evaluation } from './contracts.js';
-import { assertJsonDepth } from './limits.js';
-import { choiceWinner, validateEvaluation } from './jev.js';
-import type { Evaluate, Questions } from './jev.js';
+import { ApprovalInputSchema, ResultSchema, StewardError } from './contracts.ts';
+import type { ApprovalInput, ApprovalResult, Config, Evaluation } from './contracts.ts';
+import { assertJsonDepth } from './limits.ts';
+import { choiceWinner, validateEvaluation } from './jev.ts';
+import type { Evaluate, Questions } from './jev.ts';
 
 export const WAITING_FOR = [
   'approve_command',

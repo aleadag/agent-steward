@@ -4,23 +4,24 @@ Agent-steward's standalone CLI routes tasks to a native Codex, Pi, or agy execut
 
 ## Install and run
 
-The Nix flake provides a Node.js 22 development shell, a packaged executable with its runtime dependencies, and the default app:
+The Nix flake provides the pinned Bun development shell, a packaged executable with its runtime dependencies, and the default app:
 
 ```sh
 nix develop path:.
-npm ci --ignore-scripts
-npm test
-npm run typecheck
-npm run lint
-npm run format:check
+bun install --frozen-lockfile --ignore-scripts
+bun run build
+bun test
+bun run typecheck
+bun run lint
+bun run format:check
 nix build path:.#agent-steward --no-update-lock-file
 nix run path:. --no-update-lock-file -- --help
 nix flake check path:. --no-update-lock-file
 ```
 
-`npm run lint` runs Oxlint on `src` and `tests`; `npm run format:check` checks those files with Oxfmt. Run `npm run format` to apply formatting. TypeScript validation remains in `npm run typecheck`.
+`bun run lint` runs Oxlint on `src` and `tests`; `bun run format:check` checks those files with Oxfmt. Run `bun run format` to apply formatting. TypeScript validation remains in `bun run typecheck`.
 
-The package installs the executable as `result/bin/agent-steward` and bundles the skill at `share/agent-steward/skills/agent-steward/SKILL.md`. `nix run` and the installed executable use the packaged Node.js runtime. Offline checks do not need credentials, agent executables, user configuration, or live Jev access.
+The package installs `result/bin/agent-steward` and `result/bin/agent-steward-herdr-adapter`, bundles the skill at `share/agent-steward/skills/agent-steward/SKILL.md`, and ships the disabled plugin assets at `share/agent-steward/herdr-plugin/`. Both wrappers use the package-local Bun runtime. The TypeScript sources compile to `lib/agent-steward/dist/src/**/*.js`; the wrappers run that JavaScript with Bun. Source and emitted files retain Bun-compatible `node:` API imports, so a separate Node executable is not required. Offline checks do not need credentials, agent executables, user configuration, or live Jev access.
 
 The standalone skill is [`skills/agent-steward/SKILL.md`](skills/agent-steward/SKILL.md). If a harness supports skills, a user may manually copy or link it into a skills directory selected for that harness. For example, after choosing a destination, set `SKILLS_DIR` to that user-selected directory and run:
 
@@ -99,11 +100,17 @@ After separate review and explicit authorization, an operator can link the **dis
 herdr plugin link --disabled "<package-path>/share/agent-steward/herdr-plugin"
 ```
 
-The package supplies `herdr-plugin.toml`, `run.sh` and a relative link to the pinned-Node adapter wrapper. Linking disabled is not activation: do not enable the plugin or open its `supervisor` pane in a normal Herdr session without a separate opt-in. Before a future opt-in, configure only intended Pi/Codex pane IDs in the plugin's `targets.json` as `{"pane_ids":["w1:p1"]}` (find its directory using `herdr plugin config-dir agent-steward`), then independently review that pane's bounded text disclosure and retry behavior. Packaging tests use an isolated fake Herdr socket and CLI; they do not establish safe live activation.
+The package supplies `herdr-plugin.toml`, `run.sh` and a relative link to the package-local Bun adapter wrapper. Linking disabled is not activation: do not enable the plugin or open its `supervisor` pane in a normal Herdr session without a separate opt-in. Before a future opt-in, configure only intended Pi/Codex pane IDs in the plugin's `targets.json` as `{"pane_ids":["w1:p1"]}` (find its directory using `herdr plugin config-dir agent-steward`), then independently review that pane's bounded text disclosure and retry behavior. Packaging tests use an isolated fake Herdr socket and CLI; they do not establish safe live activation.
 
 A recovery proposal waits until its episode-anchored deadline, then re-observes and asks `stop check` again before using Herdr's `agent prompt` command with the fixed instruction. Only an unchanged, ready `idle` agent is eligible. This is best-effort babysitting, not proof that the error is still current: the instruction asks the agent to check prior success and do nothing if the failure is no longer current. Blocked dialogs, including error and permission UI, require a person: no Codex/Pi non-approval dismissal has been proven. `done` is not yet eligible because the current bounded observation path cannot verify a fresh recovery classification for that status. Approval proposals always hand off to a human and never send keys: Herdr 0.9.1's installed Pi lifecycle integration and Codex session hook expose no exact current permission-request identity, action or accepting control. The default verifier returns no proof, and neither a proposed `approve_request`, a detection digest, a blocked status nor a configured key grants authority. There is no approval-key configuration or sending path; if a future independently tested tool-specific verifier and sender are added, `1` is the requested default with optional per-tool override **only after** proof of the current request and accepting control. Quota exhaustion schedules bounded rechecks (5, 15, 45, 120 minutes, then up to six hours) and hands off at 24 hours; it cannot verify account-bound reset times. A prompt timeout, stall, or unknown write outcome is recorded as uncertain and is never automatically resent.
 
 Human handoffs emit fixed, credential-free stderr text and, when Herdr supplies its executable path, call Herdr 0.9.1 `notification show` with a fixed title and body. A successful notification call does not prove that a person saw the toast. Socket device/inode is only a local server-instance proxy, not authenticated session identity. Disposable tests exercised live Jev classification on synthetic context and one adapter-originated conditional prompt to a ready Pi with a synthetic recovery decision; they did not prove genuine-error recovery or human notification visibility. Enabling the plugin in a normal session still needs separate review and explicit authorization.
+
+The supervisor uses a version-2 generation lease with a 15-second heartbeat TTL. On stop it closes local admission immediately and independently publishes a generation revocation marker. On a responsive event loop, the scheduler reports a result within five seconds: `stopped` only after confirmed revocation, or `shutdown_incomplete` with a fixed **release unconfirmed** warning and nonzero exit status. This bounds the scheduler result, not Bun process exit or blocked filesystem calls. While release is unconfirmed, separate event hooks may still act under a live, selected, unrevoked lease. After confirmed release, fresh checks for that generation fail permanently; pre-admitted writes or commands may still finish, and uncertain deliveries are never automatically resent.
+
+Lease storage requires a coherent local filesystem and common host/PID namespace. It does not provide network-filesystem fencing or power-loss durability guarantees. Released generations and generation tombstones remain on disk; storage grows per acquisition, not per heartbeat. Disk-full errors do not grant ownership, and failure to create a revocation marker is incomplete shutdown, not successful cleanup. Safe retention cleanup is separate work.
+
+Legacy `scheduler-lease/owner.json` and stranded `takeover-guard` state require offline human review, not live conversion or age-based deletion. Disable the optional plugin, stop every supervisor and event-hook adapter process, and verify all are dead before removing only the stranded guard or old-format lease state as appropriate. Preserve episode records and all generation tombstones. Do not infer that a guard is safe to delete from lease expiry or the selected owner's death: another publisher may own it. Do not remove the version-2 lease directory to make a timeout appear successful. Enabling the plugin remains a separate explicit opt-in.
 
 Stable error codes are `invalid_input`, `invalid_config`, `missing_credentials`, `credential_detected`, `invalid_response`, `evaluation_failed`, `interactive_terminal_required`, and `launch_failed`. Messages are fixed and do not contain paths, submitted data, credentials, or raw evaluator or process errors. Diagnostics use stderr; JSON stdout contains one result and a newline.
 

@@ -1,5 +1,5 @@
-import type { StopInput, StopResult } from './contracts.js';
-import { compareRfc3339Timestamps } from './timestamps.js';
+import type { StopInput, StopResult } from './contracts.ts';
+import { compareRfc3339Timestamps } from './timestamps.ts';
 
 type Proposal = Extract<StopResult, { decision: 'stop_decision' }>['proposed_action'];
 type RetryKind = 'recoverable_api_error' | 'quota_limit';

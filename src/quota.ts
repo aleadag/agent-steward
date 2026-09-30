@@ -1,4 +1,4 @@
-import { SnapshotSchema, StewardError } from './contracts.js';
+import { SnapshotSchema, StewardError } from './contracts.ts';
 import type {
   Account,
   Config,
@@ -8,9 +8,9 @@ import type {
   QuotaWindowFact,
   ReadText,
   Snapshot,
-} from './contracts.js';
-import { assertByteLength, assertJsonDepth } from './limits.js';
-import { compareRfc3339Timestamps } from './timestamps.js';
+} from './contracts.ts';
+import { assertByteLength, assertJsonDepth } from './limits.ts';
+import { compareRfc3339Timestamps } from './timestamps.ts';
 
 type SnapshotLoad =
   | { status: 'loaded'; snapshot: Snapshot }

@@ -1,29 +1,31 @@
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { StopInputSchema } from '../dist/src/contracts.js';
-import { parseArgs, run } from '../dist/src/cli.js';
+import { StopInputSchema } from '../src/contracts.ts';
+import { parseArgs, run } from '../src/cli.ts';
+import type { Invocation, Runtime } from '../src/cli.ts';
 
 const skill = readFileSync(new URL('../skills/agent-steward/SKILL.md', import.meta.url), 'utf8');
+const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
 const stopExample = JSON.parse(readFileSync(new URL('../examples/stop.json', import.meta.url), 'utf8'));
 
-function parseSkillCommands(text) {
+function parseSkillCommands(text: string): string[] {
   return [...text.matchAll(/^```bash\n([\s\S]*?)\n```/gm)]
-    .flatMap((match) => match[1].split('\n'))
+    .flatMap((match) => match[1]!.split('\n'))
     .filter((line) => line.startsWith('agent-steward '));
 }
 
-function shellWords(command) {
-  return [...command.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((match) => match[1] ?? match[2] ?? match[3]);
+function shellWords(command: string): string[] {
+  return [...command.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((match) => match[1] ?? match[2] ?? match[3]!);
 }
 
-function invocationForm(invocation) {
+function invocationForm(invocation: Invocation): string {
   if (invocation.kind === 'help') return 'help';
   if (invocation.kind === 'stop') return 'stop-stdin';
   return invocation.task.startsWith('-') ? 'route-literal-task' : 'route-task';
 }
 
-function parseUsageForm(line) {
+function parseUsageForm(line: string): Invocation {
   let form = line.replace(/^agent-steward\s+/, '');
   form = form.replace(/^\[--config <path>\]\s+/, '--config config.json ');
   form = form.replace('session start <task> --dry-run [--json]', 'session start "Review the parser" --dry-run --json');
@@ -33,9 +35,9 @@ function parseUsageForm(line) {
   return parseArgs(shellWords(form));
 }
 
-async function emittedHelp() {
-  const out = [];
-  await run(['--help'], {
+async function emittedHelp(): Promise<string> {
+  const out: string[] = [];
+  const runtime: Runtime = {
     env: {},
     cwd: '/isolated/work',
     readText: async () => {
@@ -51,12 +53,17 @@ async function emittedHelp() {
     post: async () => {
       throw new Error('help must not post');
     },
-  });
+    terminal: { stdin: false, stdout: false },
+    launch: async () => {
+      throw new Error('help must not launch');
+    },
+  };
+  await run(['--help'], runtime);
   return out.join('');
 }
 
 test('bundled skill command forms match parsed actual CLI help and parser behavior', async () => {
-  const usage = [...(await emittedHelp()).matchAll(/^  (agent-steward .+)$/gm)].map((match) => match[1]);
+  const usage = [...(await emittedHelp()).matchAll(/^  (agent-steward .+)$/gm)].map((match) => match[1]!);
   assert.ok(usage.length > 0, 'run --help must emit parseable usage forms');
   const implementedForms = usage.map((line) => invocationForm(parseUsageForm(line)));
   const skillForms = parseSkillCommands(skill).map((line) => {
@@ -72,22 +79,46 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
     invocations.map((item) => item.kind),
     ['help', 'route', 'route', 'route', 'stop'],
   );
-  assert.equal(invocations[1].task, 'Review the parser');
-  assert.equal(invocations[1].dryRun, false);
-  assert.equal(invocations[1].json, false);
-  assert.equal(invocations[2].task, 'Review the parser');
-  assert.equal(invocations[2].dryRun, true);
-  assert.equal(invocations[2].json, true);
-  assert.equal(invocations[3].task, '--help');
-  assert.equal(invocations[3].dryRun, true);
-  assert.equal(invocations[3].json, false);
+  const routes = invocations.filter((item) => item.kind === 'route');
+  assert.equal(routes.length, 3);
+  const [firstRoute, secondRoute, thirdRoute] = routes;
+  assert.ok(firstRoute && secondRoute && thirdRoute);
+  assert.equal(firstRoute.task, 'Review the parser');
+  assert.equal(firstRoute.dryRun, false);
+  assert.equal(firstRoute.json, false);
+  assert.equal(secondRoute.task, 'Review the parser');
+  assert.equal(secondRoute.dryRun, true);
+  assert.equal(secondRoute.json, true);
+  assert.equal(thirdRoute.task, '--help');
+  assert.equal(thirdRoute.dryRun, true);
+  assert.equal(thirdRoute.json, false);
 });
 
 test('skill stop JSON example parses with the real strict schema', () => {
   const block = skill.match(/```json\n([\s\S]*?)\n```/);
   assert.ok(block, 'skill must include an actual stop JSON example');
-  const input = JSON.parse(block[1]);
+  const example = block[1];
+  assert.ok(example, 'skill stop JSON example must contain a JSON body');
+  const input = JSON.parse(example);
   assert.equal(StopInputSchema.parse(input).status, 'blocked');
   assert.equal(input.current_episode_id, input.retry.failure_episode_id);
   assert.equal(StopInputSchema.parse(stopExample).current_episode_id, stopExample.retry.failure_episode_id);
+});
+
+test('optional adapter documents incomplete shutdown and offline recovery boundaries', () => {
+  const section = readme
+    .split('### Optional Herdr adapter (not activated)')[1]
+    ?.split('\n## Command preview references')[0];
+  assert.ok(section, 'README must retain the optional adapter section');
+  for (const term of [
+    'shutdown_incomplete',
+    'release unconfirmed',
+    'five seconds',
+    'event hooks may still',
+    'pre-admitted',
+    'offline',
+    'generation tombstones',
+    '15-second',
+  ])
+    assert.ok(section.includes(term), `optional adapter section must include ${term}`);
 });

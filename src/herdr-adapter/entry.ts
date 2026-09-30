@@ -1,19 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { readFile, stat } from 'node:fs/promises';
-import { CorruptEpisodeError, EpisodeStore, type Episode } from './state.js';
+import { CorruptEpisodeError, EpisodeStore, type Episode } from './state.ts';
 import { connect } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { isAbsolute } from 'node:path';
 import process from 'node:process';
-import { StopInputSchema, StopResultSchema } from '../contracts.js';
-import { assertNoCredentials } from '../privacy.js';
-import { observeStop } from './observe.js';
-import { deliverProposal } from './deliver.js';
-import { runScheduler } from './scheduler.js';
-import type { HerdrControl } from './deliver.js';
-import type { HerdrReader, AgentSnapshot, ReadSnapshot } from './observe.js';
-import type { StopInput, StopResult } from '../contracts.js';
+import { StopInputSchema, StopResultSchema } from '../contracts.ts';
+import { assertNoCredentials } from '../privacy.ts';
+import { observeStop } from './observe.ts';
+import { deliverProposal } from './deliver.ts';
+import { runScheduler, type SchedulerResult } from './scheduler.ts';
+import type { HerdrControl } from './deliver.ts';
+import type { HerdrReader, AgentSnapshot, ReadSnapshot } from './observe.ts';
+import type { StopInput, StopResult } from '../contracts.ts';
 
 type Retry = StopInput['retry'];
 type Event = { type?: string; pane_id?: string; workspace_id?: string; agent?: string | null; agent_status?: string };
@@ -37,50 +37,71 @@ export type EventDeps = {
   sessionId?: string;
   leaseToken?: string;
   sessionValid?: () => Promise<boolean>;
+  admissionOpen?: () => boolean;
 };
 
 export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = false): Promise<void> {
+  const admissionOpen = deps.admissionOpen ?? (() => true);
+  if (!admissionOpen()) return;
   const event: Event =
     'event' in trigger && trigger.data && typeof trigger.data === 'object'
       ? { ...trigger.data, type: trigger.event }
       : (trigger as Event);
   const statusEvent = event.type === 'pane_agent_status_changed' || event.type === 'pane.agent_status_changed';
   const exitEvent = event.type === 'pane_exited' || event.type === 'pane.exited';
-  if (
-    (!statusEvent && !exitEvent) ||
-    typeof event.pane_id !== 'string' ||
-    !deps.targets.includes(event.pane_id) ||
-    !(await deps.store.active(deps.sessionId))
-  )
+  if ((!statusEvent && !exitEvent) || typeof event.pane_id !== 'string' || !deps.targets.includes(event.pane_id))
     return;
-  const stillOwner = async () =>
-    (await deps.store.active(deps.sessionId)) &&
-    (!deps.sessionId || (!!deps.leaseToken && !!(await deps.store.leaseMatches?.(deps.leaseToken, deps.sessionId)))) &&
-    (!deps.sessionValid || (await deps.sessionValid()));
+  if (!admissionOpen()) return;
+  const active = await deps.store.active(deps.sessionId);
+  if (!admissionOpen() || !active) return;
+  const stillOwner = async (): Promise<boolean> => {
+    if (!admissionOpen()) return false;
+    if (deps.sessionValid) {
+      const valid = await deps.sessionValid();
+      if (!admissionOpen() || !valid) return false;
+    }
+    if (!admissionOpen()) return false;
+    const allowed = deps.sessionId
+      ? !!deps.leaseToken && !!(await deps.store.leaseMatches?.(deps.leaseToken, deps.sessionId))
+      : await deps.store.active();
+    return admissionOpen() && allowed;
+  };
+  const notify = async (reason: HandoffReason): Promise<void> => {
+    if (admissionOpen()) await deps.handoff(reason);
+  };
   const assess = async () => {
+    if (!admissionOpen()) return;
     if (exitEvent || (event.agent_status !== 'blocked' && event.agent_status !== 'idle')) {
       if (!exitEvent && !['working', 'done', 'unknown'].includes(event.agent_status ?? '')) return;
-      if (!(await stillOwner())) return;
+      if (!admissionOpen()) return;
+      const owns = await stillOwner();
+      if (!admissionOpen() || !owns) return;
       let current;
       try {
         current = await deps.herdr.get(event.pane_id!);
       } catch {
-        await deps.handoff('observation_unavailable');
+        if (!admissionOpen()) return;
+        await notify('observation_unavailable');
         return;
       }
+      if (!admissionOpen()) return;
       let old;
       try {
         old = await deps.store.retry(event.pane_id!);
       } catch (error) {
+        if (!admissionOpen()) return;
         if (!(error instanceof CorruptEpisodeError)) throw error;
-        if (!(await stillOwner())) {
-          await deps.handoff('human_review_required');
+        const stillOwned = await stillOwner();
+        if (!admissionOpen()) return;
+        if (!stillOwned) {
+          await notify('human_review_required');
           return;
         }
         // Unreadable history cannot authorize a fresh retry budget.
-        await deps.handoff('observation_unavailable');
+        await notify('observation_unavailable');
         return;
       }
+      if (!admissionOpen()) return;
       if (!old) return;
       const replaced = current?.agent_session?.value && current.agent_session.value !== old.session_id;
       const moved = current && current.workspace_id !== event.pane_id!.split(':')[0];
@@ -95,10 +116,14 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
         const notifyLifecycle = lifecycle && !old.lifecycle_handoff_sent;
         const quarantine = old.last_delivery_state === 'none';
         if (!replaced && !notifyLifecycle && !quarantine) return;
-        if (!(await stillOwner())) {
-          await deps.handoff('human_review_required');
+        if (!admissionOpen()) return;
+        const stillOwned = await stillOwner();
+        if (!admissionOpen()) return;
+        if (!stillOwned) {
+          await notify('human_review_required');
           return;
         }
+        if (!admissionOpen()) return;
         if (replaced) await deps.store.clear?.(event.pane_id!);
         else
           await deps.store.record(event.pane_id!, {
@@ -106,26 +131,32 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
             ...(quarantine ? { next_check_at: null, last_delivery_state: 'human' as const } : {}),
             ...(notifyLifecycle ? { lifecycle_handoff_sent: true } : {}),
           });
-        await deps.handoff('observation_unavailable');
+        if (!admissionOpen()) return;
+        await notify('observation_unavailable');
       }
       return;
     }
-    if (!statusEvent) return;
+    if (!statusEvent || !admissionOpen()) return;
     // Recheck the lease *inside* the episode lock; an earlier event never grants authority.
-    if (!(await stillOwner())) return;
+    const owns = await stillOwner();
+    if (!admissionOpen() || !owns) return;
     let existing;
     try {
       existing = await deps.store.retry(event.pane_id!);
     } catch (error) {
+      if (!admissionOpen()) return;
       if (!(error instanceof CorruptEpisodeError)) throw error;
-      if (!(await stillOwner())) {
-        await deps.handoff('human_review_required');
+      const stillOwned = await stillOwner();
+      if (!admissionOpen()) return;
+      if (!stillOwned) {
+        await notify('human_review_required');
         return;
       }
       // Keep corrupt history as a fail-closed quarantine until human repair.
-      await deps.handoff('observation_unavailable');
+      await notify('observation_unavailable');
       return;
     }
+    if (!admissionOpen()) return;
     if (
       due &&
       (!(existing as Episode | null)?.next_check_at ||
@@ -136,10 +167,12 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     try {
       observed = await observeStop(deps.herdr, event.pane_id!);
     } catch {
+      if (!admissionOpen()) return;
       if (due) throw new Error('Herdr observation unavailable');
-      await deps.handoff('observation_unavailable');
+      await notify('observation_unavailable');
       return;
     }
+    if (!admissionOpen()) return;
     if (
       !observed ||
       event.workspace_id !== observed.workspace_id ||
@@ -151,10 +184,12 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
         try {
           live = await deps.herdr.get(event.pane_id!);
         } catch {
+          if (!admissionOpen()) return;
           if (due) throw new Error('Herdr observation unavailable');
-          await deps.handoff('observation_unavailable');
+          await notify('observation_unavailable');
           return;
         }
+        if (!admissionOpen()) return;
         // A rejected excerpt or stale event workspace alone cannot establish a move.
         const moved =
           !!live &&
@@ -166,53 +201,73 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
           const notifyLifecycle = !existing.lifecycle_handoff_sent;
           const quarantine = existing.next_check_at !== null || existing.last_delivery_state !== 'human';
           if (notifyLifecycle || quarantine) {
-            if (!(await stillOwner())) {
-              await deps.handoff('human_review_required');
+            if (!admissionOpen()) return;
+            const stillOwned = await stillOwner();
+            if (!admissionOpen()) return;
+            if (!stillOwned) {
+              await notify('human_review_required');
               return;
             }
+            if (!admissionOpen()) return;
             await deps.store.record(event.pane_id!, {
               ...existing,
               next_check_at: null,
               last_delivery_state: 'human',
               lifecycle_handoff_sent: true,
             });
+            if (!admissionOpen()) return;
           }
-          if (notifyLifecycle) await deps.handoff('observation_unavailable');
+          if (notifyLifecycle) await notify('observation_unavailable');
           return;
         }
       }
       if (due && existing) {
-        if (!(await stillOwner())) {
-          await deps.handoff('human_review_required');
+        if (!admissionOpen()) return;
+        const stillOwned = await stillOwner();
+        if (!admissionOpen()) return;
+        if (!stillOwned) {
+          await notify('human_review_required');
           return;
         }
+        if (!admissionOpen()) return;
         await deps.store.record(event.pane_id!, { ...existing, next_check_at: null, last_delivery_state: 'human' });
+        if (!admissionOpen()) return;
       }
-      await deps.handoff('observation_unavailable');
+      await notify('observation_unavailable');
       return;
     }
     const history = existing;
     const quarantine = async (reason: HandoffReason) => {
+      if (!admissionOpen()) return;
       if (due && history) {
-        if (!(await stillOwner())) {
-          await deps.handoff('human_review_required');
+        const stillOwned = await stillOwner();
+        if (!admissionOpen()) return;
+        if (!stillOwned) {
+          await notify('human_review_required');
           return;
         }
+        if (!admissionOpen()) return;
         await deps.store.record(observed.pane_id, {
           ...(history as Episode),
           next_check_at: null,
           last_delivery_state: 'human',
         });
+        if (!admissionOpen()) return;
       }
-      await deps.handoff(reason);
+      await notify(reason);
     };
     if (history && (history as Episode).session_id !== observed.session_id) {
-      if (!(await stillOwner())) {
-        await deps.handoff('human_review_required');
+      if (!admissionOpen()) return;
+      const stillOwned = await stillOwner();
+      if (!admissionOpen()) return;
+      if (!stillOwned) {
+        await notify('human_review_required');
         return;
       }
+      if (!admissionOpen()) return;
       await deps.store.clear?.(observed.pane_id);
-      await deps.handoff('observation_unavailable');
+      if (!admissionOpen()) return;
+      await notify('observation_unavailable');
       return;
     }
     if (history && history.failure_episode_id !== observed.current_episode_id) {
@@ -222,16 +277,21 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       const notifyLifecycle = moved && !history.lifecycle_handoff_sent;
       const quarantine = history.last_delivery_state === 'none' || history.last_delivery_state === 'delivered';
       if (quarantine || notifyLifecycle) {
-        if (!(await stillOwner())) {
-          await deps.handoff('human_review_required');
+        if (!admissionOpen()) return;
+        const stillOwned = await stillOwner();
+        if (!admissionOpen()) return;
+        if (!stillOwned) {
+          await notify('human_review_required');
           return;
         }
+        if (!admissionOpen()) return;
         await deps.store.record(observed.pane_id, {
           ...history,
           ...(quarantine ? { next_check_at: null, last_delivery_state: 'human' as const } : {}),
           ...(notifyLifecycle ? { lifecycle_handoff_sent: true } : {}),
         });
-        await deps.handoff('observation_unavailable');
+        if (!admissionOpen()) return;
+        await notify('observation_unavailable');
       }
       return;
     }
@@ -241,16 +301,21 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       (history as Episode).next_check_at &&
       deps.clock.now().getTime() >= Date.parse(history.first_observed_at) + 24 * 60 * 60_000
     ) {
-      if (!(await stillOwner())) {
-        await deps.handoff('human_review_required');
+      if (!admissionOpen()) return;
+      const stillOwned = await stillOwner();
+      if (!admissionOpen()) return;
+      if (!stillOwned) {
+        await notify('human_review_required');
         return;
       }
+      if (!admissionOpen()) return;
       await deps.store.record(observed.pane_id, {
         ...(history as Episode),
         next_check_at: null,
         last_delivery_state: 'human',
       });
-      await deps.handoff('human_review_required');
+      if (!admissionOpen()) return;
+      await notify('human_review_required');
       return;
     }
     // No new classification for the same pending timer. Due wake-ups advance quota
@@ -284,12 +349,14 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     try {
       current = await deps.herdr.get(observed.pane_id);
     } catch {
+      if (!admissionOpen()) return;
       // A failed socket read cannot prove a changed occupant. Preserve the due record
       // and let the runner enter its bounded reconnect path rather than waking at 100ms.
       if (due) throw new Error('Herdr read unavailable');
-      await deps.handoff('observation_unavailable');
+      await notify('observation_unavailable');
       return;
     }
+    if (!admissionOpen()) return;
     if (
       !current ||
       current.agent !== observed.agent ||
@@ -335,13 +402,16 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       await quarantine('observation_unavailable');
       return;
     }
+    if (!admissionOpen()) return;
     let result: StopResult;
     try {
       result = StopResultSchema.parse(await deps.decide(input.data));
     } catch {
+      if (!admissionOpen()) return;
       await quarantine('decision_failed');
       return;
     }
+    if (!admissionOpen()) return;
     if (result.decision !== 'stop_decision' || result.request_id !== input.data.request_id) {
       await quarantine('decision_failed');
       return;
@@ -376,8 +446,11 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       await quarantine('human_review_required');
       return;
     }
-    if (!(await stillOwner())) {
-      await deps.handoff('human_review_required');
+    if (!admissionOpen()) return;
+    const stillOwned = await stillOwner();
+    if (!admissionOpen()) return;
+    if (!stillOwned) {
+      await notify('human_review_required');
       return;
     }
     const record: Episode = {
@@ -389,14 +462,27 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       next_check_at: next,
       last_delivery_state: 'none',
     };
+    if (!admissionOpen()) return;
     await deps.store.record(observed.pane_id, record);
+    if (!admissionOpen()) return;
     if (action.kind === 'send_recovery_instruction') {
       if (!deps.herdr.prompt) {
-        if (await stillOwner())
-          await deps.store.record(observed.pane_id, { ...record, next_check_at: null, last_delivery_state: 'human' });
-        await deps.handoff('human_review_required');
+        if (!admissionOpen()) return;
+        const stillOwnedBeforeQuarantine = await stillOwner();
+        if (!admissionOpen()) return;
+        if (stillOwnedBeforeQuarantine) {
+          if (!admissionOpen()) return;
+          await deps.store.record(observed.pane_id, {
+            ...record,
+            next_check_at: null,
+            last_delivery_state: 'human',
+          });
+          if (!admissionOpen()) return;
+        }
+        await notify('human_review_required');
         return;
       }
+      if (!admissionOpen()) return;
       const outcome = await deliverProposal(
         deps.herdr as HerdrControl,
         observed,
@@ -406,23 +492,38 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
         deps.decide as (input: StopInput) => Promise<StopResult>,
         stillOwner,
         true,
+        admissionOpen,
       );
+      if (!admissionOpen()) return;
       if (outcome === 'human' || outcome === 'uncertain') {
-        if (await stillOwner()) {
+        const stillOwnedForCleanup = await stillOwner();
+        if (!admissionOpen()) return;
+        if (stillOwnedForCleanup) {
           const latest = await deps.store.retry(observed.pane_id);
-          if (latest && (await stillOwner()))
-            await deps.store.record(observed.pane_id, {
-              ...(latest as Episode),
-              next_check_at: null,
-              last_delivery_state: outcome === 'human' ? 'human' : 'uncertain',
-            });
+          if (!admissionOpen()) return;
+          if (latest) {
+            const stillOwnedAfterRead = await stillOwner();
+            if (!admissionOpen()) return;
+            if (stillOwnedAfterRead) {
+              if (!admissionOpen()) return;
+              await deps.store.record(observed.pane_id, {
+                ...(latest as Episode),
+                next_check_at: null,
+                last_delivery_state: outcome === 'human' ? 'human' : 'uncertain',
+              });
+              if (!admissionOpen()) return;
+            }
+          }
         }
-        await deps.handoff('human_review_required');
+        await notify('human_review_required');
       }
     }
   };
-  if (deps.store.withEpisodeLock) await deps.store.withEpisodeLock(event.pane_id!, assess);
-  else await assess();
+  if (!admissionOpen()) return;
+  if (deps.store.withEpisodeLock) {
+    await deps.store.withEpisodeLock(event.pane_id!, assess);
+    if (!admissionOpen()) return;
+  } else await assess();
 }
 
 // Herdr 0.9.1 newline-delimited socket protocol for bounded observation.
@@ -642,7 +743,27 @@ export async function runEvent(env: NodeJS.ProcessEnv, decide: EventDeps['decide
   });
 }
 
-export async function runVisibleScheduler(env: NodeJS.ProcessEnv): Promise<void> {
+export function reportSchedulerResult(
+  result: SchedulerResult,
+  output: { write: (text: string) => void; fail: () => void },
+): void {
+  if (result === 'shutdown_incomplete') {
+    output.write(
+      'agent-steward: release unconfirmed; shutdown incomplete; event hooks may still act. Human review required.\n',
+    );
+    output.fail();
+  }
+  if (result === 'already_owned') {
+    output.write(
+      'agent-steward: scheduler lease unavailable. If recovery is needed, disable the plugin, stop all adapters and verify they are dead before offline cleanup of a stranded guard or legacy lease. Preserve episode records and generation tombstones.\n',
+    );
+  }
+}
+
+export async function runVisibleScheduler(
+  env: NodeJS.ProcessEnv,
+  schedule: typeof runScheduler = runScheduler,
+): Promise<void> {
   if (!env.HERDR_SOCKET_PATH || !env.HERDR_PLUGIN_CONFIG_DIR || !env.HERDR_PLUGIN_STATE_DIR) return;
   const sessionId = await socketSession(env.HERDR_SOCKET_PATH);
   if (!sessionId) {
@@ -657,18 +778,32 @@ export async function runVisibleScheduler(env: NodeJS.ProcessEnv): Promise<void>
     return;
   }
   const abort = new AbortController();
-  process.once('SIGINT', () => abort.abort());
-  process.once('SIGTERM', () => abort.abort());
-  await runScheduler({
-    store: new EpisodeStore(env.HERDR_PLUGIN_STATE_DIR),
-    herdr: socketControl(env.HERDR_SOCKET_PATH, env.HERDR_BIN_PATH),
-    decide: decideWithCli,
-    targets,
-    sessionId,
-    signal: abort.signal,
-    handoff: (reason) => visibleHandoff(env, reason),
-    sessionValid: async () => (await socketSession(env.HERDR_SOCKET_PATH!)) === sessionId,
-  });
+  const stop = () => abort.abort();
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+  try {
+    const result = await schedule({
+      store: new EpisodeStore(env.HERDR_PLUGIN_STATE_DIR),
+      herdr: socketControl(env.HERDR_SOCKET_PATH, env.HERDR_BIN_PATH),
+      decide: decideWithCli,
+      targets,
+      sessionId,
+      signal: abort.signal,
+      handoff: (reason) => visibleHandoff(env, reason),
+      sessionValid: async () => (await socketSession(env.HERDR_SOCKET_PATH!)) === sessionId,
+    });
+    reportSchedulerResult(result, {
+      write: (text) => {
+        process.stderr.write(text);
+      },
+      fail: () => {
+        process.exitCode = 1;
+      },
+    });
+  } finally {
+    process.removeListener('SIGINT', stop);
+    process.removeListener('SIGTERM', stop);
+  }
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

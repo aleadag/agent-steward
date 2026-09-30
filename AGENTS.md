@@ -128,17 +128,21 @@ bd prime                # Refresh Beads context
 
 ## Build & Test
 
-Use the pinned Nix development shell and locked npm dependencies:
+Use the pinned Nix development shell and frozen Bun lockfile:
 
 ```bash
 nix develop path:.
-npm ci --ignore-scripts
-npm test
-npm run typecheck
+bun install --frozen-lockfile --ignore-scripts
+bun run build
+bun test
+bun run typecheck
+bun run lint
+bun run format:check
 nix build path:.#agent-steward --no-update-lock-file
+nix run path:. --no-update-lock-file -- --help
 nix flake check path:. --no-update-lock-file
 ```
 
 ## Architecture Overview
 
-The CLI in `src/cli.ts` injects bounded filesystem/stdin IO and Jev transport from the single `src/main.ts` entry point. Routing, approval, config, quota, syntax, and response validation remain separate modules. The Nix package supplies its Node.js runtime and bundles the standalone skill without installing or activating it.
+The CLI in `src/cli.ts` injects bounded filesystem/stdin IO and Jev transport from the single `src/main.ts` entry point. TypeScript source compiles to `dist/src/**/*.js`, which the package-local pinned Bun runtime executes. Retained `node:` imports use Bun-compatible APIs and do not require a Node executable. Routing, approval, config, quota, syntax, and response validation remain separate modules. The Nix package bundles the standalone skill and disabled optional Herdr plugin without installing or activating them.

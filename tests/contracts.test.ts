@@ -1,6 +1,7 @@
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import type { ErrorCode, StopResult } from '../src/contracts.ts';
 import {
   ApprovalInputSchema,
   ConfigSchema,
@@ -9,19 +10,23 @@ import {
   StopInputSchema,
   StewardError,
   errorResult,
-} from '../dist/src/contracts.js';
-import * as contractExports from '../dist/src/contracts.js';
-import { approval, candidate, config, evaluation, snapshot, windowFact } from './helpers.mjs';
+} from '../src/contracts.ts';
+import * as contractExports from '../src/contracts.ts';
+import { approval, candidate, config, evaluation, snapshot, windowFact } from './helpers.ts';
+
+type StopDecision = Extract<StopResult, { decision: 'stop_decision' }>;
 
 const validWindow = windowFact({ type: 'account' });
 
 test('config schema is strict, preserves configured text, and defaults only documented settings', () => {
-  const raw = config();
-  delete raw.jev;
-  delete raw.thresholds;
-  raw.candidates[0].id = ' candidate-id ';
+  const { jev: _jev, thresholds: _thresholds, ...raw } = config();
+  const firstCandidate = raw.candidates[0];
+  assert.ok(firstCandidate);
+  firstCandidate.id = ' candidate-id ';
   const parsed = ConfigSchema.parse(raw);
-  assert.equal(parsed.candidates[0].id, ' candidate-id ');
+  const parsedCandidate = parsed.candidates[0];
+  assert.ok(parsedCandidate);
+  assert.equal(parsedCandidate.id, ' candidate-id ');
   assert.deepEqual(parsed.jev, { model: 'jev-1.13.0' });
   assert.deepEqual(parsed.thresholds, { risky: 0.6, choiceConfidence: 0.45 });
 
@@ -224,31 +229,41 @@ test('approval context preserves own __proto__ keys at the top level and in nest
   const context = JSON.parse(
     '{"__proto__":"top-level restriction","terminal":"approve","nested":{"__proto__":"nested restriction","constructor":"nested evidence"}}',
   );
-  const before = Object.prototype.polluted;
+  const before = Object.getOwnPropertyDescriptor(Object.prototype, 'polluted');
   const parsed = ApprovalInputSchema.safeParse(approval({ context }));
   assert.equal(parsed.success, true);
   if (!parsed.success) return;
-  assert.equal(Object.hasOwn(parsed.data.context, '__proto__'), true);
-  assert.equal(parsed.data.context.__proto__, 'top-level restriction');
-  assert.deepEqual(Object.keys(parsed.data.context.nested), ['__proto__', 'constructor']);
-  assert.equal(parsed.data.context.nested.__proto__, 'nested restriction');
-  assert.equal(parsed.data.context.nested.constructor, 'nested evidence');
-  assert.equal(Object.getPrototypeOf(parsed.data.context), Object.prototype);
-  assert.equal(Object.getPrototypeOf(parsed.data.context.nested), Object.prototype);
-  assert.equal(Object.prototype.polluted, before);
+  const parsedContext = parsed.data.context;
+  assert.ok(parsedContext !== null && typeof parsedContext === 'object');
+  const nested = parsedContext.nested;
+  assert.ok(nested !== null && typeof nested === 'object');
+  const nestedContext = nested as Record<string, unknown>;
+  assert.equal(Object.hasOwn(parsedContext, '__proto__'), true);
+  assert.equal(parsedContext.__proto__, 'top-level restriction');
+  assert.deepEqual(Object.keys(nestedContext), ['__proto__', 'constructor']);
+  assert.equal(nestedContext.__proto__, 'nested restriction');
+  assert.equal(nestedContext.constructor, 'nested evidence');
+  assert.equal(Object.getPrototypeOf(parsedContext), Object.prototype);
+  assert.equal(Object.getPrototypeOf(nestedContext), Object.prototype);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(Object.prototype, 'polluted'), before);
 });
 
 test('approval context accepts and preserves an own constructor key', () => {
   const context = JSON.parse('{"constructor":"approval restriction","nested":{"constructor":"nested restriction"}}');
-  const before = Object.prototype.polluted;
+  const before = Object.getOwnPropertyDescriptor(Object.prototype, 'polluted');
   const parsed = ApprovalInputSchema.safeParse(approval({ context }));
   assert.equal(parsed.success, true);
   if (!parsed.success) return;
-  assert.equal(Object.hasOwn(parsed.data.context, 'constructor'), true);
-  assert.equal(parsed.data.context.constructor, 'approval restriction');
-  assert.equal(parsed.data.context.nested.constructor, 'nested restriction');
-  assert.equal(Object.getPrototypeOf(parsed.data.context), Object.prototype);
-  assert.equal(Object.prototype.polluted, before);
+  const parsedContext = parsed.data.context;
+  assert.ok(parsedContext !== null && typeof parsedContext === 'object');
+  const nested = parsedContext.nested;
+  assert.ok(nested !== null && typeof nested === 'object');
+  const nestedContext = nested as Record<string, unknown>;
+  assert.equal(Object.hasOwn(parsedContext, 'constructor'), true);
+  assert.equal(parsedContext.constructor, 'approval restriction');
+  assert.equal(nestedContext.constructor, 'nested restriction');
+  assert.equal(Object.getPrototypeOf(parsedContext), Object.prototype);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(Object.prototype, 'polluted'), before);
 });
 
 test('stop example parses as a version-2 observation with episode-matched retry history', async () => {
@@ -256,7 +271,9 @@ test('stop example parses as a version-2 observation with episode-matched retry 
   const parsed = StopInputSchema.parse(raw);
   assert.equal(parsed.status, 'blocked');
   assert.equal(parsed.current_episode_id, parsed.retry.failure_episode_id);
+  assert.ok(typeof parsed.context === 'string');
   assert.equal(parsed.context.includes('current permission prompt'), true);
+  assert.ok(parsed.pending_action !== null && typeof parsed.pending_action === 'object');
   assert.equal(parsed.pending_action.action, "Run the project's unit tests");
   assert.equal(parsed.automatic_approval_forbidden, false);
 });
@@ -404,15 +421,16 @@ test('error envelopes expose only catalogued messages and safe codes', () => {
 });
 
 test('live-launch errors use fixed credential-free schema-1 envelopes', () => {
-  const expectedMessages = {
-    interactive_terminal_required: 'Interactive terminal input and output are required.',
-    launch_failed: 'Agent launch failed or its outcome is uncertain.',
-  };
+  const expectedMessages: [ErrorCode, string][] = [
+    ['interactive_terminal_required', 'Interactive terminal input and output are required.'],
+    ['launch_failed', 'Agent launch failed or its outcome is uncertain.'],
+  ];
 
-  for (const [code, message] of Object.entries(expectedMessages)) {
+  for (const [code, message] of expectedMessages) {
     const result = errorResult(new StewardError(code), 'req');
     const parsed = ResultSchema.parse(result);
     assert.equal(parsed.schema_version, 1);
+    assert.ok(parsed.decision === 'error');
     assert.equal(parsed.reason_code, code);
     assert.equal(parsed.message, message);
   }
@@ -489,31 +507,34 @@ test('version-2 stop results enforce action, reason, classification, and metric 
   const { StopResultSchema } = contractExports;
   assert.equal(typeof StopResultSchema?.safeParse, 'function');
   const evaluatedResult = (
-    proposed_action,
-    reason_code,
-    waiting_for,
-    { waiting_confidence = 0.9, risk_probability = 0.2, evaluated = true } = {},
-  ) => ({
-    schema_version: 2,
-    request_id: 'r1',
-    decision: 'stop_decision',
-    proposed_action,
-    reason_code,
-    waiting_for,
-    waiting_confidence,
-    risk_probability,
-    evaluation: evaluated
-      ? evaluation({
-          waiting_for: {
-            type: 'choice',
-            choice: waiting_for,
-            probabilities: { [waiting_for]: 1 },
-            confidence: waiting_confidence,
-          },
-          risky: { type: 'noul', noul: risk_probability ?? 0.2 },
-        })
-      : null,
-  });
+    proposed_action: StopDecision['proposed_action'],
+    reason_code: StopDecision['reason_code'],
+    waiting_for: StopDecision['waiting_for'],
+    options: { waiting_confidence?: number | null; risk_probability?: number | null; evaluated?: boolean } = {},
+  ) => {
+    const { waiting_confidence = 0.9, risk_probability = 0.2, evaluated = true } = options;
+    return {
+      schema_version: 2,
+      request_id: 'r1',
+      decision: 'stop_decision',
+      proposed_action,
+      reason_code,
+      waiting_for,
+      waiting_confidence,
+      risk_probability,
+      evaluation: evaluated
+        ? evaluation({
+            waiting_for: {
+              type: 'choice',
+              choice: waiting_for,
+              probabilities: { [waiting_for]: 1 },
+              confidence: waiting_confidence ?? 0.9,
+            },
+            risky: { type: 'noul', noul: risk_probability ?? 0.2 },
+          })
+        : null,
+    };
+  };
   const actions = {
     approve: { kind: 'approve_request' },
     recover: {
@@ -525,7 +546,7 @@ test('version-2 stop results enforce action, reason, classification, and metric 
     quota: { kind: 'wait_for_quota', not_before: '2026-09-29T12:01:00Z' },
     manual: { kind: 'manual_review' },
     done: { kind: 'no_action' },
-  };
+  } satisfies Record<'approve' | 'recover' | 'quota' | 'manual' | 'done', StopDecision['proposed_action']>;
   const stopWaitingOptions = [
     'approve_command',
     'approve_edit',
@@ -537,7 +558,12 @@ test('version-2 stop results enforce action, reason, classification, and metric 
     'completed',
     'other',
   ];
-  const tiedEvaluation = (first, second, choice, risk = 0.2) =>
+  const tiedEvaluation = (
+    first: StopDecision['waiting_for'],
+    second: StopDecision['waiting_for'],
+    choice: StopDecision['waiting_for'],
+    risk = 0.2,
+  ) =>
     evaluation({
       waiting_for: {
         type: 'choice',
@@ -579,6 +605,11 @@ test('version-2 stop results enforce action, reason, classification, and metric 
   const recovery = validResults[9];
   const completed = validResults[11];
   const localManual = validResults[12];
+  assert.ok(approved);
+  assert.ok(approved.evaluation);
+  assert.ok(recovery);
+  assert.ok(completed);
+  assert.ok(localManual);
   const invalidResults = [
     { ...approved, evaluation: tiedEvaluation('approve_command', 'credentials', 'credentials', 0.1) },
     { ...recovery, evaluation: tiedEvaluation('recoverable_api_error', 'quota_limit', 'quota_limit') },

@@ -1,16 +1,46 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import { mkdtemp, mkdir, chmod, writeFile, readFile, stat, lstat, readdir, symlink } from 'node:fs/promises';
+import { test } from 'bun:test';
+import {
+  mkdtemp,
+  mkdir,
+  chmod,
+  writeFile,
+  readFile,
+  stat,
+  lstat,
+  readdir,
+  symlink,
+  rename,
+  open,
+} from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { EpisodeStore } from '../dist/src/herdr-adapter/state.js';
-import { reconcileDue, runScheduler } from '../dist/src/herdr-adapter/scheduler.js';
-import { handleEvent, runEvent } from '../dist/src/herdr-adapter/entry.js';
+import { EpisodeStore, type Episode } from '../src/herdr-adapter/state.ts';
+import { reconcileDue, runScheduler, type SchedulerOptions } from '../src/herdr-adapter/scheduler.ts';
+import { handleEvent, runEvent, type EventDeps } from '../src/herdr-adapter/entry.ts';
+import type { AgentSnapshot, HerdrReader, ObservedStop, ReadSnapshot } from '../src/herdr-adapter/observe.ts';
+import type { StopInput, StopResult } from '../src/contracts.ts';
+import { deferred, within } from './herdr-lease-helpers.ts';
+import type { LeaseAttempt, LeaseIO } from '../src/herdr-adapter/lease.ts';
+
+type HandoffReason = Parameters<NonNullable<SchedulerOptions['handoff']>>[0];
+type EventTrigger = Parameters<typeof handleEvent>[0];
+type TestPane = AgentSnapshot & {
+  agent: 'pi';
+  agent_session: NonNullable<AgentSnapshot['agent_session']>;
+};
+type PaneOverrides = Partial<Omit<AgentSnapshot, 'agent' | 'agent_session'>> & {
+  agent?: TestPane['agent'];
+  agent_session?: TestPane['agent_session'];
+};
+type TestHerdrReader = Omit<HerdrReader, 'read'> & {
+  read: (paneId?: string) => Promise<ReadSnapshot>;
+};
 
 const base = async () => new EpisodeStore(await mkdtemp(join(tmpdir(), 'steward-state-')));
 const now = new Date('2026-09-29T10:05:00Z');
-const pane = (overrides = {}) => ({
+const pane = (overrides: PaneOverrides = {}): TestPane => ({
   pane_id: 'w1:p1',
   workspace_id: 'w1',
   agent: 'pi',
@@ -20,32 +50,33 @@ const pane = (overrides = {}) => ({
   state_change_seq: 4,
   ...overrides,
 });
-const herdr = (text = 'Quota exhausted') => ({
+const herdr = (text = 'Quota exhausted'): TestHerdrReader => ({
   get: async () => pane(),
-  read: async () => ({ pane_id: 'w1:p1', source: 'detection', revision: 8, text, truncated: false }),
+  read: async (_paneId?: string) => ({ pane_id: 'w1:p1', source: 'detection', revision: 8, text, truncated: false }),
 });
-const decision = (input, kind = 'wait_for_quota', not_before = '2026-09-29T10:20:00Z') => ({
+const decision = (
+  input: StopInput,
+  kind: 'wait_for_quota' = 'wait_for_quota',
+  not_before = '2026-09-29T10:20:00Z',
+): StopResult => ({
   schema_version: 2,
   request_id: input.request_id,
   decision: 'stop_decision',
-  proposed_action: { kind, ...(kind === 'wait_for_quota' ? { not_before } : {}) },
-  reason_code: kind === 'wait_for_quota' ? 'quota_limit' : 'completed',
-  waiting_for: kind === 'wait_for_quota' ? 'quota_limit' : 'completed',
-  waiting_confidence: kind === 'wait_for_quota' ? 1 : null,
+  proposed_action: { kind, not_before },
+  reason_code: 'quota_limit',
+  waiting_for: 'quota_limit',
+  waiting_confidence: 1,
   risk_probability: null,
-  evaluation:
-    kind === 'wait_for_quota'
-      ? {
-          model: 'jev-1.13.0',
-          usage: {},
-          answers: {
-            waiting_for: { type: 'choice', choice: 'quota_limit', probabilities: { quota_limit: 1 }, confidence: 1 },
-            risky: { type: 'noul', noul: 0.1 },
-          },
-        }
-      : null,
+  evaluation: {
+    model: 'jev-1.13.0',
+    usage: {},
+    answers: {
+      waiting_for: { type: 'choice', choice: 'quota_limit', probabilities: { quota_limit: 1 }, confidence: 1 },
+      risky: { type: 'noul', noul: 0.1 },
+    },
+  },
 });
-function episode(id) {
+function episode(id: string): Episode {
   return {
     pane_id: 'w1:p1',
     session_id: 's1',
@@ -61,12 +92,40 @@ function episode(id) {
   };
 }
 
+const requireEpisode = async (store: EpisodeStore, paneId = 'w1:p1'): Promise<Episode> => {
+  const record = await store.retry(paneId);
+  assert.ok(record);
+  return record;
+};
+const requireLease = async (store: EpisodeStore, session = 'server-1'): Promise<string> => {
+  const lease = await store.acquire(session);
+  assert.ok(lease);
+  return lease;
+};
+const requireObserved = (observed: ObservedStop | null): ObservedStop => {
+  assert.ok(observed);
+  return observed;
+};
+const observe = async (reader: HerdrReader, paneId: string): Promise<ObservedStop> => {
+  const { observeStop } = await import('../src/herdr-adapter/observe.ts');
+  return requireObserved(await observeStop(reader, paneId));
+};
+const metadataPath = async (directory: string): Promise<string> => {
+  const name = (await readdir(directory)).find((entry) => entry.endsWith('.json'));
+  assert.ok(name);
+  return join(directory, name);
+};
+const collect =
+  <T>(values: T[]) =>
+  async (value: T): Promise<void> => {
+    values.push(value);
+  };
+
 // Catches reusing a failure ID when the same agent/session resumes and later displays identical old text.
 test('episode identity changes when the live stop sequence changes with identical excerpt', async () => {
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const before = await observeStop(herdr(), 'w1:p1');
+  const before = await observe(herdr(), 'w1:p1');
   const advanced = { get: async () => pane({ state_change_seq: 5 }), read: herdr().read };
-  const after = await observeStop(advanced, 'w1:p1');
+  const after = await observe(advanced, 'w1:p1');
   assert.notEqual(before.current_episode_id, after.current_episode_id);
   assert.match(before.error_evidence_digest, /^[0-9a-f]{64}$/);
   assert.equal(before.error_evidence_digest, after.error_evidence_digest);
@@ -75,10 +134,10 @@ test('episode identity changes when the live stop sequence changes with identica
 // Catches treating a timer as authorization to call Jev early, and counting checks as recovery sends.
 test('due check re-observes and advances quota history, never recovery attempts', async () => {
   const store = await base();
-  const observed = await import('../dist/src/herdr-adapter/observe.js').then((m) => m.observeStop(herdr(), 'w1:p1'));
+  const observed = await observe(herdr(), 'w1:p1');
   await store.record('w1:p1', episode(observed.current_episode_id));
-  const lease = await store.acquire('server-1');
-  const calls = [];
+  const lease = await requireLease(store);
+  const calls: StopInput[] = [];
   assert.equal(await store.active('server-1'), true);
   assert.deepEqual(await store.due(['w1:p1'], now), ['w1:p1']);
   await reconcileDue(new Date('2026-09-29T10:04:59Z'), store, herdr(), async (input) => {
@@ -86,7 +145,7 @@ test('due check re-observes and advances quota history, never recovery attempts'
     return decision(input);
   });
   assert.equal(calls.length, 0);
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   await reconcileDue(
     now,
     store,
@@ -102,19 +161,18 @@ test('due check re-observes and advances quota history, never recovery attempts'
   );
   assert.deepEqual(handoffs, []);
   assert.equal(calls.length, 1);
-  assert.equal((await store.retry('w1:p1')).quota_check_count, 1);
-  assert.equal((await store.retry('w1:p1')).attempt_count, 0);
-  assert.equal((await store.retry('w1:p1')).next_check_at, '2026-09-29T10:20:00.000Z');
+  assert.equal((await requireEpisode(store)).quota_check_count, 1);
+  assert.equal((await requireEpisode(store)).attempt_count, 0);
+  assert.equal((await requireEpisode(store)).next_check_at, '2026-09-29T10:20:00.000Z');
   await store.release(lease);
 });
 
 // A failed due decision must not trigger another CLI call on each 100ms scheduler wake.
 test('failed due CLI quarantines the episode across repeated scheduler wakes', async () => {
   const store = await base();
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  await store.record('w1:p1', episode((await observeStop(herdr(), 'w1:p1')).current_episode_id));
+  await store.record('w1:p1', episode((await observe(herdr(), 'w1:p1')).current_episode_id));
   const ctrl = new AbortController();
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   let decisions = 0;
   const deadline = setTimeout(() => ctrl.abort(), 380);
   try {
@@ -141,19 +199,18 @@ test('failed due CLI quarantines the episode across repeated scheduler wakes', a
   }
   assert.equal(decisions, 1);
   assert.deepEqual(handoffs, ['decision_failed']);
-  assert.equal((await store.retry('w1:p1')).next_check_at, null);
-  assert.equal((await store.retry('w1:p1')).last_delivery_state, 'human');
+  assert.equal((await requireEpisode(store)).next_check_at, null);
+  assert.equal((await requireEpisode(store)).last_delivery_state, 'human');
 });
 
 // A newly credential-looking detection excerpt must remain local and must not
 // cause the same overdue episode to spin indefinitely.
 test('credential rejection on a due episode hands off once with no decision', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const id = (await observeStop(herdr(), 'w1:p1')).current_episode_id;
+  const lease = await requireLease(store);
+  const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
   await store.record('w1:p1', episode(id));
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   let decisions = 0;
   for (let i = 0; i < 3; i++)
     await reconcileDue(
@@ -170,8 +227,8 @@ test('credential rejection on a due episode hands off once with no decision', as
     );
   assert.equal(decisions, 0);
   assert.deepEqual(handoffs, ['observation_unavailable']);
-  assert.equal((await store.retry('w1:p1')).last_delivery_state, 'human');
-  assert.equal((await store.retry('w1:p1')).next_check_at, null);
+  assert.equal((await requireEpisode(store)).last_delivery_state, 'human');
+  assert.equal((await requireEpisode(store)).next_check_at, null);
   await store.release(lease);
 });
 
@@ -181,7 +238,7 @@ test('socket outage uses bounded reconnect delay without repeated handoffs', asy
   const store = await base();
   await store.record('w1:p1', episode('e1'));
   const ctrl = new AbortController();
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   let reads = 0;
   const deadline = setTimeout(() => ctrl.abort(), 380);
   try {
@@ -210,19 +267,18 @@ test('socket outage uses bounded reconnect delay without repeated handoffs', asy
   }
   assert.equal(reads, 1);
   assert.deepEqual(handoffs, ['observation_unavailable']);
-  assert.equal((await store.retry('w1:p1')).next_check_at, '2026-09-29T10:05:00Z');
+  assert.equal((await requireEpisode(store)).next_check_at, '2026-09-29T10:05:00Z');
 });
 
 // The fourth get (after observeStop's stable read) may fail. A transient socket
 // failure must leave the episode intact but use reconnect delay, not a 100ms loop.
 test('second live get socket failure uses bounded reconnect on repeated scheduler wakes', async () => {
   const store = await base();
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  await store.record('w1:p1', episode((await observeStop(herdr(), 'w1:p1')).current_episode_id));
+  await store.record('w1:p1', episode((await observe(herdr(), 'w1:p1')).current_episode_id));
   let reads = 0;
   let getsAfterRead = 0;
   let decisions = 0;
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   const reader = {
     read: async () => {
       reads++;
@@ -258,17 +314,16 @@ test('second live get socket failure uses bounded reconnect on repeated schedule
   assert.equal(reads, 2);
   assert.equal(decisions, 0);
   assert.deepEqual(handoffs, ['observation_unavailable']);
-  assert.equal((await store.retry('w1:p1')).next_check_at, '2026-09-29T10:05:00Z');
+  assert.equal((await requireEpisode(store)).next_check_at, '2026-09-29T10:05:00Z');
 });
 
 // A failed detection socket read is uncertainty, not proof that the saved failure
 // changed; preserve it for bounded reconnect rather than terminally quarantine it.
 test('due detection socket failure preserves episode for bounded reconnect', async () => {
   const store = await base();
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  await store.record('w1:p1', episode((await observeStop(herdr(), 'w1:p1')).current_episode_id));
+  await store.record('w1:p1', episode((await observe(herdr(), 'w1:p1')).current_episode_id));
   let reads = 0;
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   const reader = {
     get: herdr().get,
     read: async () => {
@@ -299,19 +354,18 @@ test('due detection socket failure preserves episode for bounded reconnect', asy
   }
   assert.equal(reads, 2);
   assert.deepEqual(handoffs, ['observation_unavailable']);
-  assert.equal((await store.retry('w1:p1')).next_check_at, '2026-09-29T10:05:00Z');
+  assert.equal((await requireEpisode(store)).next_check_at, '2026-09-29T10:05:00Z');
 });
 
 // A confirmed changed revision on the last read must terminally quarantine the
 // old due episode; neither CLI nor the 100ms timer may act on the new occupant.
 test('second live get revision change quarantines a due episode once', async () => {
   const store = await base();
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  await store.record('w1:p1', episode((await observeStop(herdr(), 'w1:p1')).current_episode_id));
+  await store.record('w1:p1', episode((await observe(herdr(), 'w1:p1')).current_episode_id));
   let reads = 0;
   let getsAfterRead = 0;
   let decisions = 0;
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   const reader = {
     read: async () => {
       reads++;
@@ -346,16 +400,15 @@ test('second live get revision change quarantines a due episode once', async () 
   assert.equal(reads, 2);
   assert.equal(decisions, 0);
   assert.deepEqual(handoffs, ['observation_unavailable']);
-  assert.equal((await store.retry('w1:p1')).last_delivery_state, 'human');
-  assert.equal((await store.retry('w1:p1')).next_check_at, null);
+  assert.equal((await requireEpisode(store)).last_delivery_state, 'human');
+  assert.equal((await requireEpisode(store)).next_check_at, null);
 });
 
 // A due manual review must be terminal, not a repeatedly reevaluated overdue timer.
 test('manual decision at a due check is quarantined across later wakes', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const id = (await observeStop(herdr(), 'w1:p1')).current_episode_id;
+  const lease = await requireLease(store);
+  const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
   await store.record('w1:p1', episode(id));
   let decisions = 0;
   for (let i = 0; i < 3; i++)
@@ -364,14 +417,14 @@ test('manual decision at a due check is quarantined across later wakes', async (
       return { ...decision(input), proposed_action: { kind: 'manual_review' }, reason_code: 'retry_exhausted' };
     });
   assert.equal(decisions, 1);
-  assert.equal((await store.retry('w1:p1')).last_delivery_state, 'human');
+  assert.equal((await requireEpisode(store)).last_delivery_state, 'human');
   await store.release(lease);
 });
 
 // Catches a default due check silently ignoring persisted panes other than w1:p1.
 test('reconcileDue discovers all persisted configured pane episodes', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
+  const lease = await requireLease(store);
   const other = {
     get: async () => pane({ pane_id: 'w1:p2' }),
     read: async () => ({
@@ -382,8 +435,7 @@ test('reconcileDue discovers all persisted configured pane episodes', async () =
       truncated: false,
     }),
   };
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const id = (await observeStop(other, 'w1:p2')).current_episode_id;
+  const id = (await observe(other, 'w1:p2')).current_episode_id;
   await store.record('w1:p2', { ...episode(id), pane_id: 'w1:p2' });
   let calls = 0;
   await reconcileDue(now, store, other, async (input) => {
@@ -398,7 +450,7 @@ test('reconcileDue discovers all persisted configured pane episodes', async () =
 // episode, even when its replacement has the same due instant.
 test('missing-pane cleanup preserves a new due episode written before the lock', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
+  const lease = await requireLease(store);
   await store.record('w1:p1', episode('old-id'));
   const replacement = { ...episode('new-id'), first_observed_at: '2026-09-29T10:01:00Z' };
   const lock = store.withEpisodeLock.bind(store);
@@ -414,7 +466,7 @@ test('missing-pane cleanup preserves a new due episode written before the lock',
     return lock(paneId, action);
   };
   let decisions = 0;
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   await reconcileDue(
     now,
     store,
@@ -430,7 +482,7 @@ test('missing-pane cleanup preserves a new due episode written before the lock',
   assert.equal(interleaved, true);
   assert.equal(decisions, 0);
   assert.deepEqual(handoffs, []);
-  assert.equal((await store.retry('w1:p1')).failure_episode_id, 'new-id');
+  assert.equal((await requireEpisode(store)).failure_episode_id, 'new-id');
   await store.release(lease);
 });
 
@@ -438,22 +490,22 @@ test('missing-pane cleanup preserves a new due episode written before the lock',
 test('different observed evidence quarantines same-session history without invoking decision or resetting caps', async () => {
   const store = await base();
   await store.record('w1:p1', { ...episode('old-episode'), attempt_count: 3, last_attempt_at: '2026-09-29T10:01:00Z' });
-  const lease = await store.acquire('server-1');
+  const lease = await requireLease(store);
   let calls = 0;
   await reconcileDue(now, store, herdr('Different failure'), async () => {
     calls++;
   });
   assert.equal(calls, 0);
-  assert.equal((await store.retry('w1:p1')).attempt_count, 3);
-  assert.equal((await store.retry('w1:p1')).last_delivery_state, 'human');
-  assert.equal((await store.retry('w1:p1')).next_check_at, null);
+  assert.equal((await requireEpisode(store)).attempt_count, 3);
+  assert.equal((await requireEpisode(store)).last_delivery_state, 'human');
+  assert.equal((await requireEpisode(store)).next_check_at, null);
   await store.release(lease);
 });
 
 // Only a verified different session frees the old session's history.
 test('verified replacement session clears unrelated human-handed-off history', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
+  const lease = await requireLease(store);
   await store.record('w1:p1', { ...episode('old-id'), last_delivery_state: 'human' });
   const replacement = {
     get: async () => pane({ agent_session: { ...pane().agent_session, value: 's2' } }),
@@ -467,9 +519,8 @@ test('verified replacement session clears unrelated human-handed-off history', a
 // Catches advancing a past deadline into a busy loop, or trusting asserted reset evidence.
 test('same-session quota churn near 24h preserves first observation and hands off without another check', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const id = (await observeStop(herdr(), 'w1:p1')).current_episode_id;
+  const lease = await requireLease(store);
+  const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
   const record = {
     ...episode(id),
     first_observed_at: '2026-09-28T10:00:00Z',
@@ -489,14 +540,14 @@ test('same-session quota churn near 24h preserves first observation and hands of
       truncated: false,
     }),
   };
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   let checks = 0;
-  const deps = {
+  const deps: EventDeps = {
     store,
     herdr: reader,
     clock: { now: () => now },
     targets: ['w1:p1'],
-    handoff: async (reason) => handoffs.push(reason),
+    handoff: collect(handoffs),
     decide: async (input) => {
       checks++;
       return decision(input);
@@ -514,10 +565,10 @@ test('same-session quota churn near 24h preserves first observation and hands of
     );
     await reconcileDue(new Date('2026-09-29T10:05:00Z'), store, reader, deps.decide, ['w1:p1'], deps.handoff);
     assert.equal(checks, 0);
-    assert.equal((await store.retry('w1:p1')).first_observed_at, record.first_observed_at);
-    assert.equal((await store.retry('w1:p1')).quota_check_count, 2);
-    assert.equal((await store.retry('w1:p1')).next_check_at, null);
-    assert.equal((await store.retry('w1:p1')).last_delivery_state, 'human');
+    assert.equal((await requireEpisode(store)).first_observed_at, record.first_observed_at);
+    assert.equal((await requireEpisode(store)).quota_check_count, 2);
+    assert.equal((await requireEpisode(store)).next_check_at, null);
+    assert.equal((await requireEpisode(store)).last_delivery_state, 'human');
     assert.ok(handoffs.length > 0);
   } finally {
     await store.release(lease);
@@ -526,23 +577,22 @@ test('same-session quota churn near 24h preserves first observation and hands of
 
 test('past asserted deadline cannot create an immediate check loop', async () => {
   const store = await base();
-  const observed = await import('../dist/src/herdr-adapter/observe.js').then((m) => m.observeStop(herdr(), 'w1:p1'));
+  const observed = await observe(herdr(), 'w1:p1');
   await store.record('w1:p1', episode(observed.current_episode_id));
-  const lease = await store.acquire('server-1');
+  const lease = await requireLease(store);
   await reconcileDue(now, store, herdr(), async (input) => decision(input, 'wait_for_quota', '2026-09-29T09:00:00Z'));
-  assert.equal((await store.retry('w1:p1')).next_check_at, '2026-09-29T10:20:00.000Z');
+  assert.equal((await requireEpisode(store)).next_check_at, '2026-09-29T10:20:00.000Z');
   await store.release(lease);
 });
 
 // Catches treating an asserted/fabricated decision deadline as verified quota reset.
 test('unbound reset proposal cannot replace adapter-owned fallback schedule', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const id = (await observeStop(herdr(), 'w1:p1')).current_episode_id;
+  const lease = await requireLease(store);
+  const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
   await store.record('w1:p1', episode(id));
   await reconcileDue(now, store, herdr(), async (input) => decision(input, 'wait_for_quota', '2030-09-29T10:20:00Z'));
-  assert.equal((await store.retry('w1:p1')).next_check_at, '2026-09-29T10:20:00.000Z');
+  assert.equal((await requireEpisode(store)).next_check_at, '2026-09-29T10:20:00.000Z');
   await store.release(lease);
 });
 
@@ -550,10 +600,7 @@ test('unbound reset proposal cannot replace adapter-owned fallback schedule', as
 test('persisted session identity with surrounding whitespace is corrupt, not a match', async () => {
   const store = await base();
   await store.record('w1:p1', episode('e1'));
-  const path = join(
-    store.directory,
-    (await readdir(store.directory)).find((name) => name.endsWith('.json')),
-  );
+  const path = await metadataPath(store.directory);
   await writeFile(path, JSON.stringify({ ...episode('e1'), session_id: ' s1 ' }));
   await assert.rejects(store.retry('w1:p1'), { message: 'invalid episode metadata' });
 });
@@ -562,10 +609,7 @@ test('persisted session identity with surrounding whitespace is corrupt, not a m
 test('persisted malformed lifecycle handoff marker is rejected on read', async () => {
   const store = await base();
   await store.record('w1:p1', episode('e1'));
-  const path = join(
-    store.directory,
-    (await readdir(store.directory)).find((name) => name.endsWith('.json')),
-  );
+  const path = await metadataPath(store.directory);
   for (const corrupted of [
     { ...episode('e1'), lifecycle_handoff_sent: 'yes' },
     { ...episode('e1'), lifecycle_handoff_sent: true },
@@ -579,10 +623,7 @@ test('persisted malformed lifecycle handoff marker is rejected on read', async (
 test('persisted next check earlier than quota history is rejected on read', async () => {
   const store = await base();
   await store.record('w1:p1', episode('e1'));
-  const path = join(
-    store.directory,
-    (await readdir(store.directory)).find((name) => name.endsWith('.json')),
-  );
+  const path = await metadataPath(store.directory);
   await writeFile(
     path,
     JSON.stringify({ ...episode('e1'), quota_check_count: 1, last_quota_check_at: '2026-09-29T10:20:00Z' }),
@@ -591,7 +632,7 @@ test('persisted next check earlier than quota history is rejected on read', asyn
 });
 
 test('delivered history emits one fixed handoff for a newly observed exit, unknown or moved pane', async () => {
-  for (const [trigger, live] of [
+  const cases: Array<[EventTrigger, AgentSnapshot | null]> = [
     [{ type: 'pane_exited', pane_id: 'w1:p1', workspace_id: 'w1' }, null],
     [
       { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent_status: 'unknown' },
@@ -601,10 +642,11 @@ test('delivered history emits one fixed handoff for a newly observed exit, unkno
       { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent_status: 'working' },
       pane({ workspace_id: 'w2', agent_status: 'working' }),
     ],
-  ]) {
+  ];
+  for (const [trigger, live] of cases) {
     const store = await base();
-    const lease = await store.acquire('server-1');
-    const original = {
+    const lease = await requireLease(store);
+    const original: Episode = {
       ...episode('old-id'),
       next_check_at: null,
       attempt_count: 1,
@@ -612,9 +654,9 @@ test('delivered history emits one fixed handoff for a newly observed exit, unkno
       last_delivery_state: 'delivered',
     };
     await store.record('w1:p1', original);
-    const handoffs = [];
+    const handoffs: HandoffReason[] = [];
     let decisions = 0;
-    const deps = {
+    const deps: EventDeps = {
       store,
       targets: ['w1:p1'],
       clock: { now: () => now },
@@ -622,13 +664,13 @@ test('delivered history emits one fixed handoff for a newly observed exit, unkno
       decide: async () => {
         decisions++;
       },
-      handoff: async (reason) => handoffs.push(reason),
+      handoff: collect(handoffs),
     };
     try {
       await handleEvent(trigger, deps);
       await handleEvent(trigger, deps);
       assert.deepEqual(handoffs, ['observation_unavailable']);
-      const saved = await store.retry('w1:p1');
+      const saved = await requireEpisode(store);
       assert.equal(saved.attempt_count, 1);
       assert.equal(saved.first_observed_at, original.first_observed_at);
       assert.equal(saved.last_delivery_state, 'delivered');
@@ -640,11 +682,12 @@ test('delivered history emits one fixed handoff for a newly observed exit, unkno
 });
 
 test('missed lifecycle event notifies once on restart even for uncertain or human history', async () => {
-  for (const [state, live] of [
+  const states: Array<[Episode['last_delivery_state'], AgentSnapshot | null]> = [
     ['uncertain', null],
     ['human', pane({ agent_status: 'unknown' })],
     ['delivered', pane({ workspace_id: 'w2', agent_status: 'working' })],
-  ]) {
+  ];
+  for (const [state, live] of states) {
     const store = await base();
     const original = {
       ...episode('old-id'),
@@ -654,7 +697,7 @@ test('missed lifecycle event notifies once on restart even for uncertain or huma
       last_delivery_state: state,
     };
     await store.record('w1:p1', original);
-    const handoffs = [];
+    const handoffs: HandoffReason[] = [];
     let decisions = 0;
     for (let restart = 0; restart < 2; restart++) {
       const ctrl = new AbortController();
@@ -681,7 +724,7 @@ test('missed lifecycle event notifies once on restart even for uncertain or huma
     }
     assert.deepEqual(handoffs, ['observation_unavailable']);
     assert.equal(decisions, 0);
-    const saved = await store.retry('w1:p1');
+    const saved = await requireEpisode(store);
     assert.equal(saved.attempt_count, 1);
     assert.equal(saved.first_observed_at, original.first_observed_at);
     assert.equal(saved.last_delivery_state, state);
@@ -690,7 +733,7 @@ test('missed lifecycle event notifies once on restart even for uncertain or huma
 
 test('non-due moved idle events quarantine one same-session episode and hand off once across restart', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
+  const lease = await requireLease(store);
   const original = {
     ...episode('old-id'),
     next_check_at: '2026-09-29T10:20:00Z',
@@ -705,9 +748,9 @@ test('non-due moved idle events quarantine one same-session episode and hand off
       throw new Error('unexpected prompt');
     },
   };
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   let decisions = 0;
-  const deps = {
+  const deps: EventDeps = {
     herdr: reader,
     store,
     clock: { now: () => now },
@@ -715,7 +758,7 @@ test('non-due moved idle events quarantine one same-session episode and hand off
     sessionId: 'server-1',
     leaseToken: lease,
     sessionValid: async () => true,
-    handoff: async (reason) => handoffs.push(reason),
+    handoff: collect(handoffs),
     decide: async () => {
       decisions++;
       throw new Error('unexpected decision');
@@ -730,7 +773,7 @@ test('non-due moved idle events quarantine one same-session episode and hand off
   };
   try {
     for (let repeat = 0; repeat < 3; repeat++) await handleEvent(staleEvent, deps);
-    const saved = await store.retry('w1:p1');
+    const saved = await requireEpisode(store);
     assert.deepEqual(handoffs, ['observation_unavailable']);
     assert.equal(decisions, 0);
     assert.equal(saved.lifecycle_handoff_sent, true);
@@ -750,7 +793,7 @@ test('non-due moved idle events quarantine one same-session episode and hand off
         sessionId: 'server-1',
         signal: ctrl.signal,
         clock: deps.clock,
-        handoff: async (reason) => handoffs.push(reason),
+        handoff: collect(handoffs),
       });
     } finally {
       clearTimeout(deadline);
@@ -764,15 +807,15 @@ test('non-due moved idle events quarantine one same-session episode and hand off
 
 test('a stale workspace event and rejected excerpt do not claim an in-place moved lifecycle', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
+  const lease = await requireLease(store);
   await store.record('w1:p1', episode('old-id'));
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   let decisions = 0;
   const reader = {
     get: async () => pane({ agent_status: 'idle' }),
     read: herdr('Bearer abcdefghijklmnopqrstuvwxyz').read,
   };
-  const deps = {
+  const deps: EventDeps = {
     herdr: reader,
     store,
     clock: { now: () => now },
@@ -780,7 +823,7 @@ test('a stale workspace event and rejected excerpt do not claim an in-place move
     sessionId: 'server-1',
     leaseToken: lease,
     sessionValid: async () => true,
-    handoff: async (reason) => handoffs.push(reason),
+    handoff: collect(handoffs),
     decide: async () => {
       decisions++;
     },
@@ -791,7 +834,7 @@ test('a stale workspace event and rejected excerpt do not claim an in-place move
       deps,
       true,
     );
-    const saved = await store.retry('w1:p1');
+    const saved = await requireEpisode(store);
     assert.equal(saved.lifecycle_handoff_sent, undefined);
     assert.equal(saved.next_check_at, null);
     assert.equal(saved.last_delivery_state, 'human');
@@ -804,7 +847,7 @@ test('a stale workspace event and rejected excerpt do not claim an in-place move
 
 test('a different session in the moved pane cannot mark the old episode lifecycle', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
+  const lease = await requireLease(store);
   const original = { ...episode('old-id'), next_check_at: '2026-09-29T10:20:00Z' };
   await store.record('w1:p1', original);
   const reader = {
@@ -816,7 +859,7 @@ test('a different session in the moved pane cannot mark the old episode lifecycl
       }),
     read: herdr().read,
   };
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   let decisions = 0;
   try {
     await handleEvent(
@@ -829,7 +872,7 @@ test('a different session in the moved pane cannot mark the old episode lifecycl
         sessionId: 'server-1',
         leaseToken: lease,
         sessionValid: async () => true,
-        handoff: async (reason) => handoffs.push(reason),
+        handoff: collect(handoffs),
         decide: async () => {
           decisions++;
         },
@@ -845,7 +888,7 @@ test('a different session in the moved pane cannot mark the old episode lifecycl
 
 test('overdue timer observing a moved idle pane does not hand off again after restart', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
+  const lease = await requireLease(store);
   const original = { ...episode('old-id'), quota_check_count: 1, last_quota_check_at: '2026-09-29T10:01:00Z' };
   await store.record('w1:p1', original);
   const reader = {
@@ -858,7 +901,7 @@ test('overdue timer observing a moved idle pane does not hand off again after re
       truncated: false,
     }),
   };
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   let decisions = 0;
   try {
     await reconcileDue(
@@ -869,9 +912,9 @@ test('overdue timer observing a moved idle pane does not hand off again after re
         decisions++;
       },
       ['w1:p1'],
-      async (reason) => handoffs.push(reason),
+      collect(handoffs),
     );
-    assert.equal((await store.retry('w1:p1')).lifecycle_handoff_sent, true);
+    assert.equal((await requireEpisode(store)).lifecycle_handoff_sent, true);
     await store.release(lease);
     const ctrl = new AbortController();
     const deadline = setTimeout(() => ctrl.abort(), 70);
@@ -886,15 +929,15 @@ test('overdue timer observing a moved idle pane does not hand off again after re
         sessionId: 'server-1',
         signal: ctrl.signal,
         clock: { now: () => now },
-        handoff: async (reason) => handoffs.push(reason),
+        handoff: collect(handoffs),
       });
     } finally {
       clearTimeout(deadline);
     }
     assert.deepEqual(handoffs, ['observation_unavailable']);
     assert.equal(decisions, 0);
-    assert.equal((await store.retry('w1:p1')).quota_check_count, 1);
-    assert.equal((await store.retry('w1:p1')).first_observed_at, original.first_observed_at);
+    assert.equal((await requireEpisode(store)).quota_check_count, 1);
+    assert.equal((await requireEpisode(store)).first_observed_at, original.first_observed_at);
   } finally {
     await store.release(lease);
   }
@@ -902,11 +945,11 @@ test('overdue timer observing a moved idle pane does not hand off again after re
 
 test('overdue timer observing unknown status hands off once across later wakes and restart', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
+  const lease = await requireLease(store);
   const original = { ...episode('old-id'), quota_check_count: 2, last_quota_check_at: '2026-09-29T10:01:00Z' };
   await store.record('w1:p1', original);
   const reader = { get: async () => pane({ agent_status: 'unknown' }), read: herdr().read };
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   let decisions = 0;
   try {
     for (let wake = 0; wake < 3; wake++) {
@@ -918,13 +961,13 @@ test('overdue timer observing unknown status hands off once across later wakes a
           decisions++;
         },
         ['w1:p1'],
-        async (reason) => handoffs.push(reason),
+        collect(handoffs),
       );
     }
-    assert.equal((await store.retry('w1:p1')).quota_check_count, 2);
-    assert.equal((await store.retry('w1:p1')).first_observed_at, original.first_observed_at);
-    assert.equal((await store.retry('w1:p1')).next_check_at, null);
-    assert.equal((await store.retry('w1:p1')).last_delivery_state, 'human');
+    assert.equal((await requireEpisode(store)).quota_check_count, 2);
+    assert.equal((await requireEpisode(store)).first_observed_at, original.first_observed_at);
+    assert.equal((await requireEpisode(store)).next_check_at, null);
+    assert.equal((await requireEpisode(store)).last_delivery_state, 'human');
     await store.release(lease);
     const ctrl = new AbortController();
     const deadline = setTimeout(() => ctrl.abort(), 70);
@@ -939,7 +982,7 @@ test('overdue timer observing unknown status hands off once across later wakes a
         sessionId: 'server-1',
         signal: ctrl.signal,
         clock: { now: () => now },
-        handoff: async (reason) => handoffs.push(reason),
+        handoff: collect(handoffs),
       });
     } finally {
       clearTimeout(deadline);
@@ -954,9 +997,8 @@ test('overdue timer observing unknown status hands off once across later wakes a
 // Restart retains already-quarantined history when resolution is uncertain; only a
 // distinct session can establish that the old record is unrelated.
 test('runner startup preserves non-due closed moved unknown same-session records and clears replacement', async () => {
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const id = (await observeStop(herdr(), 'w1:p1')).current_episode_id;
-  const states = [
+  const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
+  const states: Array<[AgentSnapshot | null, boolean]> = [
     [null, false],
     [pane({ workspace_id: 'w2' }), false],
     [pane({ agent_status: 'unknown' }), false],
@@ -966,7 +1008,7 @@ test('runner startup preserves non-due closed moved unknown same-session records
     const store = await base();
     await store.record('w1:p1', { ...episode(id), next_check_at: null, last_delivery_state: 'human' });
     const ctrl = new AbortController();
-    const handoffs = [];
+    const handoffs: HandoffReason[] = [];
     let decisions = 0;
     const deadline = setTimeout(() => ctrl.abort(), 50);
     try {
@@ -991,7 +1033,7 @@ test('runner startup preserves non-due closed moved unknown same-session records
     assert.deepEqual(handoffs, ['observation_unavailable']);
     assert.equal(decisions, 0);
     assert.equal((await store.retry('w1:p1'))?.session_id ?? null, replaced ? null : 's1');
-    if (!replaced) assert.equal((await store.retry('w1:p1')).lifecycle_handoff_sent, true);
+    if (!replaced) assert.equal((await requireEpisode(store)).lifecycle_handoff_sent, true);
   }
 });
 
@@ -999,14 +1041,13 @@ test('runner startup preserves non-due closed moved unknown same-session records
 // verified replacement sessions may clear unrelated records.
 test('lifecycle events preserve same-session history and reject stale status events', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const id = (await observeStop(herdr(), 'w1:p1')).current_episode_id;
+  const lease = await requireLease(store);
+  const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
   const record = { ...episode(id), next_check_at: '2026-09-29T12:00:00Z' };
-  let live = pane({ agent_status: 'working' });
-  const handoffs = [];
+  let live: AgentSnapshot | null = pane({ agent_status: 'working' });
+  const handoffs: HandoffReason[] = [];
   let decisions = 0;
-  const deps = {
+  const deps: EventDeps = {
     store,
     targets: ['w1:p1'],
     clock: { now: () => now },
@@ -1023,25 +1064,25 @@ test('lifecycle events preserve same-session history and reject stale status eve
     { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent_status: 'working' },
     deps,
   );
-  assert.equal((await store.retry('w1:p1')).last_delivery_state, 'human');
+  assert.equal((await requireEpisode(store)).last_delivery_state, 'human');
   await store.record('w1:p1', record);
   live = null;
   await handleEvent({ type: 'pane_exited', pane_id: 'w1:p1', workspace_id: 'w1' }, deps);
-  assert.equal((await store.retry('w1:p1')).last_delivery_state, 'human');
+  assert.equal((await requireEpisode(store)).last_delivery_state, 'human');
   await store.record('w1:p1', record);
   live = pane();
   await handleEvent(
     { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent_status: 'working' },
     deps,
   );
-  assert.equal((await store.retry('w1:p1')).failure_episode_id, id);
+  assert.equal((await requireEpisode(store)).failure_episode_id, id);
   live = pane({ workspace_id: 'w2' });
   await handleEvent(
     { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent_status: 'working' },
     deps,
   );
-  assert.equal((await store.retry('w1:p1')).last_delivery_state, 'human');
-  assert.equal((await store.retry('w1:p1')).lifecycle_handoff_sent, true);
+  assert.equal((await requireEpisode(store)).last_delivery_state, 'human');
+  assert.equal((await requireEpisode(store)).lifecycle_handoff_sent, true);
   await store.record('w1:p1', record);
   live = pane({ agent_session: { agent: 'pi', source: 'integration:pi', kind: 'id', value: 's2' } });
   await handleEvent(
@@ -1063,21 +1104,18 @@ test('lifecycle events preserve same-session history and reject stale status eve
 // or throw on every wake. These are real on-disk records, not mocked store reads.
 test('corrupt episode cannot reset caps on a later same-session hook', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
+  const lease = await requireLease(store);
   await store.record('w1:p1', { ...episode('previous'), attempt_count: 3, last_attempt_at: '2026-09-29T10:01:00Z' });
-  const path = join(
-    store.directory,
-    (await readdir(store.directory)).find((name) => name.endsWith('.json')),
-  );
+  const path = await metadataPath(store.directory);
   await writeFile(path, '{broken retry record');
   let decisions = 0;
-  const handoffs = [];
-  const deps = {
+  const handoffs: HandoffReason[] = [];
+  const deps: EventDeps = {
     store,
     herdr: herdr(),
     clock: { now: () => now },
     targets: ['w1:p1'],
-    handoff: async (reason) => handoffs.push(reason),
+    handoff: collect(handoffs),
     decide: async () => {
       decisions++;
     },
@@ -1100,7 +1138,7 @@ test('corrupt episode cannot reset caps on a later same-session hook', async () 
 });
 
 test('restart quarantines corrupt retry metadata with one bounded handoff', async () => {
-  const invalid = [
+  const invalid: Array<(record: Episode) => object> = [
     (record) => ({ ...record, attempt_count: -1 }),
     (record) => ({ ...record, quota_check_count: 'two' }),
     (record) => ({ ...record, last_attempt_at: 'yesterday' }),
@@ -1117,13 +1155,10 @@ test('restart quarantines corrupt retry metadata with one bounded handoff', asyn
   for (const corrupt of invalid) {
     const store = await base();
     await store.record('w1:p1', episode('e1'));
-    const path = join(
-      store.directory,
-      (await readdir(store.directory)).find((name) => name.endsWith('.json')),
-    );
+    const path = await metadataPath(store.directory);
     await writeFile(path, JSON.stringify(corrupt(episode('e1'))));
     const ctrl = new AbortController();
-    const handoffs = [];
+    const handoffs: HandoffReason[] = [];
     let decisions = 0;
     const deadline = setTimeout(() => ctrl.abort(), 400);
     try {
@@ -1158,17 +1193,16 @@ test('restart quarantines corrupt retry metadata with one bounded handoff', asyn
 // Catches two checks of the same still-limited episode treating one check as a recovery send.
 test('successive quota checks advance separately and the 24h boundary hands off', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const id = (await observeStop(herdr(), 'w1:p1')).current_episode_id;
+  const lease = await requireLease(store);
+  const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
   await store.record('w1:p1', episode(id));
   await reconcileDue(now, store, herdr(), async (input) => decision(input, 'wait_for_quota', '2026-09-29T10:20:00Z'));
   await reconcileDue(new Date('2026-09-29T10:20:00Z'), store, herdr(), async (input) =>
     decision(input, 'wait_for_quota', '2026-09-29T10:35:00Z'),
   );
-  assert.equal((await store.retry('w1:p1')).quota_check_count, 2);
-  assert.equal((await store.retry('w1:p1')).last_quota_check_at, '2026-09-29T10:20:00.000Z');
-  assert.equal((await store.retry('w1:p1')).attempt_count, 0);
+  assert.equal((await requireEpisode(store)).quota_check_count, 2);
+  assert.equal((await requireEpisode(store)).last_quota_check_at, '2026-09-29T10:20:00.000Z');
+  assert.equal((await requireEpisode(store)).attempt_count, 0);
   let boundaryCalls = 0;
   for (let i = 0; i < 3; i++)
     await reconcileDue(new Date('2026-09-30T10:35:00Z'), store, herdr(), async (input) => {
@@ -1176,8 +1210,8 @@ test('successive quota checks advance separately and the 24h boundary hands off'
       return decision(input, 'wait_for_quota', '2026-09-30T11:00:00Z');
     });
   assert.equal(boundaryCalls, 0);
-  assert.equal((await store.retry('w1:p1')).quota_check_count, 2);
-  assert.equal((await store.retry('w1:p1')).next_check_at, null);
+  assert.equal((await requireEpisode(store)).quota_check_count, 2);
+  assert.equal((await requireEpisode(store)).next_check_at, null);
   await store.release(lease);
 });
 
@@ -1216,10 +1250,10 @@ test('installed event path honors lease and rejects delayed event for replaced o
       );
     });
   });
-  await new Promise((resolve) => server.listen(socket, resolve));
+  await new Promise<void>((resolve) => server.listen(socket, () => resolve()));
   const info = await stat(socket);
   const session = `${info.dev}:${info.ino}`;
-  const lease = await store.acquire(session);
+  const lease = await requireLease(store, session);
   let calls = 0;
   const env = {
     HERDR_SOCKET_PATH: socket,
@@ -1257,11 +1291,10 @@ test('installed event path honors lease and rejects delayed event for replaced o
 test('slow CLI result cannot mutate state after lease expires under a fake clock', async () => {
   let milliseconds = Date.now();
   const store = new EpisodeStore(await mkdtemp(join(tmpdir(), 'steward-slow-')), () => milliseconds);
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const id = (await observeStop(herdr(), 'w1:p1')).current_episode_id;
+  const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
   await store.record('w1:p1', episode(id));
-  const lease = await store.acquire('server-1');
-  const handoffs = [];
+  const lease = await requireLease(store);
+  const handoffs: HandoffReason[] = [];
   await reconcileDue(
     now,
     store,
@@ -1275,7 +1308,7 @@ test('slow CLI result cannot mutate state after lease expires under a fake clock
       handoffs.push(reason);
     },
   );
-  assert.equal((await store.retry('w1:p1')).quota_check_count, 0);
+  assert.equal((await requireEpisode(store)).quota_check_count, 0);
   assert.deepEqual(handoffs, ['human_review_required']);
   await store.release(lease);
 });
@@ -1285,26 +1318,29 @@ test('slow CLI result cannot mutate state after lease expires under a fake clock
 test('visible runner renews its lease during a slow CLI evaluation', async () => {
   let milliseconds = Date.now();
   const store = new EpisodeStore(await mkdtemp(join(tmpdir(), 'steward-heartbeat-')), () => milliseconds);
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const id = (await observeStop(herdr(), 'w1:p1')).current_episode_id;
+  const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
   await store.record('w1:p1', episode(id));
   const ctrl = new AbortController();
-  let entered;
-  let finish;
-  const began = new Promise((resolve) => {
+  let entered!: () => void;
+  let finish!: () => void;
+  const began = new Promise<void>((resolve) => {
     entered = resolve;
   });
-  const held = new Promise((resolve) => {
+  const held = new Promise<void>((resolve) => {
     finish = resolve;
   });
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
+  const originalRecord = store.record.bind(store);
+  store.record = async (paneId, value) => {
+    await originalRecord(paneId, value);
+    if (value.quota_check_count === 1) ctrl.abort();
+  };
   const runner = runScheduler({
     store,
     herdr: herdr(),
     decide: async (input) => {
       entered();
       await held;
-      ctrl.abort();
       return decision(input);
     },
     targets: ['w1:p1'],
@@ -1324,31 +1360,507 @@ test('visible runner renews its lease during a slow CLI evaluation', async () =>
   }
   finish();
   assert.equal(await runner, 'stopped');
-  assert.equal((await store.retry('w1:p1')).quota_check_count, 1);
+  assert.equal((await requireEpisode(store)).quota_check_count, 1);
   assert.deepEqual(handoffs, []);
 });
+
+test('abort before a due decision returns leaves the episode unchanged', async () => {
+  const store = await base();
+  const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
+  const original = episode(id);
+  await store.record('w1:p1', original);
+  const ctrl = new AbortController();
+  const entered = deferred<void>();
+  const resume = deferred<void>();
+  const handoffs: HandoffReason[] = [];
+  const runner = runScheduler({
+    store,
+    herdr: herdr(),
+    decide: async (input) => {
+      entered.resolve();
+      await resume.promise;
+      return decision(input);
+    },
+    targets: ['w1:p1'],
+    sessionId: 'server-1',
+    signal: ctrl.signal,
+    clock: { now: () => now },
+    handoff: async (reason) => {
+      handoffs.push(reason);
+    },
+  });
+  try {
+    await within(entered.promise);
+    ctrl.abort();
+    resume.resolve();
+    assert.equal(await within(runner), 'stopped');
+    assert.deepEqual(await requireEpisode(store), original);
+    assert.deepEqual(handoffs, []);
+  } finally {
+    resume.resolve();
+  }
+});
+
+// A submitted generation-local rename is not a prerequisite for revocation.
+for (const boundary of ['heartbeat rename', 'timer validation'] as const) {
+  test(`abort bypasses in-flight ${boundary} and a pending decision`, async () => {
+    const entered = deferred<void>(),
+      resume = deferred<void>();
+    const deciding = deferred<void>(),
+      decisionResume = deferred<void>();
+    const settled = deferred<void>(),
+      assessment = deferred<void>();
+    const timerStarted = deferred<void>();
+    let holdTimer = false;
+    let renewals = 0;
+    let lateRenewal: boolean | undefined;
+    const store = new EpisodeStore(await mkdtemp(join(tmpdir(), 'steward-heartbeat-race-')), undefined, {
+      io: {
+        rename: async (from, to) => {
+          if (renewals >= 2 && boundary === 'heartbeat rename' && to.endsWith('/heartbeat.json')) {
+            await deciding.promise;
+            entered.resolve();
+            await resume.promise;
+          }
+          await rename(from, to);
+        },
+      },
+    });
+    const original = episode((await observe(herdr(), 'w1:p1')).current_episode_id);
+    await store.record('w1:p1', original);
+    const heartbeat = store.heartbeat.bind(store);
+    store.heartbeat = async (...args) => {
+      renewals++;
+      if (renewals === 2) timerStarted.resolve();
+      const value = await heartbeat(...args);
+      if (holdTimer) {
+        lateRenewal = value;
+        settled.resolve();
+      }
+      return value;
+    };
+    const lock = store.withEpisodeLock.bind(store);
+    store.withEpisodeLock = async (paneId, action) => {
+      const value = await lock(paneId, action);
+      if (holdTimer) assessment.resolve();
+      return value;
+    };
+    const ctrl = new AbortController();
+    const runner = runScheduler({
+      store,
+      herdr: herdr(),
+      targets: ['w1:p1'],
+      sessionId: 'server-1',
+      signal: ctrl.signal,
+      clock: { now: () => now },
+      heartbeatIntervalMs: 5,
+      sessionValid: async () => {
+        if (holdTimer && boundary === 'timer validation') {
+          entered.resolve();
+          await resume.promise;
+          settled.resolve();
+        }
+        return true;
+      },
+      decide: async (input) => {
+        if (boundary === 'heartbeat rename') await timerStarted.promise;
+        holdTimer = true;
+        deciding.resolve();
+        await decisionResume.promise;
+        return decision(input);
+      },
+    });
+    try {
+      await within(deciding.promise);
+      await within(entered.promise);
+      const token = await store.activeToken('server-1');
+      assert.ok(token);
+      ctrl.abort();
+      assert.equal(await within(runner).catch(() => 'pending'), 'stopped');
+      assert.equal(
+        (await lstat(join(store.directory, 'scheduler-lease', 'generations', token, 'released'))).isDirectory(),
+        true,
+      );
+      assert.equal(await store.owned(token, 'server-1'), false);
+      const calls = renewals;
+      resume.resolve();
+      decisionResume.resolve();
+      await within(settled.promise).catch(() => assert.fail('late timer operation settlement was not observed'));
+      await within(assessment.promise);
+      assert.equal(renewals, calls);
+      if (boundary === 'heartbeat rename') assert.equal(lateRenewal, false);
+      assert.deepEqual(await requireEpisode(store), original);
+    } finally {
+      ctrl.abort();
+      resume.resolve();
+      decisionResume.resolve();
+      await within(runner).catch(() => {});
+    }
+  });
+}
+
+for (const mode of ['confirmed', 'held marker', 'initial owner'] as const) {
+  test(`abort independently revokes a pending acquisition: ${mode}`, async () => {
+    const entered = deferred<void>(),
+      resume = deferred<void>();
+    const markerEntered = deferred<void>(),
+      markerResume = deferred<void>();
+    let expire!: () => void;
+    let leases = 0,
+      callbacks = 0;
+    const io: Partial<LeaseIO> = {
+      open: async (path, flags, permissions) => {
+        const handle = await open(path, flags, permissions);
+        if (mode === 'initial owner' && path.endsWith('/owner.json')) {
+          const write = handle.writeFile.bind(handle);
+          handle.writeFile = async (...args) => {
+            entered.resolve();
+            await resume.promise;
+            return write(...args);
+          };
+        }
+        return handle;
+      },
+      rename: async (from, to) => {
+        if (mode !== 'initial owner' && to.endsWith('/active.json')) {
+          entered.resolve();
+          await resume.promise;
+        }
+        await rename(from, to);
+      },
+      mkdir: async (path, options) => {
+        if (path.endsWith('/released')) {
+          markerEntered.resolve();
+          if (mode === 'held marker') await markerResume.promise;
+        }
+        await mkdir(path, options);
+      },
+    };
+    const store = new EpisodeStore(await mkdtemp(join(tmpdir(), 'steward-acquire-abort-')), undefined, { io });
+    let attempt!: LeaseAttempt;
+    const begin = store.beginAcquire.bind(store);
+    store.beginAcquire = (session) => (attempt = begin(session));
+    const ctrl = new AbortController();
+    const running = runScheduler({
+      store,
+      herdr: herdr(),
+      decide: async () => {
+        callbacks++;
+      },
+      targets: [],
+      sessionId: 'server-1',
+      signal: ctrl.signal,
+      onLease: () => {
+        leases++;
+      },
+      sessionValid: async () => {
+        callbacks++;
+        return true;
+      },
+      shutdownDeadline: (ms, callback) => {
+        assert.equal(ms, 5_000);
+        expire = callback;
+        return () => {};
+      },
+    });
+    try {
+      await within(entered.promise);
+      ctrl.abort();
+      if (mode !== 'initial owner') {
+        assert.equal(await within(markerEntered.promise.then(() => true)).catch(() => false), true);
+      }
+      if (mode !== 'confirmed') {
+        assert.equal(typeof expire, 'function');
+        expire();
+      }
+      assert.equal(
+        await within(running).catch(() => 'pending'),
+        mode === 'confirmed' ? 'stopped' : 'shutdown_incomplete',
+      );
+      assert.equal(attempt.isOpen(), false);
+      assert.equal((await lstat(join(store.directory, 'takeover-guard'))).isFile(), true);
+      assert.equal(await new EpisodeStore(store.directory).acquire('server-1'), null);
+      if (mode === 'confirmed') {
+        assert.equal(
+          (
+            await lstat(join(store.directory, 'scheduler-lease', 'generations', attempt.token, 'released'))
+          ).isDirectory(),
+          true,
+        );
+      }
+      resume.resolve();
+      markerResume.resolve();
+      assert.equal(await within(attempt.ready), null);
+      await within(attempt.release());
+      assert.equal(await store.activeToken('server-1'), null);
+      assert.equal(leases, 0);
+      assert.equal(callbacks, 0);
+      await assert.rejects(lstat(join(store.directory, 'takeover-guard')), { code: 'ENOENT' });
+    } finally {
+      ctrl.abort();
+      resume.resolve();
+      markerResume.resolve();
+      await within(running).catch(() => {});
+    }
+  });
+}
+
+for (const boundary of [
+  'sessionValid',
+  'main heartbeat',
+  'get',
+  'read',
+  'decide',
+  'lock',
+  'record',
+  'next',
+  'handoff',
+] as const) {
+  test(`abort bypasses every suspended foreground boundary: ${boundary}`, async () => {
+    const entered = deferred<void>(),
+      resume = deferred<void>(),
+      completed = deferred<void>();
+    const assessment = deferred<void>();
+    let held = false;
+    const pause = async () => {
+      held = true;
+      entered.resolve();
+      await resume.promise;
+      completed.resolve();
+    };
+    let heartbeatWrites = 0;
+    const store = new EpisodeStore(await mkdtemp(join(tmpdir(), 'steward-foreground-abort-')), undefined, {
+      io: {
+        rename: async (from, to) => {
+          if (to.endsWith('/heartbeat.json') && ++heartbeatWrites === 2 && boundary === 'main heartbeat') await pause();
+          await rename(from, to);
+        },
+      },
+    });
+    const original = episode((await observe(herdr(), 'w1:p1')).current_episode_id);
+    await store.record('w1:p1', original);
+    const effects: string[] = [];
+    const lock = store.withEpisodeLock.bind(store);
+    store.withEpisodeLock = async (paneId, action) => {
+      if (boundary === 'lock') await pause();
+      const result = await lock(paneId, action);
+      if (held) assessment.resolve();
+      return result;
+    };
+    const record = store.record.bind(store);
+    store.record = async (...args) => {
+      effects.push('record');
+      if (boundary === 'record') await pause();
+      await record(...args);
+    };
+    const next = store.next.bind(store);
+    store.next = async (...args) => {
+      if (boundary === 'next') await pause();
+      return next(...args);
+    };
+    const reader = herdr();
+    const get = reader.get,
+      read = reader.read;
+    reader.get = async (...args) => {
+      if (boundary === 'get') await pause();
+      return get(...args);
+    };
+    reader.read = async (...args) => {
+      if (boundary === 'read') await pause();
+      return read(...args);
+    };
+    if (boundary === 'handoff') reader.get = async () => pane({ agent_status: 'running' });
+    const ctrl = new AbortController();
+    const running = runScheduler({
+      store,
+      herdr: {
+        ...reader,
+        prompt: async () => {
+          effects.push('prompt');
+        },
+      },
+      targets: ['w1:p1'],
+      sessionId: 'server-1',
+      signal: ctrl.signal,
+      clock: { now: () => now },
+      sessionValid: async () => {
+        if (boundary === 'sessionValid') await pause();
+        return true;
+      },
+      decide: async (input) => {
+        effects.push('decide');
+        if (boundary === 'decide') await pause();
+        return decision(input);
+      },
+      handoff: async () => {
+        effects.push('handoff');
+        if (boundary === 'handoff') await pause();
+      },
+    });
+    try {
+      await within(entered.promise);
+      const token = await store.activeToken('server-1');
+      assert.ok(token);
+      ctrl.abort();
+      assert.equal(await within(running).catch(() => 'pending'), 'stopped');
+      assert.equal(
+        (await lstat(join(store.directory, 'scheduler-lease', 'generations', token, 'released'))).isDirectory(),
+        true,
+      );
+      const before = [...effects];
+      resume.resolve();
+      await within(completed.promise);
+      if (['get', 'read', 'decide', 'lock', 'record', 'handoff'].includes(boundary)) await within(assessment.promise);
+      assert.deepEqual(effects, before, 'no new decision, write, prompt or handoff after closure');
+      const saved = await requireEpisode(store);
+      if (boundary === 'record' || boundary === 'next') assert.equal(saved.quota_check_count, 1);
+      else if (boundary !== 'handoff') assert.deepEqual(saved, original);
+    } finally {
+      ctrl.abort();
+      resume.resolve();
+      await within(running).catch(() => {});
+    }
+  });
+}
+
+// Ownership loss in reconciliation must not masquerade as a reconnectable socket failure.
+for (const loss of ['session', 'ownership'] as const) {
+  test(`internal shutdown on reconciliation ${loss} loss precedes a pending handoff`, async () => {
+    const store = await base();
+    await store.record('w1:p1', episode('old-stop'));
+    const noticed = deferred<void>(),
+      resume = deferred<void>();
+    const ctrl = new AbortController();
+    let checks = 0;
+    const owned = store.owned.bind(store);
+    store.owned = async (...args) => (loss === 'ownership' ? false : owned(...args));
+    const reader = herdr();
+    reader.get = async () => pane({ agent_status: 'running' });
+    const running = runScheduler({
+      store,
+      herdr: reader,
+      decide: async (input) => decision(input),
+      targets: ['w1:p1'],
+      sessionId: 'server-1',
+      signal: ctrl.signal,
+      sessionValid: async () => loss !== 'session' || ++checks === 1,
+      handoff: async () => {
+        noticed.resolve();
+        await resume.promise;
+      },
+    });
+    try {
+      await within(noticed.promise);
+      assert.equal(await within(running).catch(() => 'pending'), 'stopped');
+      assert.equal(await store.active('server-1'), false);
+    } finally {
+      ctrl.abort();
+      resume.resolve();
+      await within(running).catch(() => {});
+    }
+  });
+}
+
+for (const failure of ['invalid session', 'rejected validation', 'denied heartbeat', 'rejected heartbeat'] as const) {
+  test(`timer shutdown ${failure} bypasses pending foreground work`, async () => {
+    const store = await base();
+    const original = episode((await observe(herdr(), 'w1:p1')).current_episode_id);
+    await store.record('w1:p1', original);
+    const deciding = deferred<void>(),
+      resume = deferred<void>(),
+      failed = deferred<void>();
+    const assessment = deferred<void>();
+    const ctrl = new AbortController();
+    let pending = false;
+    const heartbeat = store.heartbeat.bind(store);
+    store.heartbeat = async (...args) => {
+      if (pending && failure.endsWith('heartbeat')) {
+        failed.resolve();
+        if (failure === 'rejected heartbeat') throw new Error('synthetic-private-error');
+        return false;
+      }
+      return heartbeat(...args);
+    };
+    const lock = store.withEpisodeLock.bind(store);
+    store.withEpisodeLock = async (paneId, action) => {
+      const value = await lock(paneId, action);
+      if (pending) assessment.resolve();
+      return value;
+    };
+    const running = runScheduler({
+      store,
+      herdr: herdr(),
+      targets: ['w1:p1'],
+      sessionId: 'server-1',
+      signal: ctrl.signal,
+      clock: { now: () => now },
+      heartbeatIntervalMs: 5,
+      decide: async (input) => {
+        pending = true;
+        deciding.resolve();
+        await resume.promise;
+        return decision(input);
+      },
+      sessionValid: async () => {
+        if (pending && !failure.endsWith('heartbeat')) {
+          failed.resolve();
+          if (failure === 'rejected validation') throw new Error('synthetic-private-error');
+          return false;
+        }
+        return true;
+      },
+    });
+    try {
+      await within(deciding.promise);
+      await within(failed.promise);
+      assert.equal(await within(running).catch(() => 'pending'), 'stopped');
+      assert.equal(ctrl.signal.aborted, false);
+      resume.resolve();
+      await within(assessment.promise);
+      assert.deepEqual(await requireEpisode(store), original);
+    } finally {
+      ctrl.abort();
+      resume.resolve();
+      await within(running).catch(() => {});
+    }
+  });
+}
 
 // Catches accepting an expired lease as sufficient evidence that a living runner is gone.
 test('guarded takeover rejects a living owner even after heartbeat expiry', async () => {
   const store = await base();
-  const lease = await store.acquire('server-1');
-  const leaseFile = join(store.directory, 'scheduler-lease', 'owner.json');
-  const original = JSON.parse(await readFile(leaseFile, 'utf8'));
-  await import('node:fs/promises').then((m) => m.writeFile(leaseFile, JSON.stringify({ ...original, heartbeat: 1 })));
+  const lease = await requireLease(store);
+  const selector = join(store.directory, 'scheduler-lease', 'active.json');
+  const original = JSON.parse(await readFile(selector, 'utf8'));
+  const heartbeatPath = join(store.directory, 'scheduler-lease', 'generations', original.token, 'heartbeat.json');
+  const heartbeat = JSON.parse(await readFile(heartbeatPath, 'utf8'));
+  await writeFile(heartbeatPath, JSON.stringify({ ...heartbeat, heartbeat: 1 }));
   assert.equal(await store.acquire('server-1'), null);
   await store.release(lease);
 });
 
 // Catches never reclaiming a verified dead runner after the heartbeat expires.
 test('dead expired runner lease is reclaimed and due state is re-observed only', async () => {
-  const store = await base();
-  const token = await store.acquire('server-1');
-  const path = join(store.directory, 'scheduler-lease', 'owner.json');
-  await writeFile(path, JSON.stringify({ pid: 99999999, token, session: 'server-1', heartbeat: 1 }));
-  const { observeStop } = await import('../dist/src/herdr-adapter/observe.js');
-  const id = (await observeStop(herdr(), 'w1:p1')).current_episode_id;
+  const initial = await base();
+  const store = new EpisodeStore(initial.directory, undefined, { alive: (pid) => (pid === 4242 ? false : true) });
+  const token = await requireLease(store);
+  const root = join(store.directory, 'scheduler-lease');
+  const selectorPath = join(root, 'active.json');
+  const selected = JSON.parse(await readFile(selectorPath, 'utf8'));
+  const ownerPath = join(root, 'generations', token, 'owner.json');
+  const heartbeatPath = join(root, 'generations', token, 'heartbeat.json');
+  await writeFile(selectorPath, JSON.stringify({ ...selected, pid: 4242 }));
+  await writeFile(ownerPath, JSON.stringify({ ...selected, pid: 4242 }));
+  const heartbeat = JSON.parse(await readFile(heartbeatPath, 'utf8'));
+  await writeFile(heartbeatPath, JSON.stringify({ ...heartbeat, heartbeat: 1 }));
+  const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
   await store.record('w1:p1', episode(id));
   const ctrl = new AbortController();
+  const originalRecord = store.record.bind(store);
+  store.record = async (paneId, value) => {
+    await originalRecord(paneId, value);
+    if (value.quota_check_count === 1) ctrl.abort();
+  };
   let calls = 0;
   const fallback = setTimeout(() => ctrl.abort(), 1000);
   const result = runScheduler({
@@ -1356,7 +1868,6 @@ test('dead expired runner lease is reclaimed and due state is re-observed only',
     herdr: herdr(),
     decide: async (input) => {
       calls++;
-      ctrl.abort();
       return decision(input);
     },
     targets: ['w1:p1'],
@@ -1367,7 +1878,7 @@ test('dead expired runner lease is reclaimed and due state is re-observed only',
   assert.equal(await result, 'stopped');
   clearTimeout(fallback);
   assert.equal(calls, 1);
-  assert.equal((await store.retry('w1:p1')).quota_check_count, 1);
+  assert.equal((await requireEpisode(store)).quota_check_count, 1);
   assert.equal(await store.active('server-1'), false);
 });
 
@@ -1393,18 +1904,23 @@ test('precreated owned 0755 state directory is tightened before episode and leas
   await mkdir(directory);
   await chmod(directory, 0o755);
   const store = new EpisodeStore(directory);
-  await store.record('w1:p1', { ...episode('e1'), context: 'Bearer abcdefghijklmnopqrstuvwxyz' });
-  const token = await store.acquire('server-1');
+  const sensitiveEpisode = { ...episode('e1'), context: 'Bearer abcdefghijklmnopqrstuvwxyz' };
+  await store.record('w1:p1', sensitiveEpisode);
+  const token = await requireLease(store);
   try {
     assert.equal((await stat(directory)).mode & 0o777, 0o700);
-    const file = join(
-      directory,
-      (await readdir(directory)).find((name) => name.endsWith('.json')),
-    );
+    const file = await metadataPath(directory);
     assert.equal((await stat(file)).mode & 0o777, 0o600);
     assert.equal((await readFile(file, 'utf8')).includes('Bearer'), false);
-    assert.equal((await store.retry('w1:p1')).failure_episode_id, 'e1');
-    assert.equal((await stat(join(directory, 'scheduler-lease', 'owner.json'))).mode & 0o777, 0o600);
+    assert.equal((await requireEpisode(store)).failure_episode_id, 'e1');
+    const lease = join(directory, 'scheduler-lease');
+    const generation = join(lease, 'generations', token);
+    assert.equal((await stat(lease)).mode & 0o777, 0o700);
+    assert.equal((await stat(join(lease, 'generations'))).mode & 0o777, 0o700);
+    assert.equal((await stat(generation)).mode & 0o777, 0o700);
+    assert.equal((await stat(join(lease, 'active.json'))).mode & 0o777, 0o600);
+    assert.equal((await stat(join(generation, 'owner.json'))).mode & 0o777, 0o600);
+    assert.equal((await stat(join(generation, 'heartbeat.json'))).mode & 0o777, 0o600);
   } finally {
     await store.release(token);
   }
@@ -1443,15 +1959,13 @@ test('symlink state directory is rejected without following or changing its targ
 
 test('metadata is private, atomic, and excludes unapproved fields', async () => {
   const store = await base();
-  await store.record('w1:p1', {
+  const sensitiveEpisode = {
     ...episode('e1'),
     context: 'Bearer abcdefghijklmnopqrstuvwxyz',
     proposal: 'send this',
-  });
-  const file = join(
-    store.directory,
-    (await readdir(store.directory)).find((name) => name.endsWith('.json')),
-  );
+  };
+  await store.record('w1:p1', sensitiveEpisode);
+  const file = await metadataPath(store.directory);
   const raw = await readFile(file, 'utf8');
   assert.equal((await stat(file)).mode & 0o777, 0o600);
   assert.equal((await stat(store.directory)).mode & 0o777, 0o700);
@@ -1480,27 +1994,32 @@ test('server identity change stops supervision instead of acting on a replacemen
     onLease: began,
   });
   await ready;
-  const timeout = setTimeout(() => ctrl.abort(), 5200);
-  assert.equal(await result, 'stopped');
-  clearTimeout(timeout);
+  let abortFallbackTriggered = false;
+  const timeout = setTimeout(() => {
+    abortFallbackTriggered = true;
+    ctrl.abort();
+  }, 5200);
+  try {
+    assert.equal(await result, 'stopped');
+  } finally {
+    clearTimeout(timeout);
+  }
+  assert.equal(abortFallbackTriggered, false, 'server identity change must stop supervision before the abort fallback');
   assert.equal(checks, 2);
   assert.equal(await store.active('server-1'), false);
-});
+}, 10000);
 
 test('timer record corrupted after reconciliation causes bounded credential-free handoff rather than silent exit', async () => {
   const store = await base();
   const ctrl = new AbortController();
-  const handoffs = [];
+  const handoffs: HandoffReason[] = [];
   const next = store.next.bind(store);
   let interleaved = false;
   store.next = async (targets) => {
     if (!interleaved) {
       interleaved = true;
       await store.record('w1:p1', episode('timer'));
-      const path = join(
-        store.directory,
-        (await readdir(store.directory)).find((name) => name.endsWith('.json')),
-      );
+      const path = await metadataPath(store.directory);
       await writeFile(path, JSON.stringify({ ...episode('timer'), next_check_at: 'invalid-timer' }));
     }
     return next(targets);

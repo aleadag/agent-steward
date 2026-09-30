@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
 import process from 'node:process';
-import { postHttps } from './jev.js';
-import { readBoundedUtf8, readFileText } from './io.js';
-import { run } from './cli.js';
-import { launchForeground } from './process.js';
-import type { NativeLaunch } from './launch.js';
+import { postHttps } from './jev.ts';
+import { readBoundedUtf8, readFileText } from './io.ts';
+import { run } from './cli.ts';
+import { launchForeground } from './process.ts';
+import type { NativeLaunch } from './launch.ts';
 
 const runtime = {
   env: {

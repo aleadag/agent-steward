@@ -1,77 +1,86 @@
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { run, parseArgs, renderDecisionCard } from '../dist/src/cli.js';
-import { config, candidate, choiceAnswer, jevResponse, snapshot } from './helpers.mjs';
+import { run, parseArgs, renderDecisionCard } from '../src/cli.ts';
+import type { Runtime } from '../src/cli.ts';
+import type { Config, Evaluation, SelectedResult, StopInput } from '../src/contracts.ts';
+import type { HttpPost, Questions } from '../src/jev.ts';
+import type { NativeLaunch } from '../src/launch.ts';
+import { config, candidate, choiceAnswer, jevResponse, snapshot } from './helpers.ts';
+
+type JevWire = { model: string; state: unknown; questions: Questions };
+type PostAnswer = (wire: JevWire, index: number) => unknown;
 
 const CONFIG_PATH = '/isolated/xdg/agent-steward/config.json';
 const SNAPSHOT_PATH = '/isolated/xdg/agent-steward/quota.json';
 const NOW = new Date('2026-09-28T10:30:00Z');
 
-function runtime(overrides = {}) {
-  const out = [],
-    err = [],
-    reads = [],
-    launches = [];
+function runtime(overrides: Partial<Runtime> = {}) {
+  const out: string[] = [],
+    err: string[] = [],
+    reads: string[] = [],
+    launches: NativeLaunch[] = [];
   const { launch: launchOverride, ...ioOverrides } = overrides;
   const cfg = config({ accounts: [], candidates: [] });
-  return {
-    out,
-    err,
-    reads,
-    launches,
-    io: {
-      env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg' },
-      cwd: '/isolated/work',
-      terminal: { stdin: true, stdout: true },
-      readText: async (path) => {
-        reads.push(path);
-        return JSON.stringify(cfg);
-      },
-      readStdin: async () => JSON.stringify(stopInput()),
-      stdout: (text) => out.push(text),
-      stderr: (text) => err.push(text),
-      now: () => new Date(NOW),
-      newRequestId: () => 'generated-1',
-      post: async () => {
-        throw new Error('unexpected post');
-      },
-      launch: async (command) => {
-        launches.push(command);
-        if (launchOverride === undefined) throw new Error('unexpected launch');
-        return launchOverride(command);
-      },
-      ...ioOverrides,
+  const io: Runtime = {
+    env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg' },
+    cwd: '/isolated/work',
+    terminal: { stdin: true, stdout: true },
+    readText: async (path) => {
+      reads.push(path);
+      return JSON.stringify(cfg);
     },
+    readStdin: async () => JSON.stringify(stopInput()),
+    stdout: (text) => out.push(text),
+    stderr: (text) => err.push(text),
+    now: () => new Date(NOW),
+    newRequestId: () => 'generated-1',
+    post: async () => {
+      throw new Error('unexpected post');
+    },
+    launch: async (command) => {
+      launches.push(command);
+      if (launchOverride === undefined) throw new Error('unexpected launch');
+      return launchOverride(command);
+    },
+    ...ioOverrides,
   };
+  return { out, err, reads, launches, io };
 }
 
-function routeConfig(candidates = [candidate()], tools = [...new Set(candidates.map((item) => item.tool))]) {
+function routeConfig(
+  candidates = [candidate()],
+  tools: Config['tools'] = [...new Set(candidates.map((item) => item.tool))],
+) {
   return config({ tools, accounts: [{ id: 'shared', source: 'codex', snapshot: 'quota.json' }], candidates });
 }
 
-function fakePost(answerFor) {
-  const requests = [];
-  const post = async (request) => {
+function fakePost(answerFor: PostAnswer) {
+  const requests: { url: string; headers: Record<string, string>; body: string; signal: AbortSignal }[] = [];
+  const post = async (request: (typeof requests)[number]) => {
     requests.push(request);
-    const wire = JSON.parse(request.body);
+    const wire = JSON.parse(request.body) as JevWire;
     return { status: 200, body: JSON.stringify(answerFor(wire, requests.length)) };
   };
   return { post, requests };
 }
 
-function routeAnswer(wire, index = 1) {
+function routeAnswer(wire: JevWire, index = 1): unknown {
   const id = index === 1 ? 'pair' : 'effort';
-  const keys = Object.keys(wire.questions[id].criteria);
+  const question = wire.questions[id];
+  if (question?.type !== 'choice') throw new Error(`missing choice question: ${id}`);
+  const keys = Object.keys(question.criteria);
+  const firstKey = keys[0];
+  if (firstKey === undefined) throw new Error(`choice question has no options: ${id}`);
   const probabilities =
     keys.length === 1
-      ? { [keys[0]]: 1 }
+      ? { [firstKey]: 1 }
       : Object.fromEntries(keys.map((key, i) => [key, i === 0 ? 0.8 : 0.2 / (keys.length - 1)]));
   return jevResponse({ [id]: choiceAnswer(probabilities) });
 }
 
-const result = (out) => JSON.parse(out.join(''));
+const result = (out: string[]) => JSON.parse(out.join(''));
 
-function stopInput(overrides = {}) {
+function stopInput(overrides: Partial<StopInput> = {}): StopInput {
   return {
     schema_version: 2,
     request_id: 'request-1',
@@ -93,8 +102,10 @@ function stopInput(overrides = {}) {
   };
 }
 
-function stopAnswer(wire, waitingFor = 'recoverable_api_error', risk = 0.1, confidence = 0.9) {
-  const criteria = Object.keys(wire.questions.waiting_for.criteria);
+function stopAnswer(wire: JevWire, waitingFor = 'recoverable_api_error', risk = 0.1, confidence = 0.9): Evaluation {
+  const question = wire.questions['waiting_for'];
+  if (question?.type !== 'choice') throw new Error('missing waiting-for question');
+  const criteria = Object.keys(question.criteria);
   return jevResponse({
     waiting_for: choiceAnswer(Object.fromEntries(criteria.map((key) => [key, key === waitingFor ? 1 : 0])), confidence),
     risky: { type: 'noul', noul: risk },
@@ -304,7 +315,7 @@ test('parser preserves the standard task data boundary and rejects options and e
 test('help lists exactly implemented forms and requires no configuration or credentials', async () => {
   const { io, out, err, reads } = runtime({
     env: {
-      get TYPESAFE_API_KEY() {
+      get TYPESAFE_API_KEY(): string {
         throw new Error('help must not read credentials');
       },
     },
@@ -405,7 +416,7 @@ test('JSON route returns one complete schema-v1 result with a generated request 
   assert.equal(parsed.planned_command.runtime_selection, 'unverified');
   assert.equal(parsed.evaluations.effort.kind, 'fixed');
   assert.equal(out.length, 1);
-  assert.ok(out[0].endsWith('\n'));
+  assert.ok(out[0]?.endsWith('\n'));
   assert.deepEqual(err, []);
   assert.equal(requests.length, 1);
 });
@@ -441,11 +452,14 @@ test('pair choices remain independent across tools and chosen effort uses config
   assert.equal(result(out).selected.tool, 'pi');
   assert.equal(result(out).selected.thinking_level, 'minimal');
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].headers.authorization, 'Bearer test-key');
+  const request = requests[0];
+  assert.ok(request !== undefined);
+  assert.equal(request.headers.authorization, 'Bearer test-key');
 });
 
 test('fixed and selected effort use explicit safe human rendering', () => {
-  const selected = {
+  const selected: SelectedResult = {
+    schema_version: 1,
     request_id: 'id',
     decision: 'selected',
     selected: {
@@ -497,7 +511,7 @@ test('fixed and selected effort use explicit safe human rendering', () => {
 });
 
 test('stop JSON exits are proposal 0, manual review 2, no action 3, errors 1', async () => {
-  for (const [waitingFor, risk, status, decision, action, exit] of [
+  const outcomes: [string, number, StopInput['status'], string, string, number][] = [
     ['approve_command', 0.2, 'blocked', 'stop_decision', 'approve_request', 0],
     ['approve_edit', 0.6, 'blocked', 'stop_decision', 'manual_review', 2],
     ['other', 0.1, 'blocked', 'stop_decision', 'manual_review', 2],
@@ -505,7 +519,8 @@ test('stop JSON exits are proposal 0, manual review 2, no action 3, errors 1', a
     ['completed', 0.1, 'done', 'stop_decision', 'no_action', 3],
     ['recoverable_api_error', 0.1, 'blocked', 'stop_decision', 'send_recovery_instruction', 0],
     ['quota_limit', 0.1, 'blocked', 'stop_decision', 'wait_for_quota', 0],
-  ]) {
+  ];
+  for (const [waitingFor, risk, status, decision, action, exit] of outcomes) {
     const { post } = fakePost((wire) => stopAnswer(wire, waitingFor, risk));
     const { io, out, err } = runtime({
       env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
@@ -518,7 +533,7 @@ test('stop JSON exits are proposal 0, manual review 2, no action 3, errors 1', a
     assert.equal(result(out).decision, decision, waitingFor);
     assert.equal(result(out).proposed_action.kind, action, waitingFor);
     assert.equal(out.length, 1);
-    assert.ok(out[0].endsWith('\n'));
+    assert.ok(out[0]?.endsWith('\n'));
     assert.deepEqual(err, []);
   }
   const { io, out } = runtime({ readStdin: async () => '{' });
@@ -556,7 +571,8 @@ test('insufficient-context stop remains local without an API key or transport', 
 
 test('configured optional key is captured for local and early-error request-ID privacy', async () => {
   const apiKey = 'SyntheticKey-Not-Pattern-4f91';
-  const assertSafe = (out, err) => assert.equal((out.join('') + err.join('')).includes(apiKey), false);
+  const assertSafe = (out: string[], err: string[]) =>
+    assert.equal((out.join('') + err.join('')).includes(apiKey), false);
   const env = { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: apiKey };
 
   const local = runtime({
@@ -663,10 +679,11 @@ test('configured non-pattern key rejects generated and caller IDs containing it 
   const apiKey = 'SyntheticKey-Not-Pattern-4f91';
   const contaminatedId = `prefix-${apiKey}-suffix`;
   const env = { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: apiKey };
-  for (const [args, overrides, version] of [
+  const contaminatedCases: [string[], Partial<Runtime>, number][] = [
     [['session', 'start', 'task'], { newRequestId: () => contaminatedId }, 1],
     [['stop', 'check'], { readStdin: async () => JSON.stringify(stopInput({ request_id: contaminatedId })) }, 2],
-  ]) {
+  ];
+  for (const [args, overrides, version] of contaminatedCases) {
     const { io, out, err, reads } = runtime({
       ...overrides,
       env,
@@ -750,10 +767,11 @@ test('custom config, enabled-tool filtering, and quota diagnostics remain local 
 });
 
 test('stop input and configuration errors use v2; malformed argv remains generic v1', async () => {
-  for (const [overrides, reason] of [
+  const invalidStopCases: [Partial<Runtime>, string][] = [
     [{ readStdin: async () => '{' }, 'invalid_input'],
     [{ readText: async () => '{' }, 'invalid_config'],
-  ]) {
+  ];
+  for (const [overrides, reason] of invalidStopCases) {
     const { io, out } = runtime(overrides);
     assert.equal(await run(['stop', 'check'], io), 1);
     assert.equal(out.length, 1);
@@ -786,9 +804,10 @@ test('stop input and configuration errors use v2; malformed argv remains generic
 
 test('stop stdin retains the bounded byte and JSON-depth limits', async () => {
   let posts = 0;
-  let nestedContext = 'deep';
+  let nestedContext: unknown = 'deep';
   for (let index = 0; index < 64; index++) nestedContext = [nestedContext];
-  for (const body of ['x'.repeat(1_048_577), JSON.stringify(stopInput({ context: nestedContext }))]) {
+  const deepInput = { ...stopInput(), context: nestedContext };
+  for (const body of ['x'.repeat(1_048_577), JSON.stringify(deepInput)]) {
     const { io, out } = runtime({
       readStdin: async () => body,
       post: async () => {
@@ -952,7 +971,7 @@ test('human cards JSON-escape untrusted metadata and generated IDs are credentia
 
 test('API and malformed data errors are sanitized and preserve the safe ID', async () => {
   const cfg = routeConfig();
-  for (const [post, reason] of [
+  const postCases: [HttpPost, string][] = [
     [
       async () => {
         throw new Error('raw token and task leaked');
@@ -960,7 +979,8 @@ test('API and malformed data errors are sanitized and preserve the safe ID', asy
       'evaluation_failed',
     ],
     [async () => ({ status: 200, body: 'not json' }), 'invalid_response'],
-  ]) {
+  ];
+  for (const [post, reason] of postCases) {
     const { io, out, err } = runtime({
       env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
       readText: async (path) => (path === CONFIG_PATH ? JSON.stringify(cfg) : JSON.stringify(snapshot([]))),

@@ -1,44 +1,55 @@
-import test from 'node:test';
+import { afterEach, mock, spyOn, test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { route } from '../dist/src/routing.js';
-import { loadQuota } from '../dist/src/quota.js';
-import { makeEvaluator, validateEvaluation } from '../dist/src/jev.js';
-import { ResultSchema, StewardError } from '../dist/src/contracts.js';
-import { config, candidate, choice, evaluation, quotaFacts, snapshot, windowFact } from './helpers.mjs';
+import { route } from '../src/routing.ts';
+import { loadQuota } from '../src/quota.ts';
+import { makeEvaluator, validateEvaluation } from '../src/jev.ts';
+import { ResultSchema, StewardError } from '../src/contracts.ts';
+import type { Candidate, Config, QuotaFacts } from '../src/contracts.ts';
+import type { Evaluate, Questions } from '../src/jev.ts';
+import { config, candidate, choice, evaluation, quotaFacts, snapshot, windowFact, runSubcase } from './helpers.ts';
+
+afterEach(() => mock.restore());
 
 const task = 'Review parser';
 const fixedNow = new Date('2026-09-28T10:30:00Z');
 
 function routeInput(
-  cfg,
-  evaluate,
-  quota = new Map(
+  cfg: Config,
+  evaluate: Evaluate,
+  quota: Map<string, QuotaFacts> = new Map(
     cfg.candidates
       .filter((item) => cfg.tools.includes(item.tool))
-      .map((item) => [
-        item.id,
-        quotaFacts(item, {
-          source: cfg.accounts.find((account) => account.id === item.account_id)?.source ?? 'codex',
-        }),
-      ]),
+      .map(
+        (item) =>
+          [
+            item.id,
+            quotaFacts(item, {
+              source: cfg.accounts.find((account) => account.id === item.account_id)?.source ?? 'codex',
+            }),
+          ] as const,
+      ),
   ),
 ) {
   return { task, requestId: 'route-1', config: cfg, quota, evaluate };
 }
 
-function selectedPairAnswer(probabilities, confidence = 0.9, returned) {
+function hasCode(error: unknown, code: StewardError['code']): error is StewardError {
+  return error instanceof StewardError && error.code === code;
+}
+
+function selectedPairAnswer(probabilities: Record<string, number>, confidence = 0.9, returned?: string) {
   return evaluation({ pair: choice(probabilities, confidence, returned) });
 }
 
-function selectedEffortAnswer(probabilities, confidence = 0.9, returned) {
+function selectedEffortAnswer(probabilities: Record<string, number>, confidence = 0.9, returned?: string) {
   return evaluation({ effort: choice(probabilities, confidence, returned) });
 }
 
 function recordingPost() {
-  const requests = [];
-  const post = async (request) => {
+  const requests: Parameters<import('../src/jev.ts').HttpPost>[0][] = [];
+  const post: import('../src/jev.ts').HttpPost = async (request) => {
     requests.push(request);
-    const wire = JSON.parse(request.body);
+    const wire = JSON.parse(request.body) as { questions: Questions };
     const answers = Object.fromEntries(
       Object.entries(wire.questions).map(([id, question]) => {
         if (question.type === 'choice') {
@@ -84,7 +95,7 @@ test('winning low-confidence pair is not returned when effort fails', async () =
         return validateEvaluation(selectedPairAnswer({ 'codex-astra': 1 }, 0.01), questions);
       },
     }),
-    (e) => e.code === 'evaluation_failed',
+    (error) => hasCode(error, 'evaluation_failed'),
   );
   assert.equal(calls, 2);
 });
@@ -108,7 +119,7 @@ test('low-confidence winning pair and effort produce a complete selected result'
     ],
   });
   const cfg = config({ candidates: [codex, pi] });
-  const states = [];
+  const states: { state: unknown; questions: Questions }[] = [];
   const result = await route(
     routeInput(cfg, async (state, questions) => {
       states.push({ state, questions });
@@ -120,11 +131,18 @@ test('low-confidence winning pair and effort produce a complete selected result'
   );
 
   assert.equal(states.length, 2);
-  assert.deepEqual(Object.keys(states[0].questions.pair.criteria), ['codex-choice', 'pi-choice']);
-  assert.deepEqual(states[0].state.candidates[0].thinking_levels, codex.thinking_levels);
-  assert.deepEqual(states[0].state.candidates[1].thinking_levels, pi.thinking_levels);
-  assert.deepEqual(Object.keys(states[1].questions.effort.criteria), ['medium', 'high']);
-  assert.deepEqual(states[1].state, { task, candidate: pi, quota: quotaFacts(pi) });
+  const pairState = states[0];
+  const effortState = states[1];
+  assert.ok(pairState !== undefined && effortState !== undefined);
+  const pairQuestion = pairState.questions['pair'];
+  const effortQuestion = effortState.questions['effort'];
+  assert.ok(pairQuestion?.type === 'choice' && effortQuestion?.type === 'choice');
+  assert.deepEqual(Object.keys(pairQuestion.criteria), ['codex-choice', 'pi-choice']);
+  const pairInput = pairState.state as { candidates: Candidate[] };
+  assert.deepEqual(pairInput.candidates[0]?.thinking_levels, codex.thinking_levels);
+  assert.deepEqual(pairInput.candidates[1]?.thinking_levels, pi.thinking_levels);
+  assert.deepEqual(Object.keys(effortQuestion.criteria), ['medium', 'high']);
+  assert.deepEqual(effortState.state, { task, candidate: pi, quota: quotaFacts(pi) });
   assert.equal(result.decision, 'selected');
   assert.equal(result.request_id, 'route-1');
   assert.deepEqual(result.selected, {
@@ -144,12 +162,18 @@ test('low-confidence winning pair and effort produce a complete selected result'
     '--thinking',
     'medium',
   ]);
-  assert.equal(result.evaluations.pair.answers.pair.confidence, 0.01);
+  const pairAnswer = result.evaluations.pair.answers['pair'];
+  assert.ok(pairAnswer?.type === 'choice');
+  assert.equal(pairAnswer.confidence, 0.01);
   assert.equal(result.evaluations.pair.model, 'jev-1.13.0');
   assert.deepEqual(result.evaluations.pair.usage, { input_tokens: 12, output_tokens: 3 });
-  assert.equal(result.evaluations.effort.answers.effort.confidence, 0.02);
-  assert.equal(result.evaluations.effort.model, 'jev-1.13.0');
-  assert.deepEqual(result.evaluations.effort.usage, { input_tokens: 12, output_tokens: 3 });
+  const effortEvaluation = result.evaluations.effort;
+  assert.ok(!('kind' in effortEvaluation));
+  const effortAnswer = effortEvaluation.answers['effort'];
+  assert.ok(effortAnswer?.type === 'choice');
+  assert.equal(effortAnswer.confidence, 0.02);
+  assert.equal(effortEvaluation.model, 'jev-1.13.0');
+  assert.deepEqual(effortEvaluation.usage, { input_tokens: 12, output_tokens: 3 });
   assert.equal(ResultSchema.safeParse(result).success, true);
   assert.deepEqual(Object.keys(result).sort(), [
     'decision',
@@ -276,8 +300,10 @@ test('known quota freshness, source, and unverified command flags survive select
   assert.equal(result.quota.snapshot_status, 'loaded');
   assert.equal(result.quota.account_status, 'known');
   assert.equal(result.quota.pool_status, 'known');
-  assert.equal(result.quota.windows[1].remaining_percent, 37);
-  assert.equal(result.quota.windows[1].observed_at, '2026-09-28T10:00:00Z');
+  const poolWindow = result.quota.windows[1];
+  assert.ok(poolWindow !== undefined);
+  assert.equal(poolWindow.remaining_percent, 37);
+  assert.equal(poolWindow.observed_at, '2026-09-28T10:00:00Z');
   assert.equal(result.planned_command.syntax_validated, true);
   assert.equal(result.planned_command.runtime_selection, 'unverified');
   assert.equal(result.planned_command.authentication, 'unverified');
@@ -320,24 +346,26 @@ test('256 enabled candidates fail before evaluator invocation', async () => {
     route(
       routeInput(config({ candidates }), async () => {
         calls++;
+        return evaluation({});
       }),
     ),
-    (error) => error.code === 'invalid_config',
+    (error) => hasCode(error, 'invalid_config'),
   );
   assert.equal(calls, 0);
 });
 
-test('empty inventory and no enabled tools fail without selection', async (t) => {
+test('empty inventory and no enabled tools fail without selection', async () => {
   for (const cfg of [config({ candidates: [] }), config({ tools: [], candidates: [candidate()] })]) {
-    await t.test('rejects empty enabled inventory', async () => {
+    await runSubcase('rejects empty enabled inventory', async () => {
       let calls = 0;
       await assert.rejects(
         route(
           routeInput(cfg, async () => {
             calls++;
+            return evaluation({});
           }),
         ),
-        (error) => error.code === 'invalid_config',
+        (error) => hasCode(error, 'invalid_config'),
       );
       assert.equal(calls, 0);
     });
@@ -348,7 +376,7 @@ test('disabled candidates are excluded without fallback or syntax validation', a
   const disabled = candidate({ id: 'disabled', tool: 'codex', model: '--not-a-model' });
   const enabled = candidate({ id: 'enabled', tool: 'pi', provider: 'openai-codex' });
   const cfg = config({ tools: ['pi'], candidates: [disabled, enabled] });
-  let call;
+  let call: { state: unknown; questions: Questions } | undefined;
   const result = await route(
     routeInput(cfg, async (state, questions) => {
       call = { state, questions };
@@ -356,29 +384,34 @@ test('disabled candidates are excluded without fallback or syntax validation', a
     }),
   );
 
-  assert.deepEqual(Object.keys(call.questions.pair.criteria), ['enabled']);
+  assert.ok(call !== undefined);
+  const pairQuestion = call.questions['pair'];
+  assert.ok(pairQuestion?.type === 'choice');
+  assert.deepEqual(Object.keys(pairQuestion.criteria), ['enabled']);
+  const pairState = call.state as { candidates: Candidate[] };
   assert.deepEqual(
-    call.state.candidates.map((item) => item.id),
+    pairState.candidates.map((item) => item.id),
     ['enabled'],
   );
   assert.equal(result.selected.candidate_id, 'enabled');
 });
 
-test('empty levels and missing quota facts fail before evaluator invocation', async (t) => {
-  await t.test('rejects raw candidate with no levels', async () => {
+test('empty levels and missing quota facts fail before evaluator invocation', async () => {
+  await runSubcase('rejects raw candidate with no levels', async () => {
     const cfg = config({ candidates: [candidate({ thinking_levels: [] })] });
     let calls = 0;
     await assert.rejects(
       route(
         routeInput(cfg, async () => {
           calls++;
+          return evaluation({});
         }),
       ),
-      (error) => error.code === 'invalid_config',
+      (error) => hasCode(error, 'invalid_config'),
     );
     assert.equal(calls, 0);
   });
-  await t.test('rejects absent quota map entry', async () => {
+  await runSubcase('rejects absent quota map entry', async () => {
     const cfg = config();
     let calls = 0;
     await assert.rejects(
@@ -387,11 +420,12 @@ test('empty levels and missing quota facts fail before evaluator invocation', as
           cfg,
           async () => {
             calls++;
+            return evaluation({});
           },
           new Map(),
         ),
       ),
-      (error) => error.code === 'invalid_config',
+      (error) => hasCode(error, 'invalid_config'),
     );
     assert.equal(calls, 0);
   });
@@ -406,9 +440,10 @@ test('unsupported syntax on any enabled candidate fails before evaluator call', 
     route(
       routeInput(cfg, async () => {
         calls++;
+        return evaluation({});
       }),
     ),
-    (error) => error.code === 'invalid_config',
+    (error) => hasCode(error, 'invalid_config'),
   );
   assert.equal(calls, 0);
 });
@@ -429,13 +464,13 @@ test('routing itself rejects an injected malformed first-stage unknown pair', as
         });
       }),
     ),
-    (error) => error.code === 'invalid_response',
+    (error) => hasCode(error, 'invalid_response'),
   );
   assert.equal(calls, 1);
 });
 
-test('injected evaluator answers are revalidated at both route stages', async (t) => {
-  await t.test('rejects an unknown pair selection', async () => {
+test('injected evaluator answers are revalidated at both route stages', async () => {
+  await runSubcase('rejects an unknown pair selection', async () => {
     const cfg = config();
     await assert.rejects(
       route(
@@ -453,10 +488,10 @@ test('injected evaluator answers are revalidated at both route stages', async (t
           ),
         ),
       ),
-      (error) => error.code === 'invalid_response',
+      (error) => hasCode(error, 'invalid_response'),
     );
   });
-  await t.test('rejects an unknown effort selection', async () => {
+  await runSubcase('rejects an unknown effort selection', async () => {
     const cfg = config({
       candidates: [
         candidate({
@@ -484,7 +519,7 @@ test('injected evaluator answers are revalidated at both route stages', async (t
               });
         }),
       ),
-      (error) => error.code === 'invalid_response',
+      (error) => hasCode(error, 'invalid_response'),
     );
     assert.equal(calls, 2);
   });
@@ -518,41 +553,42 @@ test('invalid second-stage response rejects instead of returning partial selecti
             });
       }),
     ),
-    (error) => error.code === 'invalid_response',
+    (error) => hasCode(error, 'invalid_response'),
   );
   assert.equal(calls, 2);
 });
 
-test('task and request ID must be nonempty', async (t) => {
+test('task and request ID must be nonempty', async () => {
   for (const input of [
     { task: '  ', requestId: 'route-1' },
     { task, requestId: '' },
   ]) {
-    await t.test('rejects blank route input before evaluation', async () => {
+    await runSubcase('rejects blank route input before evaluation', async () => {
       let calls = 0;
       await assert.rejects(
         route({
           ...routeInput(config(), async () => {
             calls++;
+            return evaluation({});
           }),
           ...input,
         }),
-        (error) => error.code === 'invalid_input',
+        (error) => hasCode(error, 'invalid_input'),
       );
       assert.equal(calls, 0);
     });
   }
 });
 
-test('real evaluator rejects recognizable credentials in every routed field before posting', async (t) => {
+test('real evaluator rejects recognizable credentials in every routed field before posting', async () => {
   const secret = 'steward-test-key-9f4c2';
-  const scenarios = [
+  const scenarios: [string, (cfg: Config) => { cfg: Config; task?: string }][] = [
     ['task', (cfg) => ({ cfg, task: `Review ${secret}` })],
-    ['capability', (cfg) => ({ cfg: config({ candidates: [candidate({ capabilities: `Uses ${secret}` })] }) })],
-    ['candidate ID', (cfg) => ({ cfg: config({ candidates: [candidate({ id: `key=${secret}` })] }) })],
+    ['capability', (_cfg) => ({ cfg: config({ candidates: [candidate({ capabilities: `Uses ${secret}` })] }) })],
+    ['candidate ID', (_cfg) => ({ cfg: config({ candidates: [candidate({ id: `key=${secret}` })] }) })],
     [
       'unchosen effort description',
-      (cfg) => ({
+      (_cfg) => ({
         cfg: config({
           candidates: [
             candidate({
@@ -567,7 +603,7 @@ test('real evaluator rejects recognizable credentials in every routed field befo
     ],
     [
       'selected effort description',
-      (cfg) => ({
+      (_cfg) => ({
         cfg: config({
           candidates: [
             candidate({
@@ -583,14 +619,14 @@ test('real evaluator rejects recognizable credentials in every routed field befo
   ];
 
   for (const [label, setup] of scenarios) {
-    await t.test(label, async () => {
+    await runSubcase(label, async () => {
       const original = config();
       const { cfg, task: routedTask = task } = setup(original);
       const { post, requests } = recordingPost();
       const evaluate = makeEvaluator({ model: 'jev-1.13.0', apiKey: secret, post });
       await assert.rejects(
         route({ ...routeInput(cfg, evaluate), task: routedTask }),
-        (error) => error.code === 'credential_detected' && !error.message.includes(secret),
+        (error) => hasCode(error, 'credential_detected') && !error.message.includes(secret),
       );
       assert.equal(requests.length, 0);
       assert.equal(JSON.stringify(requests).includes(secret), false);
@@ -598,7 +634,7 @@ test('real evaluator rejects recognizable credentials in every routed field befo
   }
 });
 
-test('real evaluator stage-two timeout aborts atomically without a partial route', async (t) => {
+test('real evaluator stage-two timeout aborts atomically without a partial route', async () => {
   const cfg = config({
     candidates: [
       candidate({
@@ -609,15 +645,15 @@ test('real evaluator stage-two timeout aborts atomically without a partial route
       }),
     ],
   });
-  const deadlines = [];
-  let resolveSecondStarted;
-  const secondStarted = new Promise((resolve) => {
+  const deadlines: { milliseconds: number; controller: AbortController }[] = [];
+  let resolveSecondStarted: (() => void) | undefined;
+  const secondStarted = new Promise<void>((resolve) => {
     resolveSecondStarted = resolve;
   });
   let calls = 0;
   let returned = false;
   const upstreamFailure = 'synthetic-upstream-and-request-body-marker';
-  t.mock.method(AbortSignal, 'timeout', (milliseconds) => {
+  spyOn(AbortSignal, 'timeout').mockImplementation((milliseconds) => {
     const controller = new AbortController();
     deadlines.push({ milliseconds, controller });
     return controller.signal;
@@ -632,6 +668,7 @@ test('real evaluator stage-two timeout aborts atomically without a partial route
           status: 200,
           body: JSON.stringify(evaluation({ pair: choice({ 'codex-astra': 1 }) })),
         });
+      if (resolveSecondStarted === undefined) throw new Error('second evaluation signal is not ready');
       resolveSecondStarted();
       return new Promise((_resolve, reject) => {
         request.signal.addEventListener('abort', () => reject(new Error(`${upstreamFailure}:${request.body}`)), {
@@ -651,11 +688,13 @@ test('real evaluator stage-two timeout aborts atomically without a partial route
     deadlines.map((deadline) => deadline.milliseconds),
     [30_000, 30_000],
   );
-  deadlines[1].controller.abort();
+  const secondDeadline = deadlines[1];
+  assert.ok(secondDeadline !== undefined);
+  secondDeadline.controller.abort();
   await assert.rejects(
     pending,
     (error) =>
-      error.code === 'evaluation_failed' &&
+      hasCode(error, 'evaluation_failed') &&
       !error.message.includes(upstreamFailure) &&
       !error.message.includes('unit-key-not-live'),
   );
@@ -684,7 +723,7 @@ test('real evaluator rejects a planted credential in an effort-stage payload loc
         criteria: { low: null, high: null },
       },
     }),
-    (error) => error.code === 'credential_detected' && !error.message.includes(secret),
+    (error) => hasCode(error, 'credential_detected') && !error.message.includes(secret),
   );
   assert.equal(requests.length, 0);
   assert.equal(JSON.stringify(requests).includes(secret), false);

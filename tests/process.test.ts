@@ -1,50 +1,68 @@
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { delimiter } from 'node:path';
-import { launchForeground } from '../dist/src/process.js';
-import { StewardError } from '../dist/src/contracts.js';
+import { launchForeground } from '../src/process.ts';
+import { StewardError } from '../src/contracts.ts';
+import type { NativeLaunch } from '../src/launch.ts';
+import { runSubcase } from './helpers.ts';
 
-const command = {
+type SpawnedChild = ReturnType<typeof import('node:child_process').spawn>;
+type FakeChild = EventEmitter & { kill: (signal: NodeJS.Signals) => boolean };
+type SpawnCall = [string, readonly string[] | undefined, unknown];
+
+const command: NativeLaunch = {
   executable: 'pi',
   args: ['--model', 'fast', '--', 'User task:\nReview the parser'],
 };
-const env = {
+const env: NodeJS.ProcessEnv = {
   TYPESAFE_API_KEY: 'SyntheticKey-Not-Real',
   typesafe_api_key: 'SyntheticCaseVariant-Not-Real',
   OPENAI_API_KEY: 'SyntheticProviderKey-Not-Real',
   PATH: '/trusted/bin',
 };
 
-function fakeChild() {
-  const child = new EventEmitter();
-  const kills = [];
-  child.kill = (signal) => {
-    kills.push(signal);
-    return true;
-  };
+function fakeChild(): { child: FakeChild; kills: NodeJS.Signals[] } {
+  const kills: NodeJS.Signals[] = [];
+  const child = Object.assign(new EventEmitter(), {
+    kill: (signal: NodeJS.Signals) => {
+      kills.push(signal);
+      return true;
+    },
+  });
   return { child, kills };
 }
 
-function fakeSignals() {
+function fakeSignals(): EventEmitter {
   return new EventEmitter();
 }
 
-function launchWith(child, options = {}) {
-  const calls = [];
+function asSpawnedChild(child: FakeChild): SpawnedChild {
+  return child as unknown as SpawnedChild;
+}
+
+function asSpawnImpl(
+  implementation: (executable: string, args: readonly string[] | undefined, options: unknown) => SpawnedChild,
+): typeof import('node:child_process').spawn {
+  // launchForeground calls the three-argument spawn overload; Node types expose spawn as several overloads.
+  return implementation as unknown as typeof import('node:child_process').spawn;
+}
+
+function launchWith(child: FakeChild, options: { signalSource?: EventEmitter } = {}) {
+  const calls: SpawnCall[] = [];
   const promise = launchForeground(command, {
     cwd: '/isolated/work',
     env,
     signalSource: options.signalSource ?? fakeSignals(),
-    spawnImpl: (...args) => {
-      calls.push(args);
-      return child;
-    },
+    spawnImpl: asSpawnImpl((executable, args, spawnOptions) => {
+      calls.push([executable, args, spawnOptions]);
+      return asSpawnedChild(child);
+    }),
   });
   return { promise, calls };
 }
 
-function assertLaunchFailed(promise, forbidden = []) {
+function assertLaunchFailed(promise: Promise<number>, forbidden: readonly string[] = []) {
   return assert.rejects(promise, (error) => {
     assert.ok(error instanceof StewardError);
     assert.equal(error.code, 'launch_failed');
@@ -59,9 +77,9 @@ test('launch uses fixed argv, inherited terminal, caller cwd and filtered enviro
   const { promise, calls } = launchWith(child);
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0][0], 'pi');
-  assert.deepEqual(calls[0][1], ['--model', 'fast', '--', 'User task:\nReview the parser']);
-  assert.deepEqual(calls[0][2], {
+  assert.equal(calls[0]![0], 'pi');
+  assert.deepEqual(calls[0]![1], ['--model', 'fast', '--', 'User task:\nReview the parser']);
+  assert.deepEqual(calls[0]![2], {
     cwd: '/isolated/work',
     env: { OPENAI_API_KEY: 'SyntheticProviderKey-Not-Real', PATH: '/trusted/bin' },
     stdio: 'inherit',
@@ -71,26 +89,26 @@ test('launch uses fixed argv, inherited terminal, caller cwd and filtered enviro
   assert.equal(await promise, 0);
 });
 
-test('missing, empty and relative PATH components fail before spawning', async (t) => {
-  const unsafePaths = [
+test('missing, empty and relative PATH components fail before spawning', async () => {
+  const unsafePaths: [string, string | undefined][] = [
     ['missing PATH', undefined],
     ['empty PATH', ''],
     ['empty PATH entry', `${delimiter}/trusted/bin`],
     ['relative PATH entry', `./bin${delimiter}/trusted/bin`],
   ];
   for (const [name, path] of unsafePaths) {
-    await t.test(name, async () => {
+    await runSubcase(name, async () => {
       let calls = 0;
-      const badEnv = { ...env };
+      const badEnv: NodeJS.ProcessEnv = { ...env };
       if (path === undefined) delete badEnv.PATH;
       else badEnv.PATH = path;
       const promise = launchForeground(command, {
         cwd: '/isolated/work',
         env: badEnv,
-        spawnImpl: () => {
+        spawnImpl: asSpawnImpl(() => {
           calls += 1;
-          return fakeChild().child;
-        },
+          return asSpawnedChild(fakeChild().child);
+        }),
       });
       await assertLaunchFailed(promise, [path || 'PATH']);
       assert.equal(calls, 0);
@@ -106,13 +124,14 @@ test('child exit status is returned without another spawn', async () => {
   assert.equal(calls.length, 1);
 });
 
-test('signaled child exits return defined nonzero shell statuses', async (t) => {
-  for (const [signal, status] of [
+test('signaled child exits return defined nonzero shell statuses', async () => {
+  const signaledStatuses: [NodeJS.Signals, number][] = [
     ['SIGINT', 130],
     ['SIGTERM', 143],
     ['SIGHUP', 1],
-  ]) {
-    await t.test(signal, async () => {
+  ];
+  for (const [signal, status] of signaledStatuses) {
+    await runSubcase(signal, async () => {
       const { child } = fakeChild();
       const { promise, calls } = launchWith(child);
       child.emit('exit', null, signal);

@@ -1,10 +1,10 @@
 import https from 'node:https';
 import type { ClientRequest } from 'node:http';
-import type { Evaluation } from './contracts.js';
-import { EvaluationSchema, StewardError } from './contracts.js';
-import { assertByteLength, assertJsonDepth, LimitError } from './limits.js';
-import { readBoundedUtf8 } from './io.js';
-import { assertNoCredentials } from './privacy.js';
+import type { Evaluation } from './contracts.ts';
+import { EvaluationSchema, StewardError } from './contracts.ts';
+import { assertByteLength, assertJsonDepth, LimitError } from './limits.ts';
+import { readBoundedUtf8 } from './io.ts';
+import { assertNoCredentials } from './privacy.ts';
 
 export type ChoiceQuestion = {
   type: 'choice';
@@ -18,7 +18,7 @@ export type NoulQuestion = {
 };
 export type Question = ChoiceQuestion | NoulQuestion;
 export type Questions = Record<string, Question>;
-export type { ChoiceAnswer, NoulAnswer, Evaluation } from './contracts.js';
+export type { ChoiceAnswer, NoulAnswer, Evaluation } from './contracts.ts';
 export type Evaluate = (state: unknown, questions: Questions) => Promise<Evaluation>;
 export type HttpPost = (request: {
   url: string;
@@ -170,7 +170,7 @@ export function validateEvaluation(raw: unknown, questions: Questions): Evaluati
 }
 
 export function choiceWinner(
-  answer: import('./contracts.js').ChoiceAnswer,
+  answer: import('./contracts.ts').ChoiceAnswer,
   order: readonly string[],
 ): {
   winner: string;

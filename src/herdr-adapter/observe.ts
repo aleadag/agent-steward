@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
-import { assertNoCredentials } from '../privacy.js';
+import { assertNoCredentials } from '../privacy.ts';
 
 export type AgentSnapshot = {
   pane_id: string;

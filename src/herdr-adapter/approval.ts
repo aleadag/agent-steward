@@ -1,6 +1,6 @@
-import type { StopResult } from '../contracts.js';
-import type { HerdrControl } from './deliver.js';
-import type { ObservedStop } from './observe.js';
+import type { StopResult } from '../contracts.ts';
+import type { HerdrControl } from './deliver.ts';
+import type { ObservedStop } from './observe.ts';
 
 // A future proof must bind the native request ID, action, occupant and exact
 // accepting UI control. Neither Herdr's lifecycle status nor detection text

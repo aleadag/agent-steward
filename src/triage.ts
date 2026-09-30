@@ -1,12 +1,12 @@
 import { z } from 'zod';
-import { approvalPolicy } from './approval.js';
-import { StopInputSchema, StopResultSchema, StewardError } from './contracts.js';
-import type { Config, Evaluation, StopInput, StopResult } from './contracts.js';
-import { assertJsonDepth } from './limits.js';
-import { choiceWinner, validateEvaluation } from './jev.js';
-import type { Evaluate, Questions } from './jev.js';
-import { assertNoCredentials } from './privacy.js';
-import { retryProposal } from './retry.js';
+import { approvalPolicy } from './approval.ts';
+import { StopInputSchema, StopResultSchema, StewardError } from './contracts.ts';
+import type { Config, Evaluation, StopInput, StopResult } from './contracts.ts';
+import { assertJsonDepth } from './limits.ts';
+import { choiceWinner, validateEvaluation } from './jev.ts';
+import type { Evaluate, Questions } from './jev.ts';
+import { assertNoCredentials } from './privacy.ts';
+import { retryProposal } from './retry.ts';
 
 export const WAITING_FOR = [
   'approve_command',

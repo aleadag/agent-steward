@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { StopInputSchema, StopResultSchema } from '../contracts.js';
-import type { StopInput, StopResult } from '../contracts.js';
-import { observeStop } from './observe.js';
-import type { HerdrReader, ObservedStop } from './observe.js';
-import type { Episode, EpisodeStore } from './state.js';
+import { StopInputSchema, StopResultSchema } from '../contracts.ts';
+import type { StopInput, StopResult } from '../contracts.ts';
+import { observeStop } from './observe.ts';
+import type { HerdrReader, ObservedStop } from './observe.ts';
+import type { Episode, EpisodeStore } from './state.ts';
 
 export type HerdrControl = HerdrReader & { prompt: (paneId: string, text: string) => Promise<void> };
 export type Clock = { now: () => Date };
@@ -29,15 +29,23 @@ export async function deliverProposal(
   decide: (input: StopInput) => Promise<StopResult>,
   stillOwner: () => Promise<boolean>,
   alreadyLocked = false,
+  admissionOpen: () => boolean = () => true,
 ): Promise<DeliveryOutcome> {
-  if (!alreadyLocked)
+  if (!admissionOpen()) return 'human';
+  if (!alreadyLocked) {
+    if (!admissionOpen()) return 'human';
     return (
       (await episode.withEpisodeLock(observation.pane_id, () =>
-        deliverProposal(herdr, observation, proposal, episode, clock, decide, stillOwner, true),
+        deliverProposal(herdr, observation, proposal, episode, clock, decide, stillOwner, true, admissionOpen),
       )) ?? 'human'
     );
+  }
+  if (!admissionOpen()) return 'human';
   const record = await episode.retry(observation.pane_id);
-  if (!record || !sameEpisode(observation, record) || !(await stillOwner())) return 'human';
+  if (!admissionOpen()) return 'human';
+  if (!record || !sameEpisode(observation, record)) return 'human';
+  const ownsEpisode = await stillOwner();
+  if (!admissionOpen() || !ownsEpisode) return 'human';
   if (record.last_delivery_state !== 'none')
     return record.last_delivery_state === 'delivered'
       ? 'delivered'
@@ -54,9 +62,12 @@ export async function deliverProposal(
   const now = clock.now();
   if (!Number.isFinite(now.getTime())) return 'human';
   if (now.getTime() < Date.parse(action.not_before)) {
-    if (!(await stillOwner())) return 'human';
+    if (!admissionOpen()) return 'human';
+    const stillAuthorized = await stillOwner();
+    if (!admissionOpen() || !stillAuthorized) return 'human';
+    if (!admissionOpen()) return 'human';
     await episode.record(observation.pane_id, { ...record, next_check_at: action.not_before });
-    return 'wait';
+    return admissionOpen() ? 'wait' : 'human';
   }
   // A blocked UI may be a permission dialog; neither a classifier nor a
   // screen excerpt proves a non-approval dismissal for Pi or Codex.
@@ -66,6 +77,7 @@ export async function deliverProposal(
   } catch {
     return 'human';
   }
+  if (!admissionOpen()) return 'human';
   if (
     !fresh ||
     fresh.status !== 'idle' ||
@@ -93,11 +105,13 @@ export async function deliverProposal(
   });
   if (!input.success) return 'human';
   let decision: StopResult;
+  if (!admissionOpen()) return 'human';
   try {
     decision = StopResultSchema.parse(await decide(input.data));
   } catch {
     return 'human';
   }
+  if (!admissionOpen()) return 'human';
   if (
     decision.decision !== 'stop_decision' ||
     decision.request_id !== input.data.request_id ||
@@ -107,22 +121,27 @@ export async function deliverProposal(
   )
     return 'human';
   let immediatelyBefore: ObservedStop | null;
+  if (!admissionOpen()) return 'human';
   try {
     immediatelyBefore = await observeStop(herdr, observation.pane_id);
   } catch {
     return 'human';
   }
+  if (!admissionOpen()) return 'human';
   if (
     !immediatelyBefore ||
     immediatelyBefore.status !== 'idle' ||
     !sameEpisode(immediatelyBefore, record) ||
     immediatelyBefore.revision !== fresh.revision ||
-    immediatelyBefore.state_change_seq !== fresh.state_change_seq ||
-    !(await stillOwner())
+    immediatelyBefore.state_change_seq !== fresh.state_change_seq
   )
     return 'human';
+  if (!admissionOpen()) return 'human';
+  const stillAuthorized = await stillOwner();
+  if (!admissionOpen() || !stillAuthorized) return 'human';
   // Persist the ambiguous outcome BEFORE submission. A timeout, stalled response,
   // process crash or lost acknowledgment after the write can never trigger a resend.
+  if (!admissionOpen()) return 'human';
   await episode.record(observation.pane_id, {
     ...record,
     next_check_at: null,
@@ -130,13 +149,19 @@ export async function deliverProposal(
     last_attempt_at: now.toISOString(),
     last_delivery_state: 'uncertain',
   });
-  if (!(await stillOwner())) return 'uncertain';
+  if (!admissionOpen()) return 'uncertain';
+  const stillAuthorizedBeforePrompt = await stillOwner();
+  if (!admissionOpen() || !stillAuthorizedBeforePrompt) return 'uncertain';
+  if (!admissionOpen()) return 'uncertain';
   try {
     await herdr.prompt(observation.pane_id, action.instruction);
   } catch {
     return 'uncertain';
   }
-  if (!(await stillOwner())) return 'uncertain';
+  if (!admissionOpen()) return 'uncertain';
+  const stillAuthorizedAfterPrompt = await stillOwner();
+  if (!admissionOpen() || !stillAuthorizedAfterPrompt) return 'uncertain';
+  if (!admissionOpen()) return 'uncertain';
   try {
     await episode.record(observation.pane_id, {
       ...record,
@@ -148,5 +173,5 @@ export async function deliverProposal(
   } catch {
     return 'uncertain';
   }
-  return 'delivered';
+  return admissionOpen() ? 'delivered' : 'uncertain';
 }

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { compareRfc3339Timestamps } from './timestamps.js';
+import { compareRfc3339Timestamps } from './timestamps.ts';
 
 const text = z
   .string()

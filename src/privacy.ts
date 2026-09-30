@@ -1,5 +1,5 @@
-import { StewardError } from './contracts.js';
-import { assertJsonDepth } from './limits.js';
+import { StewardError } from './contracts.ts';
+import { assertJsonDepth } from './limits.ts';
 
 const patterns = [
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
