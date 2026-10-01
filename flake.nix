@@ -24,7 +24,7 @@
               ${lib.optionalString pkgs.stdenv.hostPlatform.isDarwin "-lproc"} \
               -o "$out/bin/process-path"
           '';
-          psPath = if pkgs.stdenv.hostPlatform.isDarwin then "/bin/ps" else "${pkgs.procps}/bin/ps";
+          psPath = if pkgs.stdenv.hostPlatform.isDarwin then "${pkgs.darwin.ps}/bin/ps" else "${pkgs.procps}/bin/ps";
       fetchedBunDeps = map (dep:
         let
           parts = lib.splitString "/" dep.name;

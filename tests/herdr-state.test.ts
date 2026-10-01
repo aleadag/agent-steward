@@ -1338,7 +1338,28 @@ test('slow CLI result cannot mutate state after lease expires under a fake clock
 // than 15s in fake wall time must not disable the visible runner's lease.
 test('visible runner renews its lease during a slow CLI evaluation', async () => {
   let milliseconds = Date.now();
-  const store = new EpisodeStore(await mkdtemp(join(tmpdir(), 'steward-heartbeat-')), () => milliseconds);
+  const heldRenames = [deferred<void>(), deferred<void>()] as const;
+  const releaseRenames = [deferred<void>(), deferred<void>()] as const;
+  let holdTimerRenames = false;
+  let heldRenameCount = 0;
+  const store = new EpisodeStore(await mkdtemp(join(tmpdir(), 'steward-heartbeat-')), () => milliseconds, {
+    io: {
+      rename: async (from, to) => {
+        if (holdTimerRenames && heldRenameCount < heldRenames.length && to.endsWith('/heartbeat.json')) {
+          const index = heldRenameCount++;
+          if (index === 0) {
+            heldRenames[0].resolve();
+            await releaseRenames[0].promise;
+          } else {
+            holdTimerRenames = false;
+            heldRenames[1].resolve();
+            await releaseRenames[1].promise;
+          }
+        }
+        await rename(from, to);
+      },
+    },
+  });
   const id = (await observe(herdr(), 'w1:p1')).current_episode_id;
   await store.record('w1:p1', episode(id));
   const ctrl = new AbortController();
@@ -1351,6 +1372,31 @@ test('visible runner renews its lease during a slow CLI evaluation', async () =>
     finish = resolve;
   });
   const handoffs: HandoffReason[] = [];
+  let heartbeatPath: string | undefined;
+  let persistedHeartbeat: number | undefined;
+  let checkpoint:
+    | {
+        epoch: number;
+        completed: boolean;
+        completion: ReturnType<typeof deferred<number>>;
+        stale: ReturnType<typeof deferred<number>>;
+      }
+    | undefined;
+  const originalHeartbeat = store.heartbeat.bind(store);
+  store.heartbeat = async (...args) => {
+    const renewed = await originalHeartbeat(...args);
+    if (renewed && heartbeatPath) {
+      const value = JSON.parse(await readFile(heartbeatPath, 'utf8')) as { heartbeat: number };
+      persistedHeartbeat = value.heartbeat;
+      if (checkpoint && value.heartbeat === checkpoint.epoch) {
+        checkpoint.completed = true;
+        checkpoint.completion.resolve(value.heartbeat);
+      } else if (checkpoint && value.heartbeat < checkpoint.epoch) {
+        checkpoint.stale.resolve(value.heartbeat);
+      }
+    }
+    return renewed;
+  };
   const originalRecord = store.record.bind(store);
   store.record = async (paneId, value) => {
     await originalRecord(paneId, value);
@@ -1360,6 +1406,7 @@ test('visible runner renews its lease during a slow CLI evaluation', async () =>
     store,
     herdr: herdr(),
     decide: async (input) => {
+      holdTimerRenames = true;
       entered();
       await held;
       return decision(input);
@@ -1373,14 +1420,58 @@ test('visible runner renews its lease during a slow CLI evaluation', async () =>
       handoffs.push(reason);
     },
   });
-  await began;
-  for (let i = 0; i < 3; i++) {
-    milliseconds += 10_000;
-    await new Promise((resolve) => setTimeout(resolve, 20));
+  try {
+    await within(began);
+    await within(heldRenames[0].promise);
+    const token = await store.activeToken('server-1');
+    assert.ok(token);
+    heartbeatPath = join(store.directory, 'scheduler-lease', 'generations', token, 'heartbeat.json');
+
+    const firstEpoch = milliseconds + 10_000;
+    const firstCheckpoint = {
+      epoch: firstEpoch,
+      completed: false,
+      completion: deferred<number>(),
+      stale: deferred<number>(),
+    };
+    checkpoint = firstCheckpoint;
+    milliseconds = firstEpoch;
+    releaseRenames[0].resolve();
+    await within(heldRenames[1].promise);
+    assert.equal(await within(firstCheckpoint.stale.promise), firstEpoch - 10_000);
+    assert.equal(firstCheckpoint.completed, false);
+    assert.equal(persistedHeartbeat, firstEpoch - 10_000);
+    releaseRenames[1].resolve();
+    assert.equal(await within(firstCheckpoint.completion.promise), firstEpoch);
+    assert.equal(firstCheckpoint.completed, true);
+    assert.equal(persistedHeartbeat, firstEpoch);
     assert.equal(await store.active('server-1'), true);
+
+    for (let i = 0; i < 2; i++) {
+      const epoch = milliseconds + 10_000;
+      const nextCheckpoint = {
+        epoch,
+        completed: false,
+        completion: deferred<number>(),
+        stale: deferred<number>(),
+      };
+      checkpoint = nextCheckpoint;
+      milliseconds = epoch;
+      assert.equal(await within(nextCheckpoint.completion.promise), epoch);
+      assert.equal(nextCheckpoint.completed, true);
+      assert.equal(persistedHeartbeat, epoch);
+      assert.equal(await store.active('server-1'), true);
+    }
+    finish();
+    assert.equal(await within(runner), 'stopped');
+  } finally {
+    holdTimerRenames = false;
+    releaseRenames[0].resolve();
+    releaseRenames[1].resolve();
+    finish();
+    ctrl.abort();
+    await within(runner).catch(() => {});
   }
-  finish();
-  assert.equal(await runner, 'stopped');
   assert.equal((await requireEpisode(store)).quota_check_count, 1);
   assert.deepEqual(handoffs, []);
 });

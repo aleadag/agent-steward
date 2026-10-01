@@ -3,6 +3,7 @@ import { test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 
 const workflow = readFileSync(new URL('../.github/workflows/native.yml', import.meta.url), 'utf8');
+const flake = readFileSync(new URL('../flake.nix', import.meta.url), 'utf8');
 const approvedFallbackQuery = /^[ \t]*nix config show sandbox-fallback[ \t]*$/gm;
 
 function assertNativeWorkflowHasNoUnapprovedFallbacks(source) {
@@ -99,6 +100,14 @@ test('Darwin probe is bounded, self-owned, and precedes unchanged native gates',
     step,
     /(?:readFileSync|createReadStream|execSync|execFileSync|spawnSync\(['"]ps['"]|command -v ps)/,
   );
+});
+
+test('installed observer selects locked Darwin ps while preserving the Linux procps path', () => {
+  const paths = flake.match(/^\s*psPath = if pkgs\.stdenv\.hostPlatform\.isDarwin then (.+) else (.+);$/m);
+  assert.ok(paths, 'installed observer must define platform-specific ps paths');
+  assert.equal(paths[1], '"${pkgs.darwin.ps}/bin/ps"');
+  assert.equal(paths[2], '"${pkgs.procps}/bin/ps"');
+  assert.match(flake, /AGENT_STEWARD_PS="\$\{psPath\}"/);
 });
 
 test('workflow fallback exception rejects setting prefixes and command suffixes', () => {
