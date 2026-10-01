@@ -1,7 +1,17 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -141,7 +151,9 @@ test.skipIf(!pkg || !packagedProcess)(
   'packaged foreground adapter launches one offline fake executable with selected task argv',
   async () => {
     const root = mkdtempSync(join(tmpdir(), 'steward-fake-native-'));
+    const alias = `${root}-alias`;
     try {
+      symlinkSync(root, alias, 'dir');
       const bin = join(root, 'bin');
       mkdirSync(bin);
       const executable = join(bin, 'pi');
@@ -156,7 +168,7 @@ test.skipIf(!pkg || !packagedProcess)(
       const status = await packagedProcess.launchForeground(
         { executable: 'pi', args },
         {
-          cwd: root,
+          cwd: alias,
           env: {
             PATH: bin,
             STUB_CAPTURE: capture,
@@ -174,11 +186,12 @@ test.skipIf(!pkg || !packagedProcess)(
       assert.equal(records.length, 1);
       assert.deepEqual(records[0], {
         argv: args,
-        cwd: root,
+        cwd: realpathSync(root),
         hasKey: false,
         providerKey: 'SyntheticProviderKey-Not-Real',
       });
     } finally {
+      rmSync(alias, { force: true });
       rmSync(root, { recursive: true, force: true });
     }
   },

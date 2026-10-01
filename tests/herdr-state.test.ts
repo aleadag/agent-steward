@@ -699,28 +699,48 @@ test('missed lifecycle event notifies once on restart even for uncertain or huma
     await store.record('w1:p1', original);
     const handoffs: HandoffReason[] = [];
     let decisions = 0;
+    const reconciled = deferred<void>();
+    const next = store.next.bind(store);
+    let nextCalls = 0;
     for (let restart = 0; restart < 2; restart++) {
-      const ctrl = new AbortController();
-      const deadline = setTimeout(() => ctrl.abort(), 70);
-      try {
-        await runScheduler({
-          store,
-          herdr: { get: async () => live, read: herdr().read },
-          decide: async () => {
-            decisions++;
-          },
-          targets: ['w1:p1'],
-          sessionId: 'server-1',
-          signal: ctrl.signal,
-          clock: { now: () => now },
-          handoff: async (reason) => {
-            handoffs.push(reason);
-            ctrl.abort();
-          },
-        });
-      } finally {
-        clearTimeout(deadline);
+      if (restart === 1) {
+        store.next = async (...args) => {
+          const scheduled = await next(...args);
+          nextCalls++;
+          reconciled.resolve();
+          return scheduled;
+        };
       }
+      const ctrl = new AbortController();
+      const running = runScheduler({
+        store,
+        herdr: { get: async () => live, read: herdr().read },
+        decide: async () => {
+          decisions++;
+        },
+        targets: ['w1:p1'],
+        sessionId: 'server-1',
+        signal: ctrl.signal,
+        clock: { now: () => now },
+        handoff: async (reason) => {
+          handoffs.push(reason);
+          if (restart === 0 && reason === 'observation_unavailable') ctrl.abort();
+        },
+      });
+      try {
+        if (restart === 0) {
+          await within(running);
+        } else {
+          await within(reconciled.promise);
+          ctrl.abort();
+          await within(running);
+        }
+      } finally {
+        ctrl.abort();
+        await within(running);
+        if (restart === 1) store.next = next;
+      }
+      if (restart === 1) assert.equal(nextCalls, 1);
     }
     assert.deepEqual(handoffs, ['observation_unavailable']);
     assert.equal(decisions, 0);
@@ -728,6 +748,7 @@ test('missed lifecycle event notifies once on restart even for uncertain or huma
     assert.equal(saved.attempt_count, 1);
     assert.equal(saved.first_observed_at, original.first_observed_at);
     assert.equal(saved.last_delivery_state, state);
+    assert.equal(saved.lifecycle_handoff_sent, true);
   }
 });
 

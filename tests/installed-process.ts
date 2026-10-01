@@ -1,15 +1,36 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 
 export type ProcessRow = { pid: number; parent: number; state: string; command: string };
+
+function diagnosticField(value: unknown): string | number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string') return null;
+  return value.replace(/[^A-Za-z0-9_.:/+-]/g, '?').slice(0, 128);
+}
+
+function diagnostic(result: SpawnSyncReturns<string>): string {
+  const error = result.error as NodeJS.ErrnoException | null | undefined;
+  return JSON.stringify({
+    statusKind: result.status === undefined ? 'undefined' : result.status === null ? 'null' : 'number',
+    signal: diagnosticField(result.signal),
+    errorCode: diagnosticField(error?.code),
+    errorErrno: diagnosticField(error?.errno),
+    errorSyscall: diagnosticField(error?.syscall),
+    errorPath: diagnosticField(error?.path),
+    stdoutBytes: Buffer.byteLength(result.stdout ?? ''),
+    stderrBytes: Buffer.byteLength(result.stderr ?? ''),
+  });
+}
 
 function invoke(variable: string, args: string[]): string {
   const command = process.env[variable];
   assert.ok(command, `installed observation requires ${variable}`);
   const result = spawnSync(command, args, { env: { PATH: '' }, encoding: 'utf8', timeout: 1_000 });
-  assert.equal(result.status, 0, 'native installed process observation failed');
-  assert.equal(result.error, undefined, 'native installed process observation failed');
+  const details = `diagnostic=${diagnostic(result)}`;
+  assert.equal(result.status, 0, `native installed process observation failed; ${details}`);
+  assert.equal(result.error, undefined, `native installed process observation failed; ${details}`);
   return result.stdout.trim();
 }
 
