@@ -23,6 +23,22 @@ nix flake check path:. --no-update-lock-file
 
 The package installs `result/bin/agent-steward` and `result/bin/agent-steward-herdr-adapter`, bundles the skill at `share/agent-steward/skills/agent-steward/SKILL.md`, and ships the disabled plugin assets at `share/agent-steward/herdr-plugin/`. Both wrappers use the package-local Bun runtime. The TypeScript sources compile to `lib/agent-steward/dist/src/**/*.js`; the wrappers run that JavaScript with Bun. Source and emitted files retain Bun-compatible `node:` API imports, so a separate Node executable is not required. Offline checks do not need credentials, agent executables, user configuration, or live Jev access.
 
+### Unreleased platform support
+
+This development flake exports packages, the default app, a development shell,
+and build/installed checks for `x86_64-linux`, `aarch64-linux`
+and `aarch64-darwin`. Published `v0.1.0-alpha.1` remains the Linux-only release;
+its tag is unchanged. Portable packaging is unreleased and is not a new claim
+about that published alpha.
+
+Export/evaluation is not native validation. The native CI matrix checks the
+runner architecture and runs the complete frozen Bun and Nix gates on each
+platform. Three-platform validation is established only when all three native
+jobs for the reviewed revision pass; unavailable builders or failed native
+observations remain verification gaps. Packaging tests use synthetic inputs and
+fake native/Herdr boundaries; they do not certify live Herdr supervision or
+real Codex/agy launches. Installing the bundled adapter does not activate it.
+
 The standalone skill is [`skills/agent-steward/SKILL.md`](skills/agent-steward/SKILL.md). If a harness supports skills, a user may manually copy or link it into a skills directory selected for that harness. For example, after choosing a destination, set `SKILLS_DIR` to that user-selected directory and run:
 
 ```sh

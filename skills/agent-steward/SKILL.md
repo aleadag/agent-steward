@@ -25,9 +25,35 @@ The `--` separator ends option parsing. Everything after it is one task argument
 
 Run the live form from a caller that owns an interactive terminal. Both stdin and stdout must be TTYs; the selected native process stays attached to that terminal and inherits the caller's working directory. Live `--json` is rejected. The route summary labels provider, model, thinking level, and account as requested, not verified. A zero child exit status is only a process exit result; it does not prove task acceptance or completion. Agent-steward creates no session ID and does not enable automatic approval.
 
-The selected executable name comes from the routed tool and is resolved using `PATH`. Every PATH entry must be absolute and nonempty. These entries are trusted caller configuration, not authenticated binary identity. The package does not install native executables. The task is one native process argument and may briefly appear in local process listings, so do not put secrets in it. The child inherits the caller's environment except `TYPESAFE_API_KEY`; native provider credentials are otherwise passed through.
+The selected executable name comes from the routed tool and is resolved using `PATH`. Every PATH entry must be absolute and nonempty. These entries are trusted caller configuration, not authenticated binary identity. The package does not install native executables. The supplied task/context is sent to Jev by both standalone forms and may briefly appear in local process listings; there is no confidentiality guarantee. Do not put credentials in instructions, and do not rely on credential detection to make sensitive context safe. The child inherits the caller's environment except `TYPESAFE_API_KEY`; native provider credentials are otherwise passed through.
 
-A non-TTY subagent caller should use the `--dry-run --json` form above, parse the selected tool and requested model/thinking level, and return the preview to an already-authorized caller. That caller may use its own approved launcher and safe argv construction. Do not use `planned_command.display` as a shell command, and do not describe a preview as a successful launch. If live interaction is needed, a terminal-owning caller can run the live form instead.
+For managed delegation, use the same complete instruction for evaluation and native execution. Read the effective agent definition using the harness's project-over-global precedence; include its applicable frontmatter/body, additional instructions, write scope, tool/skill guidance and complete standalone task. Use definitions without model/thinking pins. The caller-prepared complete `instruction` must include this invocation's unique `name`, assigned absolute `assigned_cwd`, and agreed report/notification identity. Agents coordinate through their definitions and available authorized tools; steward only chooses and starts.
+
+Respect spawning restrictions: only an authorized coordinator may launch. Do not use Bash/Herdr to bypass a denied delegation tool, a no-spawning role or native approvals. The wrapper transparently supplies managed inventory and invocation-local credentials. Do not include credentials in instructions. For this phase complete task/context goes to Jev and may appear in local argv; there is no confidentiality guarantee or sensitivity classifier.
+
+Use the existing Herdr generic launcher directly, not the Pi-only `subagent` tool. Prepare invocation-local `instruction`, absolute `assigned_cwd` and unique `name`, then use the recipe below. It writes only the ordinary protected transport script; no separate task-file handoff is needed. Resolve the installed steward wrapper once and launch once; no preliminary dry-run, tuple handoff, display command or fallback.
+
+```bash
+# Inputs: complete instruction, assigned_cwd, name; supplied for this invocation.
+[[ -n "$instruction" && "$assigned_cwd" == /* && -d "$assigned_cwd" && -n "$name" ]] || exit 1
+steward=$(type -P agent-steward) || exit 1
+[[ "$steward" == /* && -x "$steward" ]] || exit 1
+umask 077
+run_dir=$(mktemp -d) || exit 1
+launch_script="$run_dir/start.sh"
+{
+  printf '%s\n' '#!/usr/bin/env bash' 'set +x' "trap '' TSTP"
+  printf 'export PATH=%q\n' "$PATH"
+  printf 'cd -- %q || exit 1\n' "$assigned_cwd"
+  printf 'exec %q session start -- %q\n' "$steward" "$instruction"
+} > "$launch_script"
+chmod 600 "$launch_script"
+herdr plugin pane open --plugin pi-herdr-subagents --entrypoint argv \
+  --placement split --target-pane "$HERDR_PANE_ID" --direction right \
+  --cwd "$assigned_cwd" --env "PI_HERDR_LAUNCH_SCRIPT=$launch_script" --no-focus
+```
+
+Pane creation acknowledges terminal transport, not native acceptance or task success. These skill-launched jobs have no pi-herdr-subagents automatic result delivery, session registry or Pi resume mapping. Do not apply legacy wait-for-pushed-results promises to them. Agents use their agreed reports/notification and native continuation tools. If pane creation is uncertain, do not reroute/retry or delete a potentially pending transport script. Cleanup belongs to the authorized coordinator after known end; never infer completion from pane disappearance or parse native JSON as a completion protocol. Keep legacy Pi delegation unchanged for now.
 
 `stop check` reads one JSON observation from stdin and always returns JSON. Include the adapter-owned current episode ID and retry history, along with the agent/pane identity and observed status. Keep `context` to the short excerpt around the current stop. For example:
 

@@ -21,6 +21,8 @@ import { join } from 'node:path';
 
 const pkg = process.env.AGENT_STEWARD_PACKAGE;
 const fifoWriterModule = process.env.AGENT_STEWARD_FIFO_WRITER ?? new URL('./fifo-writer.ts', import.meta.url).href;
+const processObserverModule =
+  process.env.AGENT_STEWARD_PROCESS_OBSERVER ?? new URL('./installed-process.ts', import.meta.url).href;
 
 type SpawnedChild = ReturnType<typeof spawn>;
 const closeEvents = new WeakMap<SpawnedChild, Promise<number | null>>();
@@ -459,8 +461,16 @@ test.skipIf(!pkg)(
     mkdirSync(bin);
     const dirname = process.env.AGENT_STEWARD_DIRNAME;
     const mkfifo = process.env.AGENT_STEWARD_MKFIFO;
+    const shell = process.env.AGENT_STEWARD_SH;
     assert.ok(dirname, 'installed check must supply dirname without a global PATH');
     assert.ok(mkfifo, 'installed check must supply mkfifo without a global PATH');
+    assert.ok(shell, 'installed check must supply its sandbox-safe shell');
+    const { assertInstalledProcess, findInstalledChild, processAlive, executablePath } = await import(
+      processObserverModule
+    );
+    assert.equal(executablePath(process.pid), realpathSync(process.execPath), 'native observer self-probe');
+    assert.throws(() => assertInstalledProcess(process.pid, shell, entry), 'wrong executable must fail');
+    assert.throws(() => assertInstalledProcess(process.pid, process.execPath, entry), 'wrong entry must fail');
     symlinkSync(dirname, join(bin, 'dirname'));
     writeFileSync(join(config, 'targets.json'), JSON.stringify({ pane_ids: ['w1:p1'] }));
     const fifoResult = spawnSync(mkfifo, [fifo], { encoding: 'utf8' });
@@ -548,7 +558,7 @@ test.skipIf(!pkg)(
         HERDR_PLUGIN_CONFIG_DIR: config,
         HERDR_PLUGIN_STATE_DIR: state,
       };
-      scheduler = spawn('/bin/sh', [join(plugin, 'run.sh'), 'scheduler'], {
+      scheduler = spawn(shell, [join(plugin, 'run.sh'), 'scheduler'], {
         cwd: root,
         env: baseEnv,
         stdio: ['ignore', 'ignore', 'pipe'],
@@ -577,11 +587,9 @@ test.skipIf(!pkg)(
       const generationG = await waitForReady(scheduler, () => schedulerStderrG);
       if (scheduler.pid === undefined) throw new Error('packaged supervisor did not receive a PID');
       const schedulerPidG = scheduler.pid;
-      assert.equal(realpathSync(`/proc/${schedulerPidG}/exe`), realpathSync(runtime));
-      const schedulerArgs = readFileSync(`/proc/${schedulerPidG}/cmdline`, 'utf8').split('\0');
-      assert.ok(schedulerArgs.includes(entry), 'supervisor must use the runtime-neutral installed entry');
+      assertInstalledProcess(schedulerPidG, runtime, entry);
 
-      eventChild = spawn('/bin/sh', [join(plugin, 'run.sh'), 'event'], {
+      eventChild = spawn(shell, [join(plugin, 'run.sh'), 'event'], {
         cwd: root,
         env: {
           ...baseEnv,
@@ -607,43 +615,24 @@ test.skipIf(!pkg)(
           setTimeout(() => reject(new Error('bounded observation did not reach Herdr')), 3_000),
         ),
       ]);
-      assert.equal(realpathSync(`/proc/${eventChild.pid}/exe`), realpathSync(runtime));
+      assertInstalledProcess(eventChild.pid!, runtime, entry);
       const observed = methods.find(({ method }) => method === 'agent.read');
       assert.deepEqual(observed, {
         method: 'agent.read',
         params: { target: 'w1:p1', source: 'detection', lines: 12, format: 'text' },
       });
 
-      let childPid: string | undefined;
+      let childPid: number | undefined;
       for (let attempt = 0; attempt < 200; attempt++) {
-        const childrenPath = `/proc/${eventChild.pid}/task/${eventChild.pid}/children`;
-        if (existsSync(childrenPath)) {
-          const children = readFileSync(childrenPath, 'utf8').trim().split(/\s+/).filter(Boolean);
-          childPid = children.find((pid) => {
-            const cmdlinePath = `/proc/${pid}/cmdline`;
-            return existsSync(cmdlinePath) && readFileSync(cmdlinePath, 'utf8').split('\0').includes(main);
-          });
-          if (childPid) break;
-        }
+        childPid = findInstalledChild(eventChild.pid!, runtime, main);
+        if (childPid) break;
         if (eventChild.exitCode !== null) break;
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       assert.ok(childPid, `adapter must execute packaged main.js via process.execPath: ${eventStderr}`);
-      const readerPid = childPid;
-      const readerIsAlive = (): boolean => {
-        try {
-          const stat = readFileSync(`/proc/${readerPid}/stat`, 'utf8');
-          const state = stat.slice(stat.lastIndexOf(')') + 2).split(' ', 1)[0];
-          return state !== undefined && state !== 'Z' && state !== 'X';
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-          throw error;
-        }
-      };
+      const readerIsAlive = (): boolean => processAlive(childPid!);
       assert.ok(readerIsAlive(), 'packaged main.js must remain alive while the config FIFO reader starts');
-      const childArgs = readFileSync(`/proc/${childPid}/cmdline`, 'utf8').split('\0');
-      assert.ok(childArgs.includes(main));
-      assert.equal(realpathSync(`/proc/${childPid}/exe`), realpathSync(runtime));
+      assertInstalledProcess(childPid, runtime, main);
 
       const { writeFifoWithDeadline } = await import(fifoWriterModule);
       await writeFifoWithDeadline(fifo, JSON.stringify({ tools: [], accounts: [], candidates: [] }), readerIsAlive);
@@ -673,7 +662,7 @@ test.skipIf(!pkg)(
         'retained selector with a release marker must not be ready',
       );
 
-      scheduler = spawn('/bin/sh', [join(plugin, 'run.sh'), 'scheduler'], {
+      scheduler = spawn(shell, [join(plugin, 'run.sh'), 'scheduler'], {
         cwd: root,
         env: baseEnv,
         stdio: ['ignore', 'ignore', 'pipe'],
@@ -688,7 +677,7 @@ test.skipIf(!pkg)(
       if (scheduler.pid === undefined) throw new Error('restarted supervisor did not receive a PID');
       const schedulerPidH = scheduler.pid;
       assert.notEqual(generationH.token, generationG.token);
-      assert.equal(realpathSync(`/proc/${schedulerPidH}/exe`), realpathSync(runtime));
+      assertInstalledProcess(schedulerPidH, runtime, entry);
       assert.equal(installedLeaseReady(state, schedulerPidH, session)?.token, generationH.token);
       assert.equal(lstatSync(markerG).isDirectory(), true);
       const generationHPath = generationPath(generationH.token);

@@ -3,24 +3,28 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   outputs = { self, nixpkgs }:
     let
-      system = "x86_64-linux";
-      pkgs = import nixpkgs { inherit system; };
-      lib = pkgs.lib;
-      bunDeps = [
-        { name = "@oxfmt/binding-linux-x64-gnu"; version = "0.71.0"; hash = "sha512-5/Z6pUewQpknXqC4/ykK6Zc6RiteAnPem1Ci7K1RZLVF6w6MMjwHjR4vsjijW4Czidgv7HKeVglGjElADliT9w=="; }
-        { name = "@oxfmt/binding-linux-x64-musl"; version = "0.71.0"; hash = "sha512-uVdG2N/4GEbOeljpQ+xv+NeEwJWJGj0WaxSiSYnoiqIYy3RWrWd3rGUmxWXP1A8+ferNvvwFoDAtvgsDUvBuSw=="; }
-        { name = "@oxlint/binding-linux-x64-gnu"; version = "1.86.0"; hash = "sha512-C1WjukSyMnr66b+w1/tV8RFVv6d9v0MzDf4p9IxVXknqgmTHBgZh1pccN1eHzFr0b9Tbb3OXoPsAAdAuHAQfeA=="; }
-        { name = "@oxlint/binding-linux-x64-musl"; version = "1.86.0"; hash = "sha512-ap6KLmvC38c6MdYzsIh25cXQupqYvjd37tMNftzrX1DCtkX1Gcf2B+S2B17dD4lKa5c5gJog7DQJyDo82PBKyw=="; }
-        { name = "@types/bun"; version = "1.4.2"; hash = "sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ=="; }
-        { name = "@types/node"; version = "22.18.6"; hash = "sha512-r8uszLPpeIWbNKtvWRt/DbVi5zbqZyj1PTmhRMqBMvDnaz1QpmSKujUtJLrqGZeoM8v72MfYggDceY4K1itzWQ=="; }
-        { name = "bun-types"; version = "1.4.2"; hash = "sha512-bxV1FgK7yBIzjRe5zBozIM4Bem11ZJcCXSrjWRG3YWLt8yFDePu4cLjpebO8OvPeIE9trbyPF4fuj3Cia4Fj3w=="; }
-        { name = "oxfmt"; version = "0.71.0"; hash = "sha512-lUPUl0d/+Io5pDrsPXWs6rB4N/bpB78oj9CTDpnbulfDz+0r3XXcHPlQ7kRPJ2GjIT4nX+/mcqunOeP9BvsEtg=="; }
-        { name = "oxlint"; version = "1.86.0"; hash = "sha512-og0lhgvZfgGF//gOOmZXvtr+GmBbAGEnbEhv/QUg7UW2Wi4wHMnJbnMD+zuHgPdJxdklfgpPupdlAaAySyxrZg=="; }
-        { name = "tinypool"; version = "2.2.0"; hash = "sha512-jBrmx4lYmaC9k/mgPbylxs7kBUxHtD8256up+HjLaDFfXScKJQyil+SWXSvhAtT7XHo+yTVlpB81PGmHP8oLSQ=="; }
-        { name = "typescript"; version = "5.9.3"; hash = "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="; }
-        { name = "undici-types"; version = "6.21.0"; hash = "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ=="; }
-        { name = "zod"; version = "4.1.12"; hash = "sha512-JInaHOamG8pt5+Ey8kGmdcAcg3OL9reK8ltczgHTAwNhMys/6ThXHityHxVV2p3fkw/c+MAvBHFVYHFZDmjMCQ=="; }
-      ];
+      systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems f;
+      perSystem = system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          lib = pkgs.lib;
+          target = {
+            x86_64-linux = { os = "linux"; cpu = "x64"; };
+            aarch64-linux = { os = "linux"; cpu = "arm64"; };
+            aarch64-darwin = { os = "darwin"; cpu = "arm64"; };
+          }.${system};
+          bunDeps = (import ./nix/bun-deps.nix) system;
+          allGraphs = lib.genAttrs systems (import ./nix/bun-deps.nix);
+          processPath = pkgs.runCommand "agent-steward-test-process-path" {
+            nativeBuildInputs = [ pkgs.stdenv.cc ];
+          } ''
+            mkdir -p "$out/bin"
+            cc -Wall -Wextra -Werror ${./tests/native-process-path.c} \
+              ${lib.optionalString pkgs.stdenv.hostPlatform.isDarwin "-lproc"} \
+              -o "$out/bin/process-path"
+          '';
+          psPath = if pkgs.stdenv.hostPlatform.isDarwin then "/bin/ps" else "${pkgs.procps}/bin/ps";
       fetchedBunDeps = map (dep:
         let
           parts = lib.splitString "/" dep.name;
@@ -79,22 +83,9 @@
           export PATH="$TMPDIR/test-bin:$PATH"
           cd "$work"
           export AGENT_STEWARD_BUN_CACHE_LOCK='${bunCacheLock}'
-          bun -e '
-            const lock = Bun.JSONC.parse(await Bun.file("bun.lock").text());
-            const line = (name, version, hash) => [name, version, hash].join(String.fromCharCode(9));
-            const expected = JSON.parse(process.env.AGENT_STEWARD_BUN_CACHE_LOCK)
-              .map((dep) => line(dep.name, dep.version, dep.hash))
-              .sort();
-            const actual = Object.entries(lock.packages)
-              .filter(([, [, , metadata]]) =>
-                (!metadata?.os || metadata.os === "linux") && (!metadata?.cpu || metadata.cpu === "x64"),
-              )
-              .map(([name, [id, , , hash]]) => line(name, id.slice(name.length + 1), hash))
-              .sort();
-            if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-              throw new Error("Nix Bun cache hashes do not exactly match the linux x64 bun.lock graph");
-            }
-          '
+          export AGENT_STEWARD_BUN_OS='${target.os}'
+          export AGENT_STEWARD_BUN_CPU='${target.cpu}'
+          bun tests/bun-cache.ts
           bun --version
           bun install --offline --frozen-lockfile --ignore-scripts --cache-dir="$cache"
           bun run build
@@ -106,8 +97,11 @@
           export XDG_CACHE_HOME="$TMPDIR/xdg-cache"
           export PATH="$TMPDIR/test-bin:$PATH"
           cd "$TMPDIR/project"
+          export AGENT_STEWARD_BUN_CACHE_GRAPHS='${builtins.toJSON allGraphs}'
           bun run typecheck
           bun test tests/*.test.ts
+          bun node_modules/oxlint/bin/oxlint src tests
+          bun node_modules/oxfmt/bin/oxfmt --config=${./.oxfmtrc.json} --check src tests
           runHook postCheck
         '';
         installPhase = ''
@@ -137,20 +131,23 @@
           runHook postInstall
         '';
       };
-    in {
-      devShells.${system}.default = pkgs.mkShell {
-        packages = [ pkgs.bun pkgs.makeWrapper ];
-      };
-      packages.${system} = {
-        agent-steward = package;
-        default = package;
-      };
-      apps.${system}.default = {
-        type = "app";
-        program = "${package}/bin/agent-steward";
-      };
-      checks.${system} = {
-        build = package;
+        in {
+          devShell = pkgs.mkShell { packages = [ pkgs.bun pkgs.makeWrapper ]; };
+        packages = { agent-steward = package; default = package; };
+        app = { type = "app"; program = "${package}/bin/agent-steward"; };
+        checks = {
+          build = package;
+          cache-graph = pkgs.runCommand "agent-steward-cache-graph" { } ''
+            mkdir -p "$TMPDIR/graph"
+            cp ${./bun.lock} "$TMPDIR/graph/bun.lock"
+            mkdir -p "$TMPDIR/graph/tests"
+            cp ${./tests/bun-cache.ts} "$TMPDIR/graph/tests/bun-cache.ts"
+            cp ${./tests/bun-cache.test.ts} "$TMPDIR/graph/tests/bun-cache.test.ts"
+            cd "$TMPDIR/graph"
+            export AGENT_STEWARD_BUN_CACHE_GRAPHS='${builtins.toJSON allGraphs}'
+            ${pkgs.bun}/bin/bun test tests/bun-cache.test.ts
+            touch "$out"
+          '';
         installed = pkgs.runCommand "agent-steward-installed-check" {
           nativeBuildInputs = [ pkgs.bun pkgs.coreutils ];
         } ''
@@ -162,9 +159,19 @@
             AGENT_STEWARD_DIRNAME="${pkgs.coreutils}/bin/dirname" \
             AGENT_STEWARD_MKFIFO="${pkgs.coreutils}/bin/mkfifo" \
             AGENT_STEWARD_FIFO_WRITER="${./tests/fifo-writer.ts}" \
-            ${pkgs.bun}/bin/bun test ${./tests/installed.test.ts} ${./tests/herdr-plugin.test.ts}
+            AGENT_STEWARD_SH="${pkgs.bash}/bin/bash" \
+            AGENT_STEWARD_PS="${psPath}" \
+            AGENT_STEWARD_PROCESS_PATH="${processPath}/bin/process-path" \
+            AGENT_STEWARD_PROCESS_OBSERVER="${./tests/installed-process.ts}" \
+            ${pkgs.bun}/bin/bun test ${./tests/installed.test.ts} ${./tests/herdr-plugin.test.ts} ${./tests/installed-delivery.test.ts}
           touch "$out"
         '';
       };
+    };
+    in {
+      packages = forAllSystems (system: (perSystem system).packages);
+      apps = forAllSystems (system: { default = (perSystem system).app; });
+      devShells = forAllSystems (system: { default = (perSystem system).devShell; });
+      checks = forAllSystems (system: (perSystem system).checks);
     };
 }

@@ -1,0 +1,77 @@
+name: Native packaging
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    name: ${{ matrix.system }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+            os: Linux
+            machine: x86_64
+            bun_os: linux
+            bun_cpu: x64
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+            os: Linux
+            machine: aarch64
+            bun_os: linux
+            bun_cpu: arm64
+          - system: aarch64-darwin
+            runner: macos-15
+            os: Darwin
+            machine: arm64
+            bun_os: darwin
+            bun_cpu: arm64
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Verify native architecture
+        shell: bash
+        env:
+          EXPECT_OS: ${{ matrix.os }}
+          EXPECT_MACHINE: ${{ matrix.machine }}
+          EXPECT_SYSTEM: ${{ matrix.system }}
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = "$EXPECT_OS"
+          test "$(uname -m)" = "$EXPECT_MACHINE"
+          test "$(nix eval --impure --raw --expr builtins.currentSystem)" = "$EXPECT_SYSTEM"
+      - name: Frozen Bun gates
+        shell: bash
+        env:
+          EXPECT_BUN_OS: ${{ matrix.bun_os }}
+          EXPECT_BUN_CPU: ${{ matrix.bun_cpu }}
+        run: |
+          nix develop path:. --no-update-lock-file -c bash -euo pipefail -c '
+            bun -e "if (process.platform !== process.env.EXPECT_BUN_OS || process.arch !== process.env.EXPECT_BUN_CPU) process.exit(1)"
+            bun install --frozen-lockfile --ignore-scripts
+            bun run build
+            bun test
+            bun test tests/ci.test.mjs
+            bun run typecheck
+            bun run lint
+            bun run format:check
+          '
+      - name: Native Nix gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix build path:.#agent-steward --no-update-lock-file --no-link -L
+          nix build path:.#default --no-update-lock-file --no-link -L
+          nix run path:. --no-update-lock-file -- --help
+          nix flake check path:. --no-update-lock-file -L

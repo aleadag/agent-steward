@@ -122,3 +122,29 @@ test('optional adapter documents incomplete shutdown and offline recovery bounda
   ])
     assert.ok(section.includes(term), `optional adapter section must include ${term}`);
 });
+
+test('unreleased portability does not rewrite published-alpha or live-runtime claims', () => {
+  for (const platform of ['x86_64-linux', 'aarch64-linux', 'aarch64-darwin']) assert.ok(readme.includes(platform));
+  assert.match(readme, /Published `v0\.1\.0-alpha\.1` remains the Linux-only release/);
+  assert.match(readme, /Portable packaging is unreleased/);
+  assert.match(readme, /Export\/evaluation is not native validation/);
+  assert.match(readme, /Three-platform validation is established only when all three native\s+jobs/);
+  assert.match(readme, /Installing the bundled adapter does not activate it/);
+});
+
+test('managed delegation is skill-driven existing transport, not patched subagent API', () => {
+  assert.ok(skill.includes('herdr plugin pane open'));
+  assert.ok(skill.includes('--entrypoint argv'));
+  assert.ok(skill.includes('same complete instruction'));
+  const managedDelegation = skill.split('For managed delegation,')[1]?.split('\nRespect spawning restrictions:')[0];
+  assert.ok(managedDelegation, 'skill must include the managed-delegation instructions');
+  assert.match(
+    managedDelegation,
+    /complete `instruction` must include this invocation's unique `name`, assigned absolute `assigned_cwd`, and agreed report\/notification identity/,
+  );
+  assert.ok(skill.includes('automatic result delivery'));
+  assert.ok(skill.includes('spawning restrictions'));
+  assert.ok(!skill.includes('executor: "agent-steward"'));
+  assert.ok(!skill.includes('--native-prompt-file'));
+  assert.ok(!skill.includes('routingBrief'));
+});
