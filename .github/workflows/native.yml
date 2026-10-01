@@ -67,6 +67,57 @@ jobs:
             bun run lint
             bun run format:check
           '
+      - name: Bounded Darwin CI probe
+        if: matrix.system == 'aarch64-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'CLIENT_NIX_SETTINGS (client settings only; not proof of daemon settings)'
+          nix --version
+          nix config show sandbox
+          nix config show sandbox-paths
+          nix config show sandbox-fallback
+          nix develop path:. --no-write-lock-file -c bun -e '
+            import { spawnSync } from "node:child_process";
+            import { statSync } from "node:fs";
+
+            let psMetadata;
+            try {
+              const psFile = statSync("/bin/ps");
+              psMetadata = {
+                fileType: psFile.isFile() ? "file" : "other",
+                mode: (psFile.mode & 0o7777).toString(8).padStart(4, "0"),
+                uid: psFile.uid,
+                gid: psFile.gid,
+                probeUid: typeof process.getuid === "function" ? process.getuid() : null,
+                probeGid: typeof process.getgid === "function" ? process.getgid() : null,
+              };
+            } catch {
+              console.error("Darwin probe metadata failed");
+              process.exit(1);
+            }
+
+            const psResult = spawnSync("/bin/ps", ["-p", String(process.pid), "-o", "pid="], {
+              encoding: "utf8",
+              timeout: 1000,
+              env: { PATH: "" },
+            });
+            const boundedString = (value) =>
+              typeof value === "string" ? value.slice(0, 128) : null;
+            const spawnError = psResult.error;
+            const diagnostic = {
+              statusKind: spawnError ? "error" : psResult.signal ? "signal" : "exit",
+              status: Number.isInteger(psResult.status) ? psResult.status : null,
+              signal: boundedString(psResult.signal),
+              errorCode: boundedString(spawnError?.code),
+              errorErrno: typeof spawnError?.errno === "number" ? spawnError.errno : null,
+              errorSyscall: boundedString(spawnError?.syscall),
+              errorPath: boundedString(spawnError?.path),
+              stdoutBytes: Buffer.byteLength(psResult.stdout ?? ""),
+              stderrBytes: Buffer.byteLength(psResult.stderr ?? ""),
+            };
+            process.stdout.write(`DARWIN_PS_PROBE ${JSON.stringify({ psMetadata, diagnostic })}\n`);
+          '
       - name: Native Nix gates
         shell: bash
         run: |
