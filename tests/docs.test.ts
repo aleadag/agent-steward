@@ -19,18 +19,18 @@ function shellWords(command: string): string[] {
   return [...command.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((match) => match[1] ?? match[2] ?? match[3]!);
 }
 
-function invocationForm(invocation: Invocation): string {
-  if (invocation.kind === 'help') return 'help';
-  if (invocation.kind === 'stop') return 'stop-stdin';
-  if (invocation.kind === 'quota-refresh') return 'quota-refresh';
-  if (invocation.kind === 'list') return invocation.json ? 'list-json' : 'list';
-  if (invocation.kind === 'show') return 'show';
-  return invocation.task.startsWith('-') ? 'route-literal-task' : 'route-task';
+function assertCommandParity(usage: string[], text: string): void {
+  const implementedForms = usage.map(parseUsageForm);
+  const skillForms = parseSkillCommands(text).map((line) => {
+    const command = line.slice('agent-steward '.length).replace(/\s+<\s+stopped-state\.json$/, '');
+    return parseArgs(shellWords(command));
+  });
+  assert.deepEqual(skillForms, implementedForms);
 }
 
 function parseUsageForm(line: string): Invocation {
   let form = line.replace(/^agent-steward\s+/, '');
-  form = form.replace(/^\[--config <path>\]\s+/, '--config config.json ');
+  form = form.replace(/^\[--config <path>\]\s+/, '--config ./config.json ');
   form = form.replace('router start <task> --dry-run [--json]', 'router start "Review the parser" --dry-run --json');
   form = form.replace('router start <task>', 'router start "Review the parser"');
   form = form.replace('router start --dry-run -- <task>', 'router start --dry-run -- --help');
@@ -95,12 +95,7 @@ async function emittedHelp(): Promise<string> {
 test('bundled skill command forms match parsed actual CLI help and parser behavior', async () => {
   const usage = [...(await emittedHelp()).matchAll(/^  (agent-steward .+)$/gm)].map((match) => match[1]!);
   assert.ok(usage.length > 0, 'run --help must emit parseable usage forms');
-  const implementedForms = usage.map((line) => invocationForm(parseUsageForm(line)));
-  const skillForms = parseSkillCommands(skill).map((line) => {
-    let command = line.slice('agent-steward '.length).replace(/\s+<\s+stopped-state\.json$/, '');
-    return invocationForm(parseArgs(shellWords(command)));
-  });
-  assert.deepEqual(skillForms, implementedForms);
+  assertCommandParity(usage, skill);
   const invocations = parseSkillCommands(skill).map((line) => {
     const command = line.slice('agent-steward '.length).replace(/\s+<\s+stopped-state\.json$/, '');
     return parseArgs(shellWords(command));
@@ -124,10 +119,38 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
   assert.equal(thirdRoute.json, false);
 });
 
+test('command-form parity detects meaningful invocation drift', () => {
+  const cases = [
+    ['--config ./config.json router start task --dry-run --json', '--config ./config.json router start task --json'],
+    ['--config ./config.json router start task --dry-run --json', '--config ./config.json router start task --dry-run'],
+    ['--config ./config.json router start task', 'router start task'],
+    ['--config ./config.json router start task', '--config other.json router start task'],
+    ['router start task', 'router start other-task'],
+    ['router start --dry-run -- --help', 'router start --dry-run -- --version'],
+    ['router list --limit 5', 'router list --limit 6'],
+    ['router list --json', 'router list'],
+    ['router show generated-id --json', 'router show generated-id'],
+    ['router show generated-id', 'router show other-id'],
+    ['--config ./config.json quota refresh --json', '--config ./config.json quota refresh'],
+    ['--config ./config.json quota refresh', 'quota refresh'],
+    ['--config ./config.json stop check', 'stop check'],
+  ];
+  for (const [original, changed] of cases) {
+    assert.ok(original && changed);
+    const usage = [`agent-steward ${original}`];
+    assertCommandParity(usage, `\`\`\`bash\nagent-steward ${original}\n\`\`\``);
+    assert.throws(
+      () => assertCommandParity(usage, `\`\`\`bash\nagent-steward ${changed}\n\`\`\``),
+      assert.AssertionError,
+      `parity must detect ${original} becoming ${changed}`,
+    );
+  }
+});
+
 test('quota refresh usage parses and README describes generated state', () => {
   assert.deepEqual(parseUsageForm('agent-steward [--config <path>] quota refresh [--json]'), {
     kind: 'quota-refresh',
-    config: 'config.json',
+    config: './config.json',
     json: true,
   });
   assert.ok(readme.includes('quota refresh'));
