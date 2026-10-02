@@ -65,6 +65,69 @@ test('Pi and agy preserve their exact provider and nondefault effort argv', () =
   assert.ok(!agy.args.some((arg) => arg.includes('provider')));
 });
 
+test('agy translates logical Gemini models and efforts to native selectors', () => {
+  const cases = [
+    ['gemini-3.8-flash', 'low', 'gemini-3.8-flash-low'],
+    ['gemini-3.8-flash', 'medium', 'gemini-3.8-flash-medium'],
+    ['gemini-3.8-flash', 'high', 'gemini-3.8-flash-high'],
+    ['gemini-3.7-flash', 'medium', 'gemini-3.7-flash-medium'],
+    ['gemini-3.6-flash', 'high', 'gemini-3.6-flash-high'],
+    ['gemini-3.1-pro', 'low', 'gemini-3.1-pro-low'],
+    ['gemini-3.1-pro', 'high', 'gemini-3.1-pro-high'],
+  ] as const;
+  for (const [model, level, selector] of cases) {
+    const value = candidate({
+      tool: 'agy',
+      provider: 'google',
+      model,
+      thinking_levels: [{ id: level, description: level }],
+    });
+    const command = buildCommand(value, level);
+    assert.deepEqual(command.args, [`--model=${selector}`]);
+    assert.equal(command.display, `'agy' '--model=${selector}'`);
+    assert.equal(command.provider_selection, 'existing_settings');
+    assert.equal(command.runtime_selection, 'unverified');
+    assert.equal(value.model, model);
+    assert.equal(value.thinking_levels[0]?.id, level);
+  }
+});
+
+test('agy preflight rejects unsupported logical model and effort combinations', () => {
+  for (const [model, level] of [
+    ['gemini-3.8-flash', 'max'],
+    ['gemini-3.7-flash', 'max'],
+    ['gemini-3.6-flash', 'max'],
+    ['gemini-3.1-pro', 'medium'],
+    ['gemini-3.1-pro', 'max'],
+    ['gemini-3.8-flash', 'default'],
+    ['gemini-3.1-pro', 'default'],
+  ]) {
+    rejectsInvalid(candidate({ tool: 'agy', model, thinking_levels: [{ id: level!, description: 'Unsupported' }] }));
+  }
+});
+
+test('agy preserves native selectors and separate effort flags for other models', () => {
+  for (const [model, level, args] of [
+    ['gemini-3.8-flash-medium', 'default', ['--model=gemini-3.8-flash-medium']],
+    ['claude-sonnet-4-6', 'high', ['--model=claude-sonnet-4-6', '--effort=high']],
+  ] as const) {
+    const value = candidate({ tool: 'agy', model, thinking_levels: [{ id: level, description: level }] });
+    assert.deepEqual(buildCommand(value, level).args, args);
+  }
+});
+
+test('Pi does not apply agy model translation', () => {
+  const value = candidate({ tool: 'pi', provider: 'google', model: 'gemini-3.8-flash' });
+  assert.deepEqual(buildCommand(value, 'low').args, [
+    '--provider',
+    'google',
+    '--model',
+    'gemini-3.8-flash',
+    '--thinking',
+    'low',
+  ]);
+});
+
 test('default omits effort overrides for all tools without claiming effective effort', () => {
   const cases: [Candidate, string[]][] = [
     [

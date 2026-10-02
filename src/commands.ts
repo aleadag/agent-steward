@@ -3,6 +3,12 @@ import type { Candidate, PlannedCommand, ThinkingLevel, Tool } from './contracts
 
 const PI_EFFORTS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const AGY_EFFORTS = new Set(['low', 'medium', 'high', 'max']);
+const AGY_MODEL_LEVELS = new Map<string, readonly string[]>([
+  ['gemini-3.8-flash', ['low', 'medium', 'high']],
+  ['gemini-3.7-flash', ['low', 'medium', 'high']],
+  ['gemini-3.6-flash', ['low', 'medium', 'high']],
+  ['gemini-3.1-pro', ['low', 'high']],
+]);
 const ASCII_CONTROLS = /[\x00-\x1f\x7f]/;
 
 function invalidConfig(): never {
@@ -24,7 +30,10 @@ export function validateCandidateSyntax(candidate: Candidate): void {
   validateArgString(candidate.model, true);
   validateArgString(candidate.provider, true);
   if (candidate.thinking_levels.length === 0) invalidConfig();
-  for (const level of candidate.thinking_levels) validateLevel(candidate.tool, level);
+  for (const level of candidate.thinking_levels) {
+    validateLevel(candidate.tool, level);
+    if (candidate.tool === 'agy') agyArgs(candidate.model, level.id);
+  }
 }
 
 export function shellQuote(value: string): string {
@@ -41,6 +50,13 @@ function effortArgs(tool: Tool, level: string): string[] {
     case 'agy':
       return [`--effort=${level}`];
   }
+}
+
+function agyArgs(model: string, level: string): string[] {
+  const levels = AGY_MODEL_LEVELS.get(model);
+  if (levels === undefined) return [`--model=${model}`, ...effortArgs('agy', level)];
+  if (!levels.includes(level)) invalidConfig();
+  return [`--model=${model}-${level}`];
 }
 
 export function buildCommand(candidate: Candidate, level: string): PlannedCommand {
@@ -66,7 +82,7 @@ export function buildCommand(candidate: Candidate, level: string): PlannedComman
       providerSelection = 'explicit_flag';
       break;
     case 'agy':
-      args = [`--model=${candidate.model}`, ...effortArgs(candidate.tool, level)];
+      args = agyArgs(candidate.model, level);
       providerSelection = 'existing_settings';
       break;
   }

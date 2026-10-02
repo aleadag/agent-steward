@@ -31,13 +31,15 @@
       "id": "gemini-agy-example",
       "tool": "agy",
       "provider": "google",
-      "model": "gemini-example",
+      "model": "gemini-3.8-flash",
       "quota_bucket": "antigravity",
       "quota_pool": "primary",
       "cost": 1,
       "capabilities": "Illustrative Gemini model through agy; not verified live",
       "thinking_levels": [
-        { "id": "low", "description": "Configured low effort" }
+        { "id": "low", "description": "Brief reasoning for straightforward tasks" },
+        { "id": "medium", "description": "Balanced reasoning for routine coding" },
+        { "id": "high", "description": "Deeper reasoning for complex coding" }
       ]
     }
   ],

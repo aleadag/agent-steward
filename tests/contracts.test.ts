@@ -153,12 +153,12 @@ test('checked-in example parses and keeps its three illustrative tool/provider p
     [
       { tool: 'codex', provider: 'openai', quota_bucket: 'codex', model: 'gpt-astra-example' },
       { tool: 'pi', provider: 'openai-codex', quota_bucket: 'pi_codex', model: 'gpt-astra-example' },
-      { tool: 'agy', provider: 'google', quota_bucket: 'antigravity', model: 'gemini-example' },
+      { tool: 'agy', provider: 'google', quota_bucket: 'antigravity', model: 'gemini-3.8-flash' },
     ],
   );
   assert.deepEqual(
     parsed.candidates.map(({ thinking_levels }) => thinking_levels.map(({ id }) => id)),
-    [['low'], ['low'], ['low']],
+    [['low'], ['low'], ['low', 'medium', 'high']],
   );
 });
 

@@ -223,6 +223,63 @@ test('low-confidence winning pair and effort produce a complete selected result'
   assert.equal(Object.hasOwn(result, 'phase'), false);
 });
 
+test('agy routing evaluates logical model and effort before translating launch argv', async () => {
+  const gemini = candidate({
+    id: 'gemini-flash-agy',
+    tool: 'agy',
+    provider: 'google',
+    model: 'gemini-3.8-flash',
+    quota_bucket: 'antigravity',
+    thinking_levels: [
+      { id: 'low', description: 'Brief reasoning' },
+      { id: 'medium', description: 'Balanced reasoning' },
+      { id: 'high', description: 'Deeper reasoning' },
+    ],
+  });
+  const cfg = config({ candidates: [gemini] });
+  const states: unknown[] = [];
+  const result = await route(
+    routeInput(cfg, async (state, questions) => {
+      states.push(state);
+      if (questions.pair !== undefined) return selectedPairAnswer({ 'gemini-flash-agy': 1 });
+      assert.ok(questions.effort?.type === 'choice');
+      assert.deepEqual(Object.keys(questions.effort.criteria), ['low', 'medium', 'high']);
+      return selectedEffortAnswer({ low: 0, medium: 1, high: 0 });
+    }),
+  );
+  assert.deepEqual(states, [
+    { task, candidates: [{ ...gemini, quota: quotaFacts(gemini) }] },
+    { task, candidate: gemini, quota: quotaFacts(gemini) },
+  ]);
+  assert.equal(result.selected.model, 'gemini-3.8-flash');
+  assert.equal(result.selected.thinking_level, 'medium');
+  assert.deepEqual(result.planned_command.args, ['--model=gemini-3.8-flash-medium']);
+  assert.equal('kind' in result.evaluations.effort, false);
+});
+
+test('agy rejects any unsupported configured logical effort before evaluation', async () => {
+  const gemini = candidate({
+    tool: 'agy',
+    model: 'gemini-3.8-flash',
+    quota_bucket: 'antigravity',
+    thinking_levels: [
+      { id: 'low', description: 'Supported' },
+      { id: 'max', description: 'Unsupported' },
+    ],
+  });
+  let calls = 0;
+  await assert.rejects(
+    route(
+      routeInput(config({ candidates: [gemini] }), async () => {
+        calls++;
+        return selectedPairAnswer({ 'codex-astra': 1 });
+      }),
+    ),
+    (error) => hasCode(error, 'invalid_config'),
+  );
+  assert.equal(calls, 0);
+});
+
 test('configured order breaks exact ties even for numeric-like IDs', async () => {
   const first = candidate({ id: '10' });
   const second = candidate({ id: '2' });
