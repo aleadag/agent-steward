@@ -22,15 +22,19 @@ function shellWords(command: string): string[] {
 function invocationForm(invocation: Invocation): string {
   if (invocation.kind === 'help') return 'help';
   if (invocation.kind === 'stop') return 'stop-stdin';
+  if (invocation.kind === 'list') return invocation.json ? 'list-json' : 'list';
+  if (invocation.kind === 'show') return 'show';
   return invocation.task.startsWith('-') ? 'route-literal-task' : 'route-task';
 }
 
 function parseUsageForm(line: string): Invocation {
   let form = line.replace(/^agent-steward\s+/, '');
   form = form.replace(/^\[--config <path>\]\s+/, '--config config.json ');
-  form = form.replace('session start <task> --dry-run [--json]', 'session start "Review the parser" --dry-run --json');
-  form = form.replace('session start <task>', 'session start "Review the parser"');
-  form = form.replace('session start --dry-run -- <task>', 'session start --dry-run -- --help');
+  form = form.replace('router start <task> --dry-run [--json]', 'router start "Review the parser" --dry-run --json');
+  form = form.replace('router start <task>', 'router start "Review the parser"');
+  form = form.replace('router start --dry-run -- <task>', 'router start --dry-run -- --help');
+  form = form.replace('router list [--limit <n>]', 'router list');
+  form = form.replace('router show <request-id> [--json]', 'router show "generated-id" --json');
   form = form.replace('stop check < stopped-state.json', 'stop check');
   return parseArgs(shellWords(form));
 }
@@ -39,6 +43,18 @@ async function emittedHelp(): Promise<string> {
   const out: string[] = [];
   const runtime: Runtime = {
     env: {},
+    appendText: async () => {
+      throw new Error('help must not write files');
+    },
+    readTextIfPresent: async () => {
+      throw new Error('help must not read ledger');
+    },
+    mkdirp: async () => {
+      throw new Error('help must not create directories');
+    },
+    chmod: async () => {
+      throw new Error('help must not change modes');
+    },
     cwd: '/isolated/work',
     readText: async () => {
       throw new Error('help must not read files');
@@ -77,7 +93,7 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
   });
   assert.deepEqual(
     invocations.map((item) => item.kind),
-    ['help', 'route', 'route', 'route', 'stop'],
+    ['help', 'route', 'route', 'route', 'list', 'list', 'show', 'stop'],
   );
   const routes = invocations.filter((item) => item.kind === 'route');
   assert.equal(routes.length, 3);
@@ -132,9 +148,23 @@ test('unreleased portability does not rewrite published-alpha or live-runtime cl
   assert.match(readme, /Installing the bundled adapter does not activate it/);
 });
 
-test('managed delegation is skill-driven existing transport, not patched subagent API', () => {
-  assert.ok(skill.includes('herdr plugin pane open'));
-  assert.ok(skill.includes('--entrypoint argv'));
+test('skill is harness-agnostic and has no Herdr launcher recipe', () => {
+  assert.doesNotMatch(skill, /herdr plugin pane open/);
+  assert.doesNotMatch(skill, /PI_HERDR_LAUNCH_SCRIPT/);
+  assert.doesNotMatch(skill, /pi-herdr-subagents/);
+  assert.doesNotMatch(skill, /subagent/);
+  assert.doesNotMatch(skill, /session start/);
+  assert.doesNotMatch(skill, /agent wait/);
+  assert.doesNotMatch(skill, /pane close/);
+  assert.doesNotMatch(skill, /idle\/done/);
+  assert.match(skill, /router start/);
+  assert.match(skill, /router list/);
+  assert.match(skill, /router show/);
+  assert.match(skill, /stop check/);
+  assert.match(skill, /never type the CLI into a shell/i);
+});
+
+test('managed delegation preserves complete instructions and authorization boundaries', () => {
   assert.ok(skill.includes('same complete instruction'));
   const managedDelegation = skill.split('For managed delegation,')[1]?.split('\nRespect spawning restrictions:')[0];
   assert.ok(managedDelegation, 'skill must include the managed-delegation instructions');
@@ -142,8 +172,11 @@ test('managed delegation is skill-driven existing transport, not patched subagen
     managedDelegation,
     /complete `instruction` must include this invocation's unique `name`, assigned absolute `assigned_cwd`, and agreed report\/notification identity/,
   );
-  assert.ok(skill.includes('automatic result delivery'));
   assert.ok(skill.includes('spawning restrictions'));
+  assert.match(skill, /requested, not verified/);
+  assert.match(skill, /does not enable automatic approval/);
+  assert.match(skill, /may appear in local argv/);
+  assert.match(skill, /Do not use Bash\/Herdr to bypass a denied delegation tool/);
   assert.ok(!skill.includes('executor: "agent-steward"'));
   assert.ok(!skill.includes('--native-prompt-file'));
   assert.ok(!skill.includes('routingBrief'));

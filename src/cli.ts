@@ -11,14 +11,22 @@ import { route } from './routing.ts';
 import { assessStop } from './triage.ts';
 import { assertLiveTask, buildNativeLaunch } from './launch.ts';
 import type { NativeLaunch } from './launch.ts';
+import { appendEvent, readLedger, formatLedgerRecord } from './ledger.ts';
+import type { LedgerEventKind } from './ledger.ts';
 
 export type Invocation =
   | { kind: 'help' }
   | { kind: 'route'; config?: string; task: string; dryRun: boolean; json: boolean }
+  | { kind: 'list'; limit: number; json: boolean }
+  | { kind: 'show'; requestId: string; json: boolean }
   | { kind: 'stop'; config?: string };
 
 export type Runtime = {
-  env: { HOME?: string; XDG_CONFIG_HOME?: string; TYPESAFE_API_KEY?: string };
+  env: { HOME?: string; XDG_CONFIG_HOME?: string; XDG_STATE_HOME?: string; TYPESAFE_API_KEY?: string };
+  appendText: (path: string, text: string) => Promise<void>;
+  readTextIfPresent: (path: string) => Promise<string | null>;
+  mkdirp: (path: string, mode: number) => Promise<void>;
+  chmod: (path: string, mode: number) => Promise<void>;
   cwd: string;
   readText: (path: string) => Promise<string>;
   readStdin: () => Promise<string>;
@@ -35,16 +43,21 @@ const HELP = `agent-steward - standalone task routing and stopped-agent decision
 
 Usage:
   agent-steward --help
-  agent-steward [--config <path>] session start <task>
-  agent-steward [--config <path>] session start <task> --dry-run [--json]
-  agent-steward [--config <path>] session start --dry-run -- <task>
+  agent-steward [--config <path>] router start <task>
+  agent-steward [--config <path>] router start <task> --dry-run [--json]
+  agent-steward [--config <path>] router start --dry-run -- <task>
+  agent-steward router list [--limit <n>]
+  agent-steward router list --json
+  agent-steward router show <request-id> [--json]
   agent-steward [--config <path>] stop check < stopped-state.json
 
-Live session start requires terminal input and output and launches the selected native agent in the foreground.
+Live router start requires terminal input and output and launches the selected native agent in the foreground.
 Live starts do not support --json. Dry-run prints a route preview without launching; --json returns that preview as JSON.
 The task is passed in argv and may appear briefly in local process listings; do not include secrets.
-Provider, model, thinking level and account are requested, not verified; no steward session ID is created.
+Provider, model, thinking level and account are requested, not verified; the CLI creates no workflow session id.
 Native permission controls remain with the selected tool. The CLI does not invoke the optional Herdr wrapper.
+Router list/show read local request history only, without config or Jev. List defaults to 20 records.
+History never stores task text; exited means native-process return, not job success.
 Stop check reads JSON from stdin and writes a version-2 JSON result.
 `;
 
@@ -85,9 +98,38 @@ export function parseArgs(argv: readonly string[]): Invocation {
     }
   }
 
+  if (commandTokens[0] === 'router' && (commandTokens[1] === 'list' || commandTokens[1] === 'show')) {
+    if (config !== undefined || separator >= 0) invalidInput();
+    const kind = commandTokens[1];
+    let json = false;
+    let limit = 20;
+    let requestId: string | undefined;
+    let hasLimit = false;
+    for (let index = 2; index < commandTokens.length; index++) {
+      const token = commandTokens[index]!;
+      if (token === '--json') {
+        if (json) invalidInput();
+        json = true;
+      } else if (kind === 'list' && token === '--limit') {
+        if (hasLimit) invalidInput();
+        hasLimit = true;
+        const value = commandTokens[++index];
+        if (value === undefined || !/^[1-9]\d*$/.test(value)) invalidInput();
+        limit = Number(value);
+        if (!Number.isSafeInteger(limit)) invalidInput();
+      } else if (kind === 'show' && !token.startsWith('-') && token.trim() && requestId === undefined) {
+        requestId = token;
+      } else invalidInput();
+    }
+    if (help) return { kind: 'help' };
+    if (kind === 'list') return { kind, limit, json };
+    if (requestId === undefined) invalidInput();
+    return { kind: 'show', requestId, json };
+  }
+
   if (help) {
     if (commandTokens.length > 0) {
-      if (commandTokens[0] === 'session' && commandTokens[1] === 'start') {
+      if (commandTokens[0] === 'router' && commandTokens[1] === 'start') {
         const routeFlags = new Set<string>();
         for (const token of commandTokens.slice(2)) {
           if (token === '--dry-run' || token === '--json') {
@@ -106,7 +148,7 @@ export function parseArgs(argv: readonly string[]): Invocation {
     if (commandTokens.length !== 2 || separator >= 0) invalidInput();
     return config === undefined ? { kind: 'stop' } : { kind: 'stop', config };
   }
-  if (commandTokens[0] !== 'session' || commandTokens[1] !== 'start') invalidInput();
+  if (commandTokens[0] !== 'router' || commandTokens[1] !== 'start') invalidInput();
 
   let dryRun = false;
   let json = false;
@@ -340,7 +382,28 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     return 0;
   }
 
-  let apiKey = readOptionalApiKey(runtime);
+  if (invocation.kind === 'list' || invocation.kind === 'show') {
+    try {
+      const records = await readLedger(runtime);
+      if (invocation.kind === 'list') {
+        const listed = records.slice(0, invocation.limit);
+        if (invocation.json) runtime.stdout(`${JSON.stringify(listed)}\n`);
+        else if (listed.length > 0) runtime.stdout(listed.map(formatLedgerRecord).join(''));
+      } else {
+        const record = records.find((record) => record.request_id === invocation.requestId);
+        if (record === undefined) {
+          runtime.stderr('agent-steward: not_found\n');
+          return 2;
+        }
+        runtime.stdout(invocation.json ? `${JSON.stringify(record)}\n` : `${JSON.stringify(record, null, 2)}\n`);
+      }
+      return 0;
+    } catch (error) {
+      return emitError(runtime, error, null, readOptionalApiKey(runtime), true);
+    }
+  }
+
+  const apiKey = readOptionalApiKey(runtime);
   let requestId: string | null = null;
   if (invocation.kind === 'route') {
     try {
@@ -362,6 +425,29 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     }
   }
 
+  const recordEvent = async (event: LedgerEventKind, selected?: SelectedResult, exitCode?: number): Promise<void> => {
+    if (requestId === null) return;
+    await appendEvent(runtime, {
+      schema_version: 1,
+      request_id: requestId,
+      recorded_at: runtime.now().toISOString(),
+      event,
+      ...(selected === undefined
+        ? {}
+        : {
+            selected: {
+              tool: selected.selected.tool,
+              provider: selected.selected.provider,
+              model: selected.selected.model,
+              thinking_level: selected.selected.thinking_level,
+              account_id: selected.selected.account_id,
+            },
+            usage: selected.evaluations.pair.usage,
+          }),
+      ...(exitCode === undefined ? {} : { exit_code: exitCode }),
+    });
+  };
+  let routeDecisionKnown = false;
   const humanRoute = invocation.kind === 'route' && !invocation.json;
   try {
     let stopInput: StopInput | undefined;
@@ -438,6 +524,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       safeResult = errorResult(new StewardError('credential_detected'), null);
     }
 
+    routeDecisionKnown = true;
     if (!invocation.dryRun && safeResult.decision === 'selected') {
       const command = buildNativeLaunch(safeResult.planned_command, invocation.task);
       const summary =
@@ -448,12 +535,19 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
         `account requested/unverified: ${jsonValue(safeResult.selected.account_id)}\n`;
       assertNoCredentials(summary, apiKey);
       runtime.stderr(summary);
+      await recordEvent('launched', safeResult);
+      let exitCode: number;
       try {
-        return await runtime.launch(command);
+        exitCode = await runtime.launch(command);
       } catch {
+        await recordEvent('launch-failed');
         return emitError(runtime, new StewardError('launch_failed'), requestId, apiKey, true);
       }
+      await recordEvent('exited', undefined, exitCode);
+      return exitCode;
     }
+    if (safeResult.decision === 'selected') await recordEvent('dry-run', safeResult);
+    else if (safeResult.decision === 'error') await recordEvent('evaluation_failed');
     if (safeResult.decision === 'selected' && !invocation.json) {
       runtime.stdout(renderDecisionCard(safeResult));
     } else {
@@ -465,6 +559,11 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     if (invocation.kind === 'stop') {
       emitJson(runtime, safeStopError(error, requestId, apiKey));
       return 1;
+    }
+    try {
+      if (!routeDecisionKnown) await recordEvent('evaluation_failed');
+    } catch (ledgerError) {
+      return emitError(runtime, ledgerError, requestId, apiKey, humanRoute);
     }
     return emitError(runtime, error, requestId, apiKey, humanRoute);
   }

@@ -76,7 +76,7 @@ test.skipIf(!pkg)('installed help needs neither checkout nor global runtimes and
     }
     const result = run(['--help']);
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /session start/);
+    assert.match(result.stdout, /router start/);
     assert.match(result.stdout, /stop check/);
     assert.doesNotMatch(result.stdout, /approval check/);
     const skill = readFileSync(join(pkg, 'share/agent-steward/skills/agent-steward/SKILL.md'), 'utf8');
@@ -87,19 +87,19 @@ test.skipIf(!pkg)('installed help needs neither checkout nor global runtimes and
 
 test.skipIf(!pkg)('installed failures stay local, structured, and credential-free', () => {
   withIsolatedHome(({ root, xdg, run }) => {
-    const missing = parsed(run(['session', 'start', 'task', '--dry-run', '--json']));
+    const missing = parsed(run(['router', 'start', 'task', '--dry-run', '--json']));
     assert.equal(missing.reason_code, 'invalid_config');
 
-    const noLaunch = parsed(run(['session', 'start', 'task', '--json']));
+    const noLaunch = parsed(run(['router', 'start', 'task', '--json']));
     assert.equal(noLaunch.reason_code, 'invalid_input');
 
-    const noTerminal = parsed(run(['session', 'start', 'task']));
+    const noTerminal = parsed(run(['router', 'start', 'task']));
     assert.equal(noTerminal.reason_code, 'interactive_terminal_required');
 
     const badConfig = join(root, 'bad.json');
     writeFileSync(badConfig, '{');
     assert.equal(
-      parsed(run(['--config', badConfig, 'session', 'start', 'task', '--dry-run', '--json'])).reason_code,
+      parsed(run(['--config', badConfig, 'router', 'start', 'task', '--dry-run', '--json'])).reason_code,
       'invalid_config',
     );
 
@@ -224,7 +224,7 @@ test.skipIf(!pkg)('installed routing reads a relative quota snapshot before a lo
       account_id: 'local',
       windows: [],
     });
-    const result = run(['session', 'start', 'task', '--dry-run', '--json']);
+    const result = run(['router', 'start', 'task', '--dry-run', '--json']);
     assert.equal(result.status, 1);
     assert.equal(parsed(result).reason_code, 'missing_credentials');
     assert.equal(result.stderr, '');

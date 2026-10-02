@@ -5,21 +5,30 @@ description: Use to route and launch a task with agent-steward or assess a stopp
 
 # Agent Steward
 
-Use `agent-steward` to route a task to a native Codex, Pi, or agy executable, or to assess a stopped-agent observation. Use route-result details only from `--dry-run` previews and `stop check`, not from live native output or its exit status. Do not invent model rankings, quota measurements, or approval-risk judgments. A `session start <task>` without `--dry-run` launches the selected native process in the foreground. `--dry-run` only previews a route, and `stop check` only assesses user-prepared input. The CLI does not inspect or change sessions, adjust effort, collect live quota, or send input to a stopped agent. `session show`, `account list`, `usage refresh`, and `session choose-effort` are not available.
+Use `agent-steward` to route a task to a native Codex, Pi, or agy executable, or to assess a stopped-agent observation. Use route-result details only from `--dry-run` previews and `stop check`, not from live native output or its exit status. Do not invent model rankings, quota measurements, or approval-risk judgments. A `router start <task>` without `--dry-run` launches the selected native process in the foreground. `--dry-run` only previews a route, and `stop check` only assesses user-prepared input. The CLI does not inspect or change sessions, adjust effort, collect live quota, or send input to a stopped agent. `session show`, `account list`, `usage refresh`, and `session choose-effort` are not available.
 
 ## Commands
 
 ```bash
 agent-steward --help
 # Interactive terminal: live foreground start.
-agent-steward --config ./config.json session start "Review the parser"
+agent-steward --config ./config.json router start "Review the parser"
 # Non-TTY caller: JSON route preview only, no launch.
-agent-steward --config ./config.json session start "Review the parser" --dry-run --json
-agent-steward --config ./config.json session start --dry-run -- "--help"
+agent-steward --config ./config.json router start "Review the parser" --dry-run --json
+agent-steward --config ./config.json router start --dry-run -- "--help"
+agent-steward router list
+agent-steward router list --json
+agent-steward router show "generated-id" --json
 agent-steward --config ./config.json stop check < stopped-state.json
 ```
 
 The `--` separator ends option parsing. Everything after it is one task argument, so `--help` in the fourth form is task text. Without the separator, give the task as one shell argument, normally by quoting it. The `stopped-state.json` file in the final form is user-prepared; the CLI does not discover or create it. [`examples/stop.json`](../../examples/stop.json) shows its version-2 shape.
+
+## Inspect recorded routes
+
+`router list` and `router show` read local history without config, credentials, or Jev. List defaults to 20 folded records; `--limit <n>` changes display only. The ledger ID is Jev's `request_id`, not a workflow or native session ID. `exited` means the native process returned, not that the assigned job succeeded. Missing history yields an empty list; an unknown ID yields `agent-steward: not_found` and exit 2.
+
+Events are stored in `$XDG_STATE_HOME/agent-steward/router.jsonl`, falling back to `$HOME/.local/state/agent-steward/router.jsonl`, with directory mode `0700` and file mode `0600`. History stores credential-checked decision fields and evaluator usage, never tasks/prompts, keys, pane IDs, PIDs, or planned-command displays.
 
 ## Start a task
 
@@ -31,29 +40,9 @@ For managed delegation, use the same complete instruction for evaluation and nat
 
 Respect spawning restrictions: only an authorized coordinator may launch. Do not use Bash/Herdr to bypass a denied delegation tool, a no-spawning role or native approvals. The wrapper transparently supplies managed inventory and invocation-local credentials. Do not include credentials in instructions. For this phase complete task/context goes to Jev and may appear in local argv; there is no confidentiality guarantee or sensitivity classifier.
 
-Use the existing Herdr generic launcher directly, not the Pi-only `subagent` tool. Prepare invocation-local `instruction`, absolute `assigned_cwd` and unique `name`, then use the recipe below. It writes only the ordinary protected transport script; no separate task-file handoff is needed. Resolve the installed steward wrapper once and launch once; no preliminary dry-run, tuple handoff, display command or fallback.
+If you own a TTY, run `agent-steward router start -- <instruction>` from `assigned_cwd`, passing the complete instruction as one argument. Otherwise, use your coordinator skill and multiplexer to argv-exec that same command into a caller-owned pane with the assigned working directory. Never type the CLI into a shell: do not send command text or use a typed-shell fallback. Steward does not create panes or manage their lifecycle; follow the multiplexer skill for those operations. Launch once, without a preliminary dry-run or a separate task-file handoff.
 
-```bash
-# Inputs: complete instruction, assigned_cwd, name; supplied for this invocation.
-[[ -n "$instruction" && "$assigned_cwd" == /* && -d "$assigned_cwd" && -n "$name" ]] || exit 1
-steward=$(type -P agent-steward) || exit 1
-[[ "$steward" == /* && -x "$steward" ]] || exit 1
-umask 077
-run_dir=$(mktemp -d) || exit 1
-launch_script="$run_dir/start.sh"
-{
-  printf '%s\n' '#!/usr/bin/env bash' 'set +x' "trap '' TSTP"
-  printf 'export PATH=%q\n' "$PATH"
-  printf 'cd -- %q || exit 1\n' "$assigned_cwd"
-  printf 'exec %q session start -- %q\n' "$steward" "$instruction"
-} > "$launch_script"
-chmod 600 "$launch_script"
-herdr plugin pane open --plugin pi-herdr-subagents --entrypoint argv \
-  --placement split --target-pane "$HERDR_PANE_ID" --direction right \
-  --cwd "$assigned_cwd" --env "PI_HERDR_LAUNCH_SCRIPT=$launch_script" --no-focus
-```
-
-Pane creation acknowledges terminal transport, not native acceptance or task success. These skill-launched jobs have no pi-herdr-subagents automatic result delivery, session registry or Pi resume mapping. Do not apply legacy wait-for-pushed-results promises to them. Agents use their agreed reports/notification and native continuation tools. If pane creation is uncertain, do not reroute/retry or delete a potentially pending transport script. Cleanup belongs to the authorized coordinator after known end; never infer completion from pane disappearance or parse native JSON as a completion protocol. Keep legacy Pi delegation unchanged for now.
+Inspect `router list` and `router show <request-id>` to see whether Jev ran and which route was recorded. A recorded route or process exit does not prove task success; completion is the agreed report. There is no automatic result delivery, native session registry, or resume mapping. Agents use their agreed reports/notification and authorized native continuation tools; follow-up work is a new launch. If launch is uncertain, do not silently retry or select another candidate. Leave errors readable and report the failure honestly; never infer completion from pane disappearance or parse native JSON as a completion protocol.
 
 `stop check` reads one JSON observation from stdin and always returns JSON. Include the adapter-owned current episode ID and retry history, along with the agent/pane identity and observed status. Keep `context` to the short excerpt around the current stop. For example:
 
@@ -88,13 +77,13 @@ This is illustrative user-prepared input, not permission to inspect a real termi
 
 ## Interpreting results
 
-For a `session start --dry-run` preview, inspect the selected candidate, planned command, quota facts, pair/effort evaluations, and request ID; JSON output is available with `--json` and includes `planned_command.args`. Unknown quota is possible when a snapshot is missing, expired, invalid, or lacks a matching pool window; unknown never means full. Evaluator token usage is separate from subscription quota. Runtime model/effort and authentication/account binding are unverified. The quoted command is display-only and must not be run as permission to launch.
+For a `router start --dry-run` preview, inspect the selected candidate, planned command, quota facts, pair/effort evaluations, and request ID; JSON output is available with `--json` and includes `planned_command.args`. Unknown quota is possible when a snapshot is missing, expired, invalid, or lacks a matching pool window; unknown never means full. Evaluator token usage is separate from subscription quota. Runtime model/effort and authentication/account binding are unverified. The quoted command is display-only and must not be run as permission to launch.
 
 A stop result has `schema_version: 2`, `decision: "stop_decision"`, a `proposed_action`, and a `reason_code`. It can propose `approve_request`, a fixed `send_recovery_instruction` with `not_before`, `wait_for_quota` with `not_before`, `manual_review`, or `no_action`. An approval assessment is not permission to send arbitrary input or an authorization token; it is only a proposal for the supplied request. Ties, low confidence, unclear state, explicit restrictions, and risk at or above the configured cutoff require human review. Jev's Noul value is not a calibrated probability of harm. `automatic_approval_forbidden: true` records a known restriction; `false` never grants permission.
 
 A recovery proposal does not deliver its instruction or wait. Re-observe the agent and obtain a fresh decision after any wait. An asserted reset snapshot does not verify live account/pool binding, and agent-steward does not collect live quota. `no_action` is reserved for a settled `done` state. The caller must re-read the same agent, match the current request or failure, and preserve the tool's existing permission controls before any delivery. The optional, unactivated Herdr 0.9.1 adapter cannot bind Pi/Codex permission requests to a native current request ID, action, pane occupant and accepting UI control. It therefore hands off every `approve_request` and never sends approval keys. There is no approval-key configuration or sending path; `1` and any future per-tool override may be considered only after independently verified tool-specific request/control proof. Never guess a UI key or treat an exit status as authority.
 
-Stop proposals exit 0, `manual_review` exits 2, `no_action` exits 3, and errors exit 1. A `session start --dry-run` route exits 0 for a selected preview and 1 for a route error. A successful live foreground start emits no steward route-result JSON: the native process owns stdout, and the CLI returns its process exit status. A native exit status of 1 does not identify a steward route error or establish task delivery, acceptance, or completion. Parse JSON for `session start --dry-run --json` and `stop check`; check the schema version, decision, reason, and request ID, and for stop proposals match the current request identity. An exit status alone never authorizes delivery. Stop errors use version 2, route errors version 1, and malformed command lines use the generic version-1 error. Errors never include a partial proposal.
+Stop proposals exit 0, `manual_review` exits 2, `no_action` exits 3, and errors exit 1. A `router start --dry-run` route exits 0 for a selected preview and 1 for a route error. A successful live foreground start emits no steward route-result JSON: the native process owns stdout, and the CLI returns its process exit status. A native exit status of 1 does not identify a steward route error or establish task delivery, acceptance, or completion. Parse JSON for `router start --dry-run --json` and `stop check`; check the schema version, decision, reason, and request ID, and for stop proposals match the current request identity. An exit status alone never authorizes delivery. Stop errors use version 2, route errors version 1, and malformed command lines use the generic version-1 error. Errors never include a partial proposal.
 
 ## Privacy and limits
 

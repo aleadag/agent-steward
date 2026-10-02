@@ -1,6 +1,6 @@
 # Agent-steward
 
-Agent-steward's standalone CLI routes tasks to a native Codex, Pi, or agy executable. `session start --dry-run` produces a route preview; a live `session start <task>` launches the selected native process in the foreground. `stop check` assesses a user-prepared stopped-agent observation but does not send input. The CLI does not create steward-managed sessions, inspect existing sessions, adjust effort, collect live quota, or use Herdr to launch agents. Configuration describes a local inventory only. The separate bundled Herdr adapter is opt-in; building this package does not install or activate it.
+Agent-steward's standalone CLI routes tasks to a native Codex, Pi, or agy executable. `router start --dry-run` produces a route preview; a live `router start <task>` launches the selected native process in the foreground. `stop check` assesses a user-prepared stopped-agent observation but does not send input. The CLI does not create steward-managed sessions, inspect existing sessions, adjust effort, collect live quota, or use Herdr to launch agents. Configuration describes a local inventory only. The separate bundled Herdr adapter is opt-in; building this package does not install or activate it.
 
 ## Install and run
 
@@ -52,17 +52,28 @@ These are optional manual instructions only. Agent-steward does not install skil
 
 ```sh
 agent-steward --help
-agent-steward --config ./config.json session start "Review the parser"
-agent-steward --config ./config.json session start "Review the parser" --dry-run --json
-agent-steward --config ./config.json session start --dry-run -- "--help"
+agent-steward --config ./config.json router start "Review the parser"
+agent-steward --config ./config.json router start "Review the parser" --dry-run --json
+agent-steward --config ./config.json router start --dry-run -- "--help"
+agent-steward router list
+agent-steward router list --json
+agent-steward router show "generated-id" --json
 agent-steward --config ./config.json stop check < stopped-state.json
 ```
 
-The first `session start` command launches the selected native agent in the foreground; the next returns a JSON route preview without launching. The `--` separator ends option parsing. The fourth command previews the literal task `--help`; text after the separator is never treated as a CLI option. Before the separator, `--config <path>` is global and can appear before or after command tokens. Each route task is exactly one argument; quote multiword tasks. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
+The first `router start` command launches the selected native agent in the foreground; the next returns a JSON route preview without launching. The `--` separator ends option parsing. The fourth command previews the literal task `--help`; text after the separator is never treated as a CLI option. For start and stop, `--config <path>` can appear before or after command tokens, before the separator. List and show reject `--config`. Each route task is exactly one argument; quote multiword tasks. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
+
+### Local route history
+
+`router list` shows the latest 20 recorded requests; `--limit <n>` changes the display without pruning history. `router show <request-id>` shows the folded decision fields, latest event, and exit code when recorded. Both commands support `--json` and read local history without loading config, requiring credentials, or calling Jev. A missing ledger gives an empty list; an unknown request ID exits 2 with `agent-steward: not_found` on stderr.
+
+The append-only ledger is `$XDG_STATE_HOME/agent-steward/router.jsonl`, or `$HOME/.local/state/agent-steward/router.jsonl` when XDG state is unset. Its directory is `0700` and file is `0600`. Events record selected tool/provider/model/thinking/account, evaluator usage, and native exit code when known. They never store task/prompt text, keys, pane IDs, PIDs, or planned-command displays. Credential detection blocks writes.
+
+Records fold by Jev's `request_id`, not a workflow or native session ID. Events are `dry-run`, `launched`, `launch-failed`, `evaluation_failed`, and `exited`. `exited` means the foreground native process returned, not that its assigned job succeeded.
 
 ### Foreground native launch (alpha)
 
-A live `session start <task>` requires terminal input and output, rejects `--json`, and stays attached to the selected Codex, Pi, or agy process until it exits. The native process inherits the caller's terminal and working directory. A zero exit status means only that the process exited zero; it does not prove that the task was accepted or completed. The CLI does not create a steward session ID or enable automatic approval.
+A live `router start <task>` requires terminal input and output, rejects `--json`, and stays attached to the selected Codex, Pi, or agy process until it exits. The native process inherits the caller's terminal and working directory. A zero exit status means only that the process exited zero; it does not prove that the task was accepted or completed. The CLI does not create a steward session ID or enable automatic approval.
 
 The live route summary labels the selected provider, model, thinking level, and account as requested, not confirmed. Native flags request those settings; the CLI cannot verify the effective runtime model, effort, provider, or account. The executable is selected by its fixed tool name from `PATH`. Every PATH entry must be absolute and nonempty. Those entries are trusted caller configuration, not proof of executable identity. The package does not install native tools.
 
@@ -76,7 +87,7 @@ A `--dry-run` route uses `schema_version: 1` when returned as JSON; stop results
 
 Error envelopes have fixed messages and retain the command's schema version. For example, a route error is version 1 and a valid stop-command error is version 2. Malformed command-line arguments that do not select a command use the generic version-1 error.
 
-A `session start --dry-run` route exits 0 for a complete selected preview and 1 for route errors. `stop check` exits 0 for an approval, recovery, or quota-wait proposal, 2 for `manual_review`, 3 for `no_action`, and 1 for errors. A successful live foreground start returns the native process exit status; a native exit status of 1 is not evidence of a steward route error or of task non-delivery, acceptance, or completion. Check `--dry-run` preview results and the `stop check` JSON result alongside their exit codes: no exit code authorizes delivery. `no_action` means no follow-up input should be sent, not that a person has no reason to respond. Errors never accompany a proposal or partial route.
+A `router start --dry-run` route exits 0 for a complete selected preview and 1 for route errors. `stop check` exits 0 for an approval, recovery, or quota-wait proposal, 2 for `manual_review`, 3 for `no_action`, and 1 for errors. A successful live foreground start returns the native process exit status; a native exit status of 1 is not evidence of a steward route error or of task non-delivery, acceptance, or completion. Check `--dry-run` preview results and the `stop check` JSON result alongside their exit codes: no exit code authorizes delivery. `no_action` means no follow-up input should be sent, not that a person has no reason to respond. Errors never accompany a proposal or partial route.
 
 Routing first selects a tool/model pair, then selects one of that pair's configured thinking levels. A single configured level skips the second evaluation. Each Jev request has its own 30-second deadline with no retries, so a route can involve two sequential requests and two separate deadlines. Evaluation token usage measures Jev usage, not remaining subscription quota.
 
