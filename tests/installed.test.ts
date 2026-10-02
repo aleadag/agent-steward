@@ -212,6 +212,7 @@ test.skipIf(!pkg)('installed routing ignores cwd bucket files and reads trusted 
           model: 'example-model',
           quota_bucket: 'codex',
           quota_pool: 'primary',
+          cost: 1,
           capabilities: 'test only',
           thinking_levels: [{ id: 'low', description: 'low' }],
         },

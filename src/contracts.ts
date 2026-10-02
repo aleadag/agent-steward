@@ -48,6 +48,7 @@ const CandidateSchema = z.strictObject({
   model: text,
   quota_bucket: QuotaBucketSchema,
   quota_pool: text,
+  cost: z.number().finite().positive(),
   capabilities: text,
   thinking_levels: z
     .array(ThinkingLevelSchema)

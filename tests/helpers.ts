@@ -29,6 +29,7 @@ export function candidate(overrides: Partial<Candidate> | Record<string, unknown
     model: 'gpt-astra-example',
     quota_bucket: 'codex',
     quota_pool: 'primary',
+    cost: 1,
     capabilities: 'Illustrative coding model; not verified live',
     thinking_levels: [{ id: 'low', description: 'Configured low effort' }],
     ...overrides,

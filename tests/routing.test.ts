@@ -101,6 +101,36 @@ test('winning low-confidence pair is not returned when effort fails', async () =
   assert.equal(calls, 2);
 });
 
+test('pair evaluation includes relative cost in instructions and candidate state', async () => {
+  const cheap = candidate({ id: 'cheap', cost: 1 });
+  const dear = candidate({
+    id: 'dear',
+    tool: 'pi',
+    quota_bucket: 'pi_codex',
+    provider: 'openai-codex',
+    cost: 2,
+  });
+  const cfg = config({ candidates: [cheap, dear] });
+  let pairState: unknown;
+  let pairText = '';
+  await route(
+    routeInput(cfg, async (state, questions) => {
+      if (questions.pair !== undefined) {
+        pairState = state;
+        assert.equal(questions.pair.type, 'choice');
+        pairText = questions.pair.instructions;
+        return selectedPairAnswer({ cheap: 1, dear: 0 });
+      }
+      return selectedEffortAnswer({ low: 1 });
+    }),
+  );
+  assert.match(pairText, /relative cost/);
+  assert.match(pairText, /not a bill/);
+  const candidates = (pairState as { candidates: Candidate[] }).candidates;
+  assert.equal(candidates[0]?.cost, 1);
+  assert.equal(candidates[1]?.cost, 2);
+});
+
 test('low-confidence winning pair and effort produce a complete selected result', async () => {
   const codex = candidate({
     id: 'codex-choice',

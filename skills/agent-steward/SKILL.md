@@ -33,7 +33,7 @@ Events are stored in `$XDG_STATE_HOME/agent-steward/router.jsonl`, falling back 
 
 ## Refresh quota
 
-Run `quota refresh [--json]` explicitly when fresh quota is needed; `router start` never fetches it or reads auth stores. Refresh needs no terminal or TypeSafe key and never calls Jev or launches an agent. Config candidates use `quota_bucket`, not provider account IDs: Codex uses `codex`, Pi uses `pi_codex` or `pi_xai`, and agy uses `antigravity`. Native and Pi Codex buckets stay separate even with the same login. `accounts`, `account_id`, and snapshot-path config fields are not supported.
+Run `quota refresh [--json]` explicitly when fresh quota is needed; `router start` never fetches it or reads auth stores. Refresh needs no terminal or TypeSafe key and never calls Jev or launches an agent. Config candidates use `quota_bucket`, not provider account IDs: Codex uses `codex`, Pi uses `pi_codex` or `pi_xai`, and agy uses `antigravity`. Each candidate has a relative `cost` greater than zero (ranking hint, not a bill). Native and Pi Codex buckets stay separate even with the same login. `accounts`, `account_id`, and snapshot-path config fields are not supported.
 
 Refresh reads existing Codex ChatGPT auth from `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) and Pi OAuth entries `openai-codex`/`xai` from `$PI_CODING_AGENT_DIR/auth.json` (default `~/.pi/agent/auth.json`). Explicit overrides must be absolute and nonempty. It never logs in, refreshes tokens, writes auth stores, scans browsers/keyrings, or scrapes CSRF tokens. Antigravity is unsupported and remains unknown without auth or network access.
 

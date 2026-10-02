@@ -45,6 +45,20 @@ test('config schema is strict, preserves configured text, and defaults only docu
   assert.equal(ConfigSchema.safeParse({ ...config(), candidates: [candidate({ model: null })] }).success, false);
 });
 
+test('config requires finite positive cost on each candidate', () => {
+  assert.equal(ConfigSchema.safeParse(config({ candidates: [candidate({ cost: 1 })] })).success, true);
+  assert.equal(ConfigSchema.safeParse(config({ candidates: [candidate({ cost: 2 })] })).success, true);
+  const { cost: _cost, ...withoutCost } = candidate();
+  assert.equal(ConfigSchema.safeParse(config({ candidates: [withoutCost] })).success, false);
+  for (const cost of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, '1', null, undefined]) {
+    assert.equal(
+      ConfigSchema.safeParse(config({ candidates: [candidate({ cost })] })).success,
+      false,
+      String(cost),
+    );
+  }
+});
+
 test('config requires quota_bucket pairing and rejects accounts and account_id', () => {
   assert.equal(ConfigSchema.safeParse(config()).success, true);
   assert.equal(ConfigSchema.safeParse({ ...config(), accounts: [] }).success, false);
