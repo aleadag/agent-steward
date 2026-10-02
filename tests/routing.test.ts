@@ -223,7 +223,7 @@ test('low-confidence winning pair and effort produce a complete selected result'
   assert.equal(Object.hasOwn(result, 'phase'), false);
 });
 
-test('agy routing evaluates logical model and effort before translating launch argv', async () => {
+test('agy routing preserves model and effort in evaluation and native launch argv', async () => {
   const gemini = candidate({
     id: 'gemini-flash-agy',
     tool: 'agy',
@@ -253,18 +253,18 @@ test('agy routing evaluates logical model and effort before translating launch a
   ]);
   assert.equal(result.selected.model, 'gemini-3.8-flash');
   assert.equal(result.selected.thinking_level, 'medium');
-  assert.deepEqual(result.planned_command.args, ['--model=gemini-3.8-flash-medium']);
+  assert.deepEqual(result.planned_command.args, ['--model=gemini-3.8-flash', '--effort=medium']);
   assert.equal('kind' in result.evaluations.effort, false);
 });
 
-test('agy rejects any unsupported configured logical effort before evaluation', async () => {
+test('agy rejects any invalid configured native effort before evaluation', async () => {
   const gemini = candidate({
     tool: 'agy',
     model: 'gemini-3.8-flash',
     quota_bucket: 'antigravity',
     thinking_levels: [
       { id: 'low', description: 'Supported' },
-      { id: 'max', description: 'Unsupported' },
+      { id: 'xhigh', description: 'Unsupported' },
     ],
   });
   let calls = 0;
