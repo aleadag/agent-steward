@@ -51,32 +51,28 @@ export async function appendEvent(runtime: LedgerRuntime, event: LedgerEvent): P
   await runtime.chmod(file, 0o600);
 }
 
-const quotaBuckets = new Set(['codex', 'pi_codex', 'pi_xai', 'antigravity']);
+const SelectedSchema = EventSchema.shape.selected.unwrap();
+const LegacySelectedSchema = SelectedSchema.omit({ quota_bucket: true })
+  .extend({ account_id: z.string(), quota_bucket: z.string().optional() })
+  .transform(({ account_id: _accountId, quota_bucket, ...selected }) => ({
+    ...selected,
+    // Legacy account IDs were aliases, not evidence of a credential bucket.
+    quota_bucket: quota_bucket ?? null,
+  }));
+const ReadEventSchema = EventSchema.extend({
+  selected: z.union([SelectedSchema, LegacySelectedSchema]).optional(),
+});
+type LedgerRecord = z.infer<typeof ReadEventSchema>;
 
-export async function readLedger(runtime: LedgerRuntime): Promise<LedgerEvent[]> {
+export async function readLedger(runtime: LedgerRuntime): Promise<LedgerRecord[]> {
   const text = await runtime.readTextIfPresent(ledgerFile(runtime.env));
   if (text === null) return [];
   assertNoCredentials(text, runtime.env.TYPESAFE_API_KEY ?? '');
-  const folded = new Map<string, LedgerEvent>();
+  const folded = new Map<string, LedgerRecord>();
   for (const line of text.split('\n').filter((line) => line.trim() !== '')) {
-    let event: LedgerEvent;
+    let event: LedgerRecord;
     try {
-      const parsed: unknown = JSON.parse(line);
-      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        const record = parsed as Record<string, unknown>;
-        if (record.selected !== null && typeof record.selected === 'object' && !Array.isArray(record.selected)) {
-          const selected = record.selected as Record<string, unknown>;
-          if (selected.quota_bucket === undefined) {
-            if (typeof selected.account_id === 'string' && quotaBuckets.has(selected.account_id)) {
-              selected.quota_bucket = selected.account_id;
-            } else {
-              delete record.selected;
-            }
-          }
-          if (record.selected !== undefined) delete selected.account_id;
-        }
-      }
-      event = EventSchema.parse(parsed);
+      event = ReadEventSchema.parse(JSON.parse(line));
     } catch {
       throw new StewardError('invalid_input');
     }
@@ -87,7 +83,7 @@ export async function readLedger(runtime: LedgerRuntime): Promise<LedgerEvent[]>
   return [...folded.values()].reverse();
 }
 
-export function formatLedgerRecord(record: LedgerEvent): string {
+export function formatLedgerRecord(record: LedgerRecord): string {
   const selected = record.selected;
   const route = selected ? `${selected.tool}/${selected.model}/${selected.thinking_level}` : '-';
   const fields = [record.request_id, record.recorded_at, route, selected?.quota_bucket ?? '-', record.event];

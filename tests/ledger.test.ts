@@ -1,6 +1,7 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { appendEvent, ledgerFile } from '../src/ledger.ts';
+import { appendEvent, ledgerFile, readLedger } from '../src/ledger.ts';
+import { StewardError } from '../src/contracts.ts';
 import { run } from '../src/cli.ts';
 import type { Runtime } from '../src/cli.ts';
 
@@ -133,17 +134,119 @@ test('list and show read legacy account_id-only and mixed ledger history', async
   assert.equal(await run(['router', 'list', '--json'], rt), 0);
   const listed = JSON.parse(out.join(''));
   assert.equal(listed.length, 3);
-  assert.equal(listed[2].selected.quota_bucket, 'codex');
+  assert.deepEqual(listed[2].selected, {
+    tool: 'codex',
+    provider: 'openai',
+    model: 'm1',
+    thinking_level: 'low',
+    quota_bucket: null,
+  });
   assert.equal(listed[1].selected.quota_bucket, 'pi_codex');
   assert.equal(Object.hasOwn(listed[1].selected, 'account_id'), false);
-  assert.equal(Object.hasOwn(listed[0], 'selected'), false);
+  assert.deepEqual(listed[0].selected, {
+    tool: 'codex',
+    provider: 'openai',
+    model: 'm3',
+    thinking_level: 'low',
+    quota_bucket: null,
+  });
+  assert.equal(out.join('').includes('private-id'), false);
 
   out.length = 0;
   assert.equal(await run(['router', 'show', 'legacy', '--json'], rt), 0);
-  assert.equal(JSON.parse(out.join('')).selected.quota_bucket, 'codex');
+  assert.equal(JSON.parse(out.join('')).selected.quota_bucket, null);
   out.length = 0;
   assert.equal(await run(['router', 'show', 'unknown-account', '--json'], rt), 0);
-  assert.equal(Object.hasOwn(JSON.parse(out.join('')), 'selected'), false);
+  assert.deepEqual(JSON.parse(out.join('')).selected, {
+    tool: 'codex',
+    provider: 'openai',
+    model: 'm3',
+    thinking_level: 'low',
+    quota_bucket: null,
+  });
+});
+
+for (const alias of ['codex-subscription-example', 'codex', 'pi_codex', 'pi_xai', 'antigravity']) {
+  test(`legacy alias ${alias} preserves the historical selection without inventing a bucket`, async () => {
+    const event = {
+      schema_version: 1,
+      request_id: 'legacy-pi',
+      recorded_at: '2026-10-01T00:00:00.000Z',
+      event: 'launched',
+      selected: {
+        tool: 'pi',
+        provider: 'openai-codex',
+        model: 'historical-model',
+        thinking_level: 'high',
+        account_id: alias,
+      },
+      usage: { input_tokens: 20, output_tokens: 5 },
+    };
+    const text = [event, { ...event, event: 'exited', selected: undefined, exit_code: 0 }]
+      .map((row) => JSON.stringify(row))
+      .join('\n');
+    const files = new Map<string, string>();
+    const { rt, out, modes } = memoryRuntime(files, { XDG_STATE_HOME: '/isolated/state' });
+    files.set(ledgerFile(rt.env), text);
+    const [record] = await readLedger(rt);
+    const selected = {
+      tool: 'pi',
+      provider: 'openai-codex',
+      model: 'historical-model',
+      thinking_level: 'high',
+      quota_bucket: null,
+    };
+    assert.deepEqual(record?.selected, selected);
+    assert.equal(record?.event, 'exited');
+    assert.equal(record?.exit_code, 0);
+    assert.deepEqual(record?.usage, { input_tokens: 20, output_tokens: 5 });
+    assert.equal(await run(['router', 'list'], rt), 0);
+    assert.match(out.join(''), /legacy-pi.*pi\/historical-model\/high  -  exited/);
+    out.length = 0;
+    assert.equal(await run(['router', 'show', 'legacy-pi', '--json'], rt), 0);
+    assert.deepEqual(JSON.parse(out.join('')).selected, selected);
+    assert.equal(out.join('').includes('account_id'), false);
+    assert.equal(files.get(ledgerFile(rt.env)), text);
+    assert.deepEqual(modes, []);
+  });
+}
+
+test('legacy selections must validate before account IDs are removed', async () => {
+  const selected = {
+    tool: 'pi',
+    provider: 'openai-codex',
+    model: 'm2',
+    thinking_level: 'high',
+    account_id: 'old-alias',
+  };
+  for (const invalid of [
+    {},
+    { ...selected, tool: 7 },
+    { ...selected, provider: null },
+    { ...selected, model: undefined },
+    { ...selected, thinking_level: [] },
+    { ...selected, account_id: 123 },
+    { ...selected, account_id: undefined },
+    { ...selected, unexpected: 'field' },
+    { ...selected, quota_bucket: 'pi_codex', account_id: 123 },
+  ]) {
+    const files = new Map<string, string>();
+    const { rt } = memoryRuntime(files, { XDG_STATE_HOME: '/isolated/state' });
+    files.set(
+      ledgerFile(rt.env),
+      JSON.stringify({
+        schema_version: 1,
+        request_id: 'invalid-legacy',
+        recorded_at: '2026-10-01T00:00:00.000Z',
+        event: 'launched',
+        selected: invalid,
+      }),
+    );
+    await assert.rejects(
+      readLedger(rt),
+      (error: unknown) => error instanceof StewardError && error.code === 'invalid_input',
+    );
+  }
 });
 
 test('credential scan blocks writes before any filesystem side effect', async () => {

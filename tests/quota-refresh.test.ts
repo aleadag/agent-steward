@@ -1,9 +1,12 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { dirname } from 'node:path';
 import { SnapshotSchema, StewardError } from '../src/contracts.ts';
 import type { QuotaBucket, SnapshotSource } from '../src/contracts.ts';
-import { candidate, config, snapshot, windowFact } from './helpers.ts';
+import { candidate, choice, config, evaluation, recordingPost, snapshot, windowFact } from './helpers.ts';
+import { makeEvaluator } from '../src/jev.ts';
+import { route } from '../src/routing.ts';
 import type { QuotaHttpGet, QuotaRefreshIO } from '../src/quota-refresh.ts';
 import { loadQuota } from '../src/quota.ts';
 import {
@@ -111,6 +114,7 @@ function refreshIO(
     },
     writeText: async (path, text, mode) => {
       operations.push(['write', path, mode]);
+      if (files.has(path)) throw Object.assign(new Error('exists'), { code: 'EEXIST' });
       files.set(path, text);
     },
     rename: async (from, to) => {
@@ -155,13 +159,17 @@ test('refresh writes a private atomic snapshot without Jev or auth-store writes'
     },
   ]);
   const dest = `${quotaDir}/codex.json`;
+  const temp = operations.find(([op]) => op === 'write')?.[1];
+  assert.ok(typeof temp === 'string');
+  assert.equal(dirname(temp), quotaDir);
+  assert.notEqual(temp, dest);
   assert.deepEqual(
     operations.filter(([op]) => op !== 'read'),
     [
       ['mkdir', quotaDir, 0o700],
       ['chmod', quotaDir, 0o700],
-      ['write', `${dest}.tmp`, 0o600],
-      ['rename', `${dest}.tmp`, dest],
+      ['write', temp, 0o600],
+      ['rename', temp, dest],
     ],
   );
   const body = files.get(dest)!;
@@ -172,7 +180,7 @@ test('refresh writes a private atomic snapshot without Jev or auth-store writes'
   assert.equal(saved.windows[0]?.observed_at, observed);
   for (const secret of [nativeAccess, 'private@example.com', 'raw-account']) assert.ok(!body.includes(secret));
   assert.equal(files.get('/home/.codex/auth.json'), authBefore);
-  assert.equal(files.has(`${dest}.tmp`), false);
+  assert.equal(files.has(temp), false);
 });
 
 test('refresh uses distinct Pi credentials, pinned headers, and XDG state paths', async () => {
@@ -326,6 +334,10 @@ for (const bucket of ['codex', 'pi_codex'] as const) {
     ['access token', nativeAccess],
     ['embedded access token', `reserve-${nativeAccess}-weekly`],
     ['recognizable credential', `password =\n${'A'.repeat(20)}`],
+    ['account identity', 'acct'],
+    ['embedded account identity', 'reserve-acct-weekly'],
+    ['email', 'private@example.com'],
+    ['embedded email', 'reserve-private@example.com-weekly'],
   ]) {
     for (const changed of [false, true]) {
       test(`${bucket} rejects ${label} in window IDs and ${changed ? 'invalidates changed' : 'preserves same'} identity`, async () => {
@@ -347,9 +359,55 @@ for (const bucket of ['codex', 'pi_codex'] as const) {
           operations.filter(([op]) => op !== 'read'),
           changed ? [['unlink', dest]] : [],
         );
-        assert.equal(files.has(`${dest}.tmp`), false);
+        assert.deepEqual(
+          [...files.keys()].filter((path) => path.startsWith(`${dest}.`)),
+          [],
+        );
       });
     }
+  }
+}
+
+for (const bucket of ['codex', 'pi_codex'] as const) {
+  for (const [label, id] of [
+    ['account identity', 'acct'],
+    ['embedded account identity', 'reserve-acct-weekly'],
+    ['email', 'private@example.com'],
+    ['embedded email', 'reserve-private@example.com-weekly'],
+  ] as const) {
+    test(`${bucket} keeps ${label} out of snapshots, loaded quota, route output, and Jev bodies`, async () => {
+      const { io, files } = refreshIO(async () => ({
+        status: 200,
+        body: JSON.stringify({
+          ...codexUsage(measured()),
+          additional_rate_limits: [{ limit_name: id, rate_limit: { primary_window: measured() } }],
+        }),
+      }));
+      const configuration = refreshConfig([bucket]);
+      const refreshed = await refreshQuota(configuration, io);
+      const quota = await loadQuota(configuration, { ...io, now, diagnostic: () => {} });
+      const { post, requests } = recordingPost(evaluation({ pair: choice({ 'candidate-0': 1 }) }));
+      const selected = await route({
+        task: 'Review the parser',
+        requestId: 'privacy-regression',
+        config: configuration,
+        quota,
+        evaluate: makeEvaluator({ model: 'jev-1.13.0', apiKey: 'unit-key-not-live', post }),
+      });
+      assert.equal(requests.length, 1);
+      for (const [boundary, text] of [
+        ['snapshot', files.get(`${quotaDir}/${bucket}.json`) ?? ''],
+        ['loaded quota', JSON.stringify([...quota.values()])],
+        ['route output', JSON.stringify(selected)],
+        ['Jev body', requests[0]!.body],
+      ] as const) {
+        assert.equal(text.includes(id), false, `${boundary} exposed ${label}`);
+      }
+      assert.deepEqual(refreshed, { buckets: [{ bucket, status: 'malformed' }] });
+      assert.equal(files.has(`${quotaDir}/${bucket}.json`), false);
+      assert.equal(selected.quota.snapshot_status, 'missing');
+      assert.equal(selected.quota.account_status, 'unknown');
+    });
   }
 }
 
@@ -397,7 +455,10 @@ for (const oversized of [false, true]) {
         );
         assert.deepEqual(diagnostics, []);
       }
-      assert.equal(files.has(`${dest}.tmp`), false);
+      assert.deepEqual(
+        [...files.keys()].filter((path) => path.startsWith(`${dest}.`)),
+        [],
+      );
     });
   }
 }
@@ -436,8 +497,78 @@ test('successful changed identity replaces the previous snapshot', async () => {
   );
 });
 
+test('overlapping refreshes publish independently with exclusive temporary-file creation', async () => {
+  const { io, files, operations } = refreshIO();
+  let signalFirstCreated!: () => void;
+  const firstCreated = new Promise<void>((resolve) => {
+    signalFirstCreated = resolve;
+  });
+  let releaseFirst!: () => void;
+  const firstReleased = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const writeText = io.writeText;
+  let writes = 0;
+  io.writeText = async (...args) => {
+    await writeText(...args);
+    if (++writes === 1) {
+      signalFirstCreated();
+      await firstReleased;
+    }
+  };
+  const configuration = refreshConfig(['codex']);
+  const first = Promise.allSettled([refreshQuota(configuration, io)]);
+  await firstCreated;
+  const second = await Promise.allSettled([refreshQuota(configuration, io)]);
+  releaseFirst();
+  const expected = [{ status: 'fulfilled', value: { buckets: [{ bucket: 'codex', status: 'written' }] } }];
+  assert.deepEqual(await first, expected);
+  assert.deepEqual(second, expected);
+  const temps = operations.filter(([op]) => op === 'write').map(([, path]) => path);
+  assert.equal(new Set(temps).size, 2);
+  for (const temp of temps) assert.equal(files.has(temp as string), false);
+  assert.equal(
+    SnapshotSchema.parse(JSON.parse(files.get(`${quotaDir}/codex.json`)!)).windows[0]?.remaining_percent,
+    75,
+  );
+  assert.deepEqual(
+    operations.filter(([op]) => op === 'unlink'),
+    [],
+  );
+});
+
+test("failed exclusive creation never unlinks another writer's temporary file", async () => {
+  const { io, files, operations } = refreshIO();
+  let foreignTemp = '';
+  io.writeText = async (path) => {
+    foreignTemp = path;
+    files.set(path, 'another writer owns these bytes');
+    throw Object.assign(new Error('exists'), { code: 'EEXIST' });
+  };
+  await assert.rejects(refreshQuota(refreshConfig(['codex']), io), { code: 'EEXIST' });
+  assert.equal(files.get(foreignTemp), 'another writer owns these bytes');
+  assert.deepEqual(
+    operations.filter(([op]) => op === 'unlink'),
+    [],
+  );
+});
+
+for (const phase of ['mkdirp', 'chmod'] as const) {
+  test(`${phase} failure before temporary-file creation does not unlink anything`, async () => {
+    const { io, operations } = refreshIO();
+    io[phase] = async () => {
+      throw new Error('permission denied');
+    };
+    await assert.rejects(refreshQuota(refreshConfig(['codex']), io), /permission denied/);
+    assert.deepEqual(
+      operations.filter(([op]) => op === 'unlink' || op === 'write'),
+      [],
+    );
+  });
+}
+
 test('failed atomic rename cleans up its temporary file and does not claim written', async () => {
-  const { io, files } = refreshIO();
+  const { io, files, operations } = refreshIO();
   const dest = `${quotaDir}/codex.json`;
   const previous = storedSnapshot('codex');
   files.set(dest, previous);
@@ -445,7 +576,13 @@ test('failed atomic rename cleans up its temporary file and does not claim writt
     throw new Error('rename failed');
   };
   await assert.rejects(refreshQuota(refreshConfig(['codex']), io));
-  assert.equal(files.has(`${dest}.tmp`), false);
+  const temp = operations.find(([op]) => op === 'write')?.[1];
+  assert.ok(typeof temp === 'string');
+  assert.equal(files.has(temp), false);
+  assert.deepEqual(
+    operations.filter(([op]) => op === 'unlink'),
+    [['unlink', temp]],
+  );
   assert.equal(files.get(dest), previous);
 });
 

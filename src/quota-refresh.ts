@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join } from 'node:path';
 import { SnapshotSchema, StewardError } from './contracts.ts';
 import type { Config, QuotaBucket, QuotaWindow, ReadText, SnapshotSource } from './contracts.ts';
@@ -320,6 +320,10 @@ export async function refreshQuota(
         identity_fingerprint: identityFingerprint,
         windows: mapped.windows,
       });
+      // Provider labels are untrusted: reject identity substrings and any email
+      // separator before they can reach disk, routing output, or Jev state.
+      if (snapshot.windows.some(({ id }) => id?.includes(identity) || id?.includes('@')))
+        throw new StewardError('credential_detected');
       // A schema-validated snapshot always serializes to a string.
       serialized = assertNoCredentials(snapshot, auth.access)!;
       assertByteLength(serialized);
@@ -328,14 +332,16 @@ export async function refreshQuota(
       result.push({ bucket, status: 'malformed' });
       continue;
     }
-    const temp = `${dest}.tmp`;
+    const temp = `${dest}.${randomUUID()}.tmp`;
+    let tempCreated = false;
     try {
       await io.mkdirp(dirname(dest), 0o700);
       await io.chmod(dirname(dest), 0o700);
       await io.writeText(temp, serialized, 0o600);
+      tempCreated = true;
       await io.rename(temp, dest);
     } catch (error) {
-      await unlinkIfPresent(temp, io);
+      if (tempCreated) await unlinkIfPresent(temp, io);
       await invalidatePrevious(dest, identityFingerprint, io);
       throw error;
     }
