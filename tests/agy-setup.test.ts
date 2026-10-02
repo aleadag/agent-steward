@@ -36,6 +36,23 @@ async function fixture(run: (paths: ReturnType<typeof agyPaths>) => Promise<void
     await fs.rm(home, { recursive: true, force: true });
   }
 }
+test('empty native renderer type is preserved through setup and upgrade', async () =>
+  fixture(async (paths) => {
+    for (const enabled of [true, false]) {
+      await fs.rm(paths.manifest, { force: true });
+      const original = { type: '', command: '/old/render', padding: 2, enabled };
+      await fs.writeFile(paths.settings, JSON.stringify({ unrelated: 'keep', statusLine: original }));
+      await setupAgy(paths, ['/installed/steward'], setupFS);
+      assert.deepEqual((await verifyAgySetup(paths, setupFS))?.previousStatusLine, original);
+      const installed = JSON.parse(await setupFS.readText(paths.settings));
+      assert.equal(installed.unrelated, 'keep');
+      assert.equal(installed.statusLine.type, 'command');
+      assert.equal(installed.statusLine.padding, 2);
+      await setupAgy(paths, ['/upgraded/steward'], setupFS);
+      assert.deepEqual((await verifyAgySetup(paths, setupFS))?.previousStatusLine, original);
+    }
+  }));
+
 test('a manually installed unquoted hook is not wrapped without ownership metadata', async () =>
   fixture(async (paths) => {
     const settings = JSON.parse(await setupFS.readText(paths.settings));

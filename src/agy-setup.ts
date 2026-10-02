@@ -9,7 +9,7 @@ import { assertByteLength, assertJsonDepth } from './limits.ts';
 
 export type AgyPaths = { auth: string; settings: string; state: string; workdir: string; manifest: string };
 const statusLineSchema = z
-  .object({ type: z.literal('command'), command: z.string().min(1), enabled: z.boolean().optional() })
+  .object({ type: z.enum(['', 'command']), command: z.string().min(1), enabled: z.boolean().optional() })
   .passthrough();
 const manifestSchema = z.strictObject({
   schema_version: z.literal(1),
