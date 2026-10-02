@@ -1,6 +1,6 @@
 import { buildCommand, validateCandidateSyntax } from './commands.ts';
 import { ConfigSchema, ResultSchema, StewardError } from './contracts.ts';
-import type { Candidate, Config, QuotaFacts, SelectedResult } from './contracts.ts';
+import type { Config, QuotaFacts, SelectedResult } from './contracts.ts';
 import { choiceWinner, validateEvaluation } from './jev.ts';
 import type { Evaluate, Evaluation, Questions } from './jev.ts';
 

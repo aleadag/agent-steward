@@ -9,6 +9,7 @@ const AGY_MODEL_LEVELS = new Map<string, readonly string[]>([
   ['gemini-3.6-flash', ['low', 'medium', 'high']],
   ['gemini-3.1-pro', ['low', 'high']],
 ]);
+// eslint-disable-next-line no-control-regex -- Reject ASCII controls in executable arguments.
 const ASCII_CONTROLS = /[\x00-\x1f\x7f]/;
 
 function invalidConfig(): never {

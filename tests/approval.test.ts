@@ -588,7 +588,7 @@ test('real evaluator rejects recognizable credentials in all approval fields bef
   ];
   for (const [label, makeInput] of scenarios) {
     await runSubcase(label, async () => {
-      const { post, requests } = recordingPost((wire) => answersFor('approve_command'));
+      const { post, requests } = recordingPost(() => answersFor('approve_command'));
       const evaluate = makeEvaluator({ model: 'jev-1.13.0', apiKey: secret, post });
       await assert.rejects(
         assessApproval(makeInput(), {
@@ -605,7 +605,7 @@ test('real evaluator rejects recognizable credentials in all approval fields bef
 });
 
 test('real evaluator uses the recording fake post and returns one complete evaluation', async () => {
-  const { post, requests } = recordingPost((wire) => answersFor('approve_command'));
+  const { post, requests } = recordingPost(() => answersFor('approve_command'));
   const evaluate = makeEvaluator({ model: 'jev-1.13.0', apiKey: 'non-secret-fixture-key', post });
   const result = await assessApproval(approval(), {
     thresholds: { risky: 0.6, choiceConfidence: 0.45 },

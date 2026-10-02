@@ -55,6 +55,7 @@ function identity(pane: AgentSnapshot, paneId: string): string | null {
       session.source !== 'herdr:pi' ||
       !isAbsolute(session.value) ||
       !session.value.endsWith('.jsonl') ||
+      // eslint-disable-next-line no-control-regex -- Reject ASCII controls in session paths.
       /[\x00-\x1f\x7f]/.test(session.value)
     )
       return null;

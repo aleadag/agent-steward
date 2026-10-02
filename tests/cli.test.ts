@@ -1269,6 +1269,7 @@ test('human cards JSON-escape untrusted metadata and generated IDs are credentia
   });
   assert.equal(await run(['router', 'start', 'task', '--dry-run'], io), 0);
   assert.match(out.join(''), /generated\\u001b/);
+  // eslint-disable-next-line no-control-regex -- Verify a raw terminal escape never reaches the human card.
   assert.doesNotMatch(out.join(''), /generated\u001b/);
 });
 

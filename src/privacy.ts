@@ -5,7 +5,7 @@ const patterns = [
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
   /\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/,
   /\bAKIA[0-9A-Z]{16}\b/,
-  /\bBearer\s+[A-Za-z0-9._~+\/-]{12,}={0,2}\b/i,
+  /\bBearer\s+[A-Za-z0-9._~+/-]{12,}={0,2}\b/i,
   /\b(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*["']?[^\s"',;]{8,}/i,
 ];
 const credentialKey = /^(api[_-]?key|access[_-]?token|client[_-]?secret|password)$/i;
