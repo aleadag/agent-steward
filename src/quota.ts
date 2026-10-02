@@ -56,17 +56,26 @@ async function readSnapshot(
     return { status: 'unreadable' };
   }
 
-  let snapshot: Snapshot;
+  let parsed: unknown;
   try {
     assertByteLength(text);
-    const parsed: unknown = JSON.parse(text);
+    parsed = JSON.parse(text);
     assertJsonDepth(parsed);
-    snapshot = SnapshotSchema.parse(parsed);
   } catch {
     diagnostic('quota_malformed');
     return { status: 'malformed' };
   }
 
+  const validated = SnapshotSchema.safeParse(parsed);
+  if (!validated.success) {
+    if (validated.error.issues.every((issue) => issue.path[0] === 'identity_fingerprint')) {
+      diagnostic('quota_identity_mismatch');
+      return { status: 'identity_mismatch' };
+    }
+    diagnostic('quota_malformed');
+    return { status: 'malformed' };
+  }
+  const snapshot = validated.data;
   if (snapshot.source !== bucket) {
     diagnostic('quota_identity_mismatch');
     return { status: 'identity_mismatch' };
@@ -88,6 +97,8 @@ function classifyWindow(window: QuotaWindow, now: string): QuotaWindowFact {
     status: reason === null ? 'known' : 'unknown',
     reason,
     scope: window.scope,
+    ...(window.id === undefined ? {} : { id: window.id }),
+    ...(window.cadence === undefined ? {} : { cadence: window.cadence }),
     remaining_percent: reason === null ? window.remaining_percent : null,
     reset_at: window.reset_at,
     observed_at: window.observed_at,

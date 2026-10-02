@@ -176,6 +176,42 @@ test('reads each referenced bucket once and does not mix equal pool IDs across b
   assert.equal(quota.get('pi-primary').quota_bucket, 'pi_codex');
 });
 
+test('reads each enabled collectable bucket once from XDG state per invocation', async () => {
+  const cfg = config({
+    candidates: [
+      candidate(),
+      candidate({ id: 'codex-second' }),
+      candidate({ id: 'pi-codex', tool: 'pi', quota_bucket: 'pi_codex' }),
+      candidate({ id: 'pi-xai', tool: 'pi', quota_bucket: 'pi_xai' }),
+      candidate({ id: 'agy', tool: 'agy', quota_bucket: 'antigravity' }),
+    ],
+  });
+  for (let invocation = 0; invocation < 2; invocation++) {
+    const reads: string[] = [];
+    const quota = await loadQuota(cfg, {
+      env: { XDG_STATE_HOME: '/state', HOME: '/home' },
+      now,
+      readText: async (path) => {
+        reads.push(path);
+        if (path.endsWith('/codex.json')) return JSON.stringify(snapshot([windowFact({ type: 'account' })]));
+        if (path.endsWith('/pi_codex.json')) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+        throw new Error('unreadable');
+      },
+      diagnostic: () => {},
+    });
+    assert.deepEqual(reads.sort(), [
+      '/state/agent-steward/quota/codex.json',
+      '/state/agent-steward/quota/pi_codex.json',
+      '/state/agent-steward/quota/pi_xai.json',
+    ]);
+    assert.equal(quota.get('codex-astra').snapshot_status, 'loaded');
+    assert.equal(quota.get('codex-second').snapshot_status, 'loaded');
+    assertFactsUnknown(quota.get('pi-codex'), 'missing');
+    assertFactsUnknown(quota.get('pi-xai'), 'unreadable');
+    assertFactsUnknown(quota.get('agy'), 'missing');
+  }
+});
+
 test('disabled candidates and empty inventory do not read snapshots', async () => {
   for (const cfg of [config({ tools: ['pi'] }), config({ tools: [], candidates: [] })]) {
     let reads = 0;
@@ -195,13 +231,17 @@ test('disabled candidates and empty inventory do not read snapshots', async () =
 test('unsupported bucket produces unknown facts and safe diagnostics without a read', async () => {
   const cfg = config({ candidates: [candidate({ tool: 'agy', quota_bucket: 'antigravity' })] });
   const diagnostics: string[] = [];
+  let reads = 0;
   const quota = await loadQuota(cfg, {
+    env: {},
     now,
     readText: async () => {
+      reads++;
       throw new Error('/private/quota.json');
     },
     diagnostic: (code) => diagnostics.push(code),
   });
+  assert.equal(reads, 0);
   assertFactsUnknown(quota.get('codex-astra'), 'missing');
   assert.deepEqual(diagnostics, ['quota_missing']);
 });
@@ -250,6 +290,82 @@ test('snapshot source must match configured bucket', async () => {
     assertFactsUnknown(quota.get('codex-astra'), 'identity_mismatch');
     assert.deepEqual(diagnostics, ['quota_identity_mismatch']);
   }
+});
+
+test('missing or invalid fingerprint yields identity mismatch with no usable facts', async () => {
+  for (const identity_fingerprint of [undefined, null, '', ' ', 'ab'.repeat(31), 'AB'.repeat(32), 'g'.repeat(64), 42]) {
+    const diagnostics: string[] = [];
+    const quota = await loadQuota(config(), {
+      now,
+      readText: async () => JSON.stringify(snapshot([windowFact({ type: 'account' })], { identity_fingerprint })),
+      diagnostic: (code) => diagnostics.push(code),
+    });
+    assertFactsUnknown(quota.get('codex-astra'), 'identity_mismatch');
+    assert.deepEqual(diagnostics, ['quota_identity_mismatch']);
+  }
+});
+
+test('missing fingerprint does not bypass snapshot schema validation', async () => {
+  for (const overrides of [{ schema_version: 2 }, { extra: true }, { windows: [{}] }]) {
+    const diagnostics: string[] = [];
+    const quota = await loadQuota(config(), {
+      now,
+      readText: async () => JSON.stringify(snapshot([], { identity_fingerprint: undefined, ...overrides })),
+      diagnostic: (code) => diagnostics.push(code),
+    });
+    assertFactsUnknown(quota.get('codex-astra'), 'malformed');
+    assert.deepEqual(diagnostics, ['quota_malformed']);
+  }
+});
+
+test('window facts retain optional metadata without exposing stale capacity', async () => {
+  const data = snapshot([
+    windowFact({ type: 'account' }, { id: 'credits', cadence: 'weekly' }),
+    windowFact({ type: 'account' }, { id: 'reserve', cadence: 'other', valid_until: '2026-09-28T10:30:00Z' }),
+    windowFact({ type: 'account' }, { id: 'id-only' }),
+    windowFact({ type: 'account' }, { cadence: 'other' }),
+    windowFact({ type: 'account' }),
+  ]);
+  const quota = await loadQuota(config(), { now, readText: async () => JSON.stringify(data), diagnostic: () => {} });
+  const facts = quota.get('codex-astra');
+  assert.deepEqual(
+    facts.windows.map((w) => [w.id, w.cadence, w.remaining_percent]),
+    [
+      ['credits', 'weekly', 40],
+      ['reserve', 'other', null],
+      ['id-only', undefined, 40],
+      [undefined, 'other', 40],
+      [undefined, undefined, 40],
+    ],
+  );
+  assert.equal(Object.hasOwn(windowAt(facts, 3), 'id'), false);
+  assert.equal(Object.hasOwn(windowAt(facts, 2), 'cadence'), false);
+  assert.equal(Object.hasOwn(windowAt(facts, 4), 'id'), false);
+  assert.equal(Object.hasOwn(windowAt(facts, 4), 'cadence'), false);
+});
+
+test('account-scoped weekly extras apply to every candidate without inventing a pool match', async () => {
+  const cfg = config({ candidates: [candidate(), candidate({ id: 'other', quota_pool: 'absent' })] });
+  const data = snapshot([
+    windowFact({ type: 'pool', pool_id: 'primary' }, { id: 'primary', cadence: 'weekly', remaining_percent: 70 }),
+    windowFact({ type: 'account' }, { id: 'gpt-reserve', cadence: 'weekly', remaining_percent: 10 }),
+  ]);
+  const quota = await loadQuota(cfg, { now, readText: async () => JSON.stringify(data), diagnostic: () => {} });
+  assert.deepEqual(
+    quota.get('codex-astra').windows.map((w) => [w.id, w.cadence, w.remaining_percent]),
+    [
+      ['primary', 'weekly', 70],
+      ['gpt-reserve', 'weekly', 10],
+    ],
+  );
+  assert.deepEqual(
+    quota.get('other').windows.map((w) => [w.id, w.cadence, w.remaining_percent]),
+    [['gpt-reserve', 'weekly', 10]],
+  );
+  assert.equal(quota.get('codex-astra').pool_status, 'known');
+  assert.equal(quota.get('other').pool_status, 'unknown');
+  assert.equal(quota.get('codex-astra').account_status, 'known');
+  assert.equal(quota.get('other').account_status, 'known');
 });
 
 test('expired, reset, and future-observed windows retain dates but never usable capacity', async () => {
