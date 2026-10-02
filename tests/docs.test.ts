@@ -45,6 +45,12 @@ async function emittedHelp(): Promise<string> {
   const out: string[] = [];
   const runtime: Runtime = {
     env: {},
+    fileSize: async () => {
+      throw new Error('help must not stat files');
+    },
+    withLedgerLock: async () => {
+      throw new Error('help must not lock files');
+    },
     appendText: async () => {
       throw new Error('help must not write files');
     },

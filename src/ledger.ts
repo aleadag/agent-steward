@@ -26,12 +26,17 @@ const EventSchema = z
 
 export type LedgerEvent = z.infer<typeof EventSchema>;
 export type LedgerEventKind = LedgerEvent['event'];
-type LedgerRuntime = {
+const MAX_LEDGER_BYTES = 5 * 1024 * 1024;
+
+export type LedgerRuntime = {
   env: { XDG_STATE_HOME?: string; HOME?: string; TYPESAFE_API_KEY?: string };
   appendText: (path: string, text: string) => Promise<void>;
   readTextIfPresent: (path: string) => Promise<string | null>;
   mkdirp: (path: string, mode: number) => Promise<void>;
   chmod: (path: string, mode: number) => Promise<void>;
+  fileSize: (path: string) => Promise<number>;
+  rename: (from: string, to: string) => Promise<void>;
+  withLedgerLock: <T>(path: string, action: () => Promise<T>) => Promise<T>;
 };
 
 export function ledgerFile(env: { XDG_STATE_HOME?: string; HOME?: string }): string {
@@ -44,11 +49,21 @@ export async function appendEvent(runtime: LedgerRuntime, event: LedgerEvent): P
   const text = JSON.stringify(event);
   assertNoCredentials(text, runtime.env.TYPESAFE_API_KEY ?? '');
   if (!EventSchema.safeParse(event).success) throw new StewardError('invalid_input');
+  const line = `${text}\n`;
+  const bytes = Buffer.byteLength(line, 'utf8');
+  if (bytes > MAX_LEDGER_BYTES) throw new StewardError('invalid_input');
   const file = ledgerFile(runtime.env);
   await runtime.mkdirp(path.dirname(file), 0o700);
   await runtime.chmod(path.dirname(file), 0o700);
-  await runtime.appendText(file, `${text}\n`);
-  await runtime.chmod(file, 0o600);
+  await runtime.withLedgerLock(file, async () => {
+    const size = await runtime.fileSize(file);
+    if (size > 0 && size + bytes > MAX_LEDGER_BYTES) {
+      await runtime.chmod(file, 0o600);
+      await runtime.rename(file, `${file}.1`);
+    }
+    await runtime.appendText(file, line);
+    await runtime.chmod(file, 0o600);
+  });
 }
 
 const SelectedSchema = EventSchema.shape.selected.unwrap();
@@ -65,9 +80,15 @@ const ReadEventSchema = EventSchema.extend({
 type LedgerRecord = z.infer<typeof ReadEventSchema>;
 
 export async function readLedger(runtime: LedgerRuntime): Promise<LedgerRecord[]> {
-  const text = await runtime.readTextIfPresent(ledgerFile(runtime.env));
-  if (text === null) return [];
-  assertNoCredentials(text, runtime.env.TYPESAFE_API_KEY ?? '');
+  const file = ledgerFile(runtime.env);
+  const texts = await runtime.withLedgerLock(file, async () => [
+    await runtime.readTextIfPresent(`${file}.1`),
+    await runtime.readTextIfPresent(file),
+  ]);
+  for (const text of texts) {
+    if (text !== null) assertNoCredentials(text, runtime.env.TYPESAFE_API_KEY ?? '');
+  }
+  const text = texts.filter((text) => text !== null).join('\n');
   const folded = new Map<string, LedgerRecord>();
   for (const line of text.split('\n').filter((line) => line.trim() !== '')) {
     let event: LedgerRecord;

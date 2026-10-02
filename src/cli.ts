@@ -14,7 +14,7 @@ import { assessStop } from './triage.ts';
 import { assertLiveTask, buildNativeLaunch } from './launch.ts';
 import type { NativeLaunch } from './launch.ts';
 import { appendEvent, readLedger, formatLedgerRecord } from './ledger.ts';
-import type { LedgerEventKind } from './ledger.ts';
+import type { LedgerEventKind, LedgerRuntime } from './ledger.ts';
 
 export type Invocation =
   | { kind: 'help' }
@@ -30,6 +30,8 @@ export type Runtime = QuotaRefreshIO & {
   readTextIfPresent: (path: string) => Promise<string | null>;
   mkdirp: (path: string, mode: number) => Promise<void>;
   chmod: (path: string, mode: number) => Promise<void>;
+  fileSize: LedgerRuntime['fileSize'];
+  withLedgerLock: LedgerRuntime['withLedgerLock'];
   cwd: string;
   readText: (path: string) => Promise<string>;
   readStdin: () => Promise<string>;

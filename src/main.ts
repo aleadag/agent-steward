@@ -8,6 +8,7 @@ import type { QuotaHttpGet } from './quota-refresh.ts';
 import { postHttps } from './jev.ts';
 import { readBoundedUtf8, readFileText } from './io.ts';
 import { run } from './cli.ts';
+import { fileSize, withLedgerLock } from './ledger-io.ts';
 import { launchForeground } from './process.ts';
 import type { NativeLaunch } from './launch.ts';
 
@@ -91,6 +92,8 @@ const runtime = {
   rename,
   unlink,
   httpGet,
+  fileSize,
+  withLedgerLock,
   appendText: async (path: string, text: string) => {
     try {
       await chmod(path, 0o600);

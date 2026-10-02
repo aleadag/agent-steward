@@ -27,6 +27,8 @@ function runtime(overrides: Partial<Runtime> = {}) {
       files.set(path, (files.get(path) ?? '') + text);
     },
     readTextIfPresent: async (path) => files.get(path) ?? null,
+    fileSize: async (path) => Buffer.byteLength(files.get(path) ?? ''),
+    withLedgerLock: async (_path, action) => action(),
     writeText: async (path, text) => {
       files.set(path, text);
     },

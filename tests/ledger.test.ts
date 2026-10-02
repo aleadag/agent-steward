@@ -1,7 +1,11 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { appendEvent, ledgerFile, readLedger } from '../src/ledger.ts';
 import { StewardError } from '../src/contracts.ts';
+import { fileSize, withLedgerLock } from '../src/ledger-io.ts';
 import { run } from '../src/cli.ts';
 import type { Runtime } from '../src/cli.ts';
 
@@ -28,6 +32,8 @@ function memoryRuntime(files: Map<string, string>, env: Runtime['env']) {
       files.set(path, (files.get(path) ?? '') + text);
     },
     readTextIfPresent: async (path) => files.get(path) ?? null,
+    fileSize: async (path) => Buffer.byteLength(files.get(path) ?? ''),
+    withLedgerLock: async (_path, action) => action(),
     mkdirp: async (path, mode) => {
       modes.push([path, mode]);
     },
@@ -58,6 +64,204 @@ function memoryRuntime(files: Map<string, string>, env: Runtime['env']) {
   };
   return { rt, out, err, modes };
 }
+
+const rotationLimit = 5 * 1024 * 1024;
+
+async function diskRuntime() {
+  const root = await mkdtemp(path.join(tmpdir(), 'steward-ledger-'));
+  const { rt } = memoryRuntime(new Map(), { XDG_STATE_HOME: root });
+  const runtime = {
+    ...rt,
+    appendText: async (file: string, text: string) => {
+      await appendFile(file, text, { mode: 0o600 });
+    },
+    readTextIfPresent: async (file: string) => {
+      try {
+        return await readFile(file, 'utf8');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+      }
+    },
+    fileSize,
+    withLedgerLock,
+    mkdirp: async (directory: string, mode: number) => {
+      await mkdir(directory, { recursive: true, mode });
+    },
+    chmod,
+    rename,
+  };
+  const file = ledgerFile(runtime.env);
+  await mkdir(path.dirname(file), { mode: 0o700 });
+  return { runtime, file, cleanup: () => rm(root, { recursive: true, force: true }) };
+}
+
+const rotationEvent = {
+  schema_version: 1 as const,
+  request_id: 'boundary',
+  recorded_at: '2026-10-02T00:00:00.000Z',
+  event: 'dry-run' as const,
+};
+
+test('rotation keeps an exact-limit file and replaces only one backup on overflow', async () => {
+  const { runtime, file, cleanup } = await diskRuntime();
+  try {
+    const line = `${JSON.stringify(rotationEvent)}\n`;
+    const prefix = ' '.repeat(rotationLimit - Buffer.byteLength(line));
+    await writeFile(file, prefix, { mode: 0o600 });
+    await appendEvent(runtime, rotationEvent);
+    assert.equal((await stat(file)).size, rotationLimit);
+    assert.equal(await runtime.readTextIfPresent(`${file}.1`), null);
+    await writeFile(`${file}.1`, 'obsolete', { mode: 0o644 });
+    await appendEvent(runtime, { ...rotationEvent, request_id: 'new' });
+    assert.equal(await readFile(`${file}.1`, 'utf8'), prefix + line);
+    assert.equal((await stat(`${file}.1`)).mode & 0o777, 0o600);
+    assert.equal((await stat(file)).mode & 0o777, 0o600);
+    assert.deepEqual(
+      (await readLedger(runtime)).map((record) => record.request_id),
+      ['new', 'boundary'],
+    );
+    await writeFile(file, ' '.repeat(rotationLimit), { mode: 0o600 });
+    await appendEvent(runtime, { ...rotationEvent, request_id: 'latest' });
+    assert.equal(await readFile(`${file}.1`, 'utf8'), ' '.repeat(rotationLimit));
+    assert.deepEqual(
+      (await readLedger(runtime)).map((record) => record.request_id),
+      ['latest'],
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test('history folds backup before current and reads a backup without a current file', async () => {
+  const { runtime, file, cleanup } = await diskRuntime();
+  try {
+    const launched = {
+      ...rotationEvent,
+      event: 'launched',
+      selected: { tool: 'pi', provider: 'openai', model: 'm1', thinking_level: 'low', quota_bucket: 'pi_codex' },
+    };
+    await writeFile(`${file}.1`, JSON.stringify(launched));
+    assert.equal((await readLedger(runtime))[0]?.event, 'launched');
+    await appendEvent(runtime, { ...rotationEvent, event: 'exited', exit_code: 0 });
+    const [record] = await readLedger(runtime);
+    assert.equal(record?.event, 'exited');
+    assert.equal(record?.selected?.model, 'm1');
+    assert.equal(record?.exit_code, 0);
+    await writeFile(`${file}.1`, 'invalid json');
+    await assert.rejects(readLedger(runtime), StewardError);
+    await writeFile(`${file}.1`, JSON.stringify({ ...rotationEvent, request_id: 'secret' }));
+    runtime.env.TYPESAFE_API_KEY = 'secret';
+    await assert.rejects(readLedger(runtime), StewardError);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('concurrent rotation retains every new event and releases the lock after failure', async () => {
+  const { runtime, file, cleanup } = await diskRuntime();
+  try {
+    await writeFile(file, ' '.repeat(rotationLimit), { mode: 0o600 });
+    await Promise.all(
+      Array.from({ length: 12 }, (_, index) =>
+        appendEvent(runtime, { ...rotationEvent, request_id: `parallel-${index}` }),
+      ),
+    );
+    assert.equal((await readLedger(runtime)).length, 12);
+    assert.equal((await stat(`${file}.1`)).size, rotationLimit);
+    await assert.rejects(
+      runtime.withLedgerLock(file, async () => {
+        throw new Error('test failure');
+      }),
+    );
+    await appendEvent(runtime, { ...rotationEvent, request_id: 'after-failure' });
+    assert.equal((await readLedger(runtime)).length, 13);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('separate CLI processes serialize rotation with readers', async () => {
+  const { runtime, file, cleanup } = await diskRuntime();
+  try {
+    await writeFile(file, ' '.repeat(rotationLimit), { mode: 0o600 });
+    const ledgerModule = new URL('../src/ledger.ts', import.meta.url).href;
+    const ioModule = new URL('../src/ledger-io.ts', import.meta.url).href;
+    const source = `
+      import { appendEvent, readLedger } from ${JSON.stringify(ledgerModule)};
+      import { fileSize, withLedgerLock } from ${JSON.stringify(ioModule)};
+      import { appendFile, readFile, mkdir, chmod, rename } from 'node:fs/promises';
+      const runtime = {
+        env: ${JSON.stringify(runtime.env)}, fileSize, withLedgerLock, chmod, rename,
+        mkdirp: (p, mode) => mkdir(p, { recursive: true, mode }),
+        appendText: (p, text) => appendFile(p, text, { mode: 0o600 }),
+        readTextIfPresent: async (p) => {
+          try { return await readFile(p, 'utf8'); }
+          catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+        },
+      };
+      await appendEvent(runtime, { ...${JSON.stringify(rotationEvent)}, request_id: process.argv[1] });
+      await readLedger(runtime);
+    `;
+    const processes = Array.from({ length: 6 }, (_, index) =>
+      Bun.spawn([process.execPath, '--eval', source, `process-${index}`], { stdout: 'ignore', stderr: 'pipe' }),
+    );
+    const results = await Promise.all(
+      processes.map(async (child) => ({ code: await child.exited, stderr: await new Response(child.stderr).text() })),
+    );
+    for (const result of results) assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual((await readLedger(runtime)).map((record) => record.request_id).sort(), [
+      'process-0',
+      'process-1',
+      'process-2',
+      'process-3',
+      'process-4',
+      'process-5',
+    ]);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('rotation failure preserves both files and releases the lock', async () => {
+  const { runtime, file, cleanup } = await diskRuntime();
+  try {
+    await writeFile(file, ' '.repeat(rotationLimit), { mode: 0o600 });
+    await writeFile(`${file}.1`, 'previous backup', { mode: 0o600 });
+    await assert.rejects(
+      appendEvent(
+        {
+          ...runtime,
+          rename: async () => {
+            throw new Error('rename failed');
+          },
+        },
+        rotationEvent,
+      ),
+      /rename failed/,
+    );
+    assert.equal((await stat(file)).size, rotationLimit);
+    assert.equal(await readFile(`${file}.1`, 'utf8'), 'previous backup');
+    await appendEvent(runtime, rotationEvent);
+    assert.equal((await readLedger(runtime))[0]?.request_id, 'boundary');
+  } finally {
+    await cleanup();
+  }
+});
+
+test('oversized UTF-8 events are rejected without changing retained history', async () => {
+  const { runtime, file, cleanup } = await diskRuntime();
+  try {
+    await assert.rejects(
+      appendEvent(runtime, { ...rotationEvent, request_id: 'é'.repeat(rotationLimit / 2) }),
+      StewardError,
+    );
+    assert.equal(await runtime.readTextIfPresent(file), null);
+    assert.equal(await runtime.readTextIfPresent(`${file}.1`), null);
+  } finally {
+    await cleanup();
+  }
+});
 
 test('append then list folds by request_id without task text', async () => {
   const files = new Map<string, string>();
