@@ -14,7 +14,7 @@ function recognizable(value: string, apiKey: string): boolean {
   return (apiKey.length > 0 && value.includes(apiKey)) || patterns.some((pattern) => pattern.test(value));
 }
 
-export function assertNoCredentials(content: unknown, apiKey: string): void {
+export function assertNoCredentials(content: unknown, apiKey: string): string | undefined {
   assertJsonDepth(content);
 
   const stack: unknown[] = [content];
@@ -46,4 +46,5 @@ export function assertNoCredentials(content: unknown, apiKey: string): void {
   if (serialized !== undefined && recognizable(serialized, apiKey)) {
     throw new StewardError('credential_detected');
   }
+  return serialized;
 }

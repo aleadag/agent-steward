@@ -56,6 +56,18 @@ test('serialized caller-derived content is checked even if its enumerable form d
   );
 });
 
+test('credential validation returns the checked serialization without serializing twice', () => {
+  let serializations = 0;
+  const content = {
+    toJSON: () => {
+      serializations++;
+      return { safe: true };
+    },
+  };
+  assert.equal(assertNoCredentials(content, ''), '{"safe":true}');
+  assert.equal(serializations, 1);
+});
+
 test('structured credential names reject nonempty string values', () => {
   for (const key of ['api_key', 'api-key', 'APIKEY', 'access_token', 'client-secret', 'password']) {
     const value = Object.fromEntries([[key, 'ordinary-value']]);

@@ -5,6 +5,7 @@ import { SnapshotSchema, StewardError } from '../src/contracts.ts';
 import type { QuotaBucket, SnapshotSource } from '../src/contracts.ts';
 import { candidate, config, snapshot, windowFact } from './helpers.ts';
 import type { QuotaHttpGet, QuotaRefreshIO } from '../src/quota-refresh.ts';
+import { loadQuota } from '../src/quota.ts';
 import {
   authPath,
   fingerprint,
@@ -316,6 +317,87 @@ for (const [label, httpGet, status] of failureResponses) {
         operations.filter(([op]) => op !== 'read'),
         changed ? [['unlink', dest]] : [],
       );
+    });
+  }
+}
+
+for (const bucket of ['codex', 'pi_codex'] as const) {
+  for (const [label, id] of [
+    ['access token', nativeAccess],
+    ['embedded access token', `reserve-${nativeAccess}-weekly`],
+    ['recognizable credential', `password =\n${'A'.repeat(20)}`],
+  ]) {
+    for (const changed of [false, true]) {
+      test(`${bucket} rejects ${label} in window IDs and ${changed ? 'invalidates changed' : 'preserves same'} identity`, async () => {
+        const { io, files, operations } = refreshIO(async () => ({
+          status: 200,
+          body: JSON.stringify({
+            ...codexUsage(measured()),
+            additional_rate_limits: [{ limit_name: id, rate_limit: { primary_window: measured() } }],
+          }),
+        }));
+        const dest = `${quotaDir}/${bucket}.json`;
+        const previous = storedSnapshot(bucket, changed ? 'previous-login' : 'acct');
+        files.set(dest, previous);
+        assert.deepEqual(await refreshQuota(refreshConfig([bucket]), io), {
+          buckets: [{ bucket, status: 'malformed' }],
+        });
+        assert.equal(files.get(dest), changed ? undefined : previous);
+        assert.deepEqual(
+          operations.filter(([op]) => op !== 'read'),
+          changed ? [['unlink', dest]] : [],
+        );
+        assert.equal(files.has(`${dest}.tmp`), false);
+      });
+    }
+  }
+}
+
+for (const oversized of [false, true]) {
+  for (const changed of [false, true]) {
+    test(`mapped snapshot ${oversized ? 'one byte over' : 'at'} reader limit with ${changed ? 'changed' : 'same'} identity`, async () => {
+      // Two windows repeat this 523,917-byte ID. With primary remaining=0 the
+      // snapshot is exactly 1 MiB; remaining=10 adds one byte. UTF-8, not length.
+      const id = 'é'.repeat(261_958) + 'x';
+      const body = JSON.stringify({
+        ...codexUsage(measured({ used_percent: oversized ? 90 : 100 })),
+        additional_rate_limits: [
+          { limit_name: id, rate_limit: { primary_window: measured(), secondary_window: measured() } },
+        ],
+      });
+      assert.ok(Buffer.byteLength(body, 'utf8') < 1_048_576);
+      const { io, files, operations } = refreshIO(async () => ({ status: 200, body }));
+      const dest = `${quotaDir}/codex.json`;
+      const previous = storedSnapshot('codex', changed ? 'previous-login' : 'acct');
+      files.set(dest, previous);
+      const configuration = refreshConfig(['codex']);
+      assert.deepEqual(await refreshQuota(configuration, io), {
+        buckets: [{ bucket: 'codex', status: oversized ? 'malformed' : 'written' }],
+      });
+      if (oversized) {
+        assert.equal(files.get(dest), changed ? undefined : previous);
+        assert.deepEqual(
+          operations.filter(([op]) => op !== 'read'),
+          changed ? [['unlink', dest]] : [],
+        );
+      } else {
+        assert.equal(Buffer.byteLength(files.get(dest)!, 'utf8'), 1_048_576);
+        const diagnostics: string[] = [];
+        const loaded = await loadQuota(configuration, {
+          env: io.env,
+          readText: io.readText,
+          now,
+          diagnostic: (code) => diagnostics.push(code),
+        });
+        const facts = loaded.get('candidate-0')!;
+        assert.equal(facts.snapshot_status, 'loaded');
+        assert.deepEqual(
+          facts.windows.map((window) => window.id),
+          ['primary', id, id],
+        );
+        assert.deepEqual(diagnostics, []);
+      }
+      assert.equal(files.has(`${dest}.tmp`), false);
     });
   }
 }

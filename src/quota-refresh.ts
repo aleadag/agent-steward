@@ -3,6 +3,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { SnapshotSchema, StewardError } from './contracts.ts';
 import type { Config, QuotaBucket, QuotaWindow, ReadText, SnapshotSource } from './contracts.ts';
 import { assertByteLength, assertJsonDepth } from './limits.ts';
+import { assertNoCredentials } from './privacy.ts';
 import { quotaFile } from './quota.ts';
 import { compareRfc3339Timestamps } from './timestamps.ts';
 
@@ -300,22 +301,29 @@ export async function refreshQuota(
       bucket === 'codex'
         ? readCodexAuth(text, now)
         : readPiAuth(text, bucket === 'pi_codex' ? 'openai-codex' : 'xai', now);
-    const mapped =
-      'status' in auth || identity === null
-        ? { status: 'auth' as const }
-        : await collectWindows(bucket, auth.access, identity, now.toISOString(), io.httpGet);
+    if ('status' in auth || identity === null) {
+      await invalidatePrevious(dest, identityFingerprint, io);
+      result.push({ bucket, status: 'auth' });
+      continue;
+    }
+    const mapped = await collectWindows(bucket, auth.access, identity, now.toISOString(), io.httpGet);
     if ('status' in mapped) {
       await invalidatePrevious(dest, identityFingerprint, io);
       result.push({ bucket, status: mapped.status });
       continue;
     }
-    const snapshot = SnapshotSchema.safeParse({
-      schema_version: 1,
-      source: bucket,
-      identity_fingerprint: identityFingerprint,
-      windows: mapped.windows,
-    });
-    if (!snapshot.success) {
+    let serialized: string;
+    try {
+      const snapshot = SnapshotSchema.parse({
+        schema_version: 1,
+        source: bucket,
+        identity_fingerprint: identityFingerprint,
+        windows: mapped.windows,
+      });
+      // A schema-validated snapshot always serializes to a string.
+      serialized = assertNoCredentials(snapshot, auth.access)!;
+      assertByteLength(serialized);
+    } catch {
       await invalidatePrevious(dest, identityFingerprint, io);
       result.push({ bucket, status: 'malformed' });
       continue;
@@ -324,7 +332,7 @@ export async function refreshQuota(
     try {
       await io.mkdirp(dirname(dest), 0o700);
       await io.chmod(dirname(dest), 0o700);
-      await io.writeText(temp, JSON.stringify(snapshot.data), 0o600);
+      await io.writeText(temp, serialized, 0o600);
       await io.rename(temp, dest);
     } catch (error) {
       await unlinkIfPresent(temp, io);
