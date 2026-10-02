@@ -1,3 +1,11 @@
+# Unreleased — native AGY quota
+
+- Run `quota setup agy`, then explicitly trust the dedicated native working directory as described in the [README](README.md#one-time-agy-setup-and-service-operation). Setup preserves the previous statusLine renderer and never grants trust or logs in.
+- `quota refresh [--json]` now collects Antigravity quota without a caller TTY or model turn. Native AGY may renew the existing consumer login; changed or unknown identity invalidates old quota. Routing remains offline.
+- Change AGY candidates from `quota_pool: "primary"` to `"gemini"` or `"third_party"`; both native limits are required per measured pool. Incomplete pools remain unknown.
+
+Linux source and installed checks pass. Darwin native validation remains outstanding. Package version and published alpha tags are unchanged; these changes are not a published release.
+
 # v0.1.0-alpha.3 — quota refresh and relative cost
 
 Approved release notes for `v0.1.0-alpha.3`. Package metadata reports `0.1.0-alpha.3`; remote publication requires separate authorization. Same features as the `v0.1.0-alpha.2` tag, plus Oxfmt on the cost-contract test so the Nix package check passes.

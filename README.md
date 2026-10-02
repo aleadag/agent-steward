@@ -1,6 +1,8 @@
 # Agent-steward
 
-Agent-steward's standalone CLI routes tasks to a native Codex, Pi, or agy executable. `router start --dry-run` produces a route preview; a live `router start <task>` launches the selected native process in the foreground. `stop check` assesses a user-prepared stopped-agent observation but does not send input. `quota refresh` collects measured limits from existing Codex and Pi logins into local snapshots; routing never fetches quota. The CLI does not create steward-managed sessions, inspect existing sessions, adjust effort, or use Herdr to launch agents. Configuration describes a local inventory only. The separate bundled Herdr adapter is opt-in; building this package does not install or activate it.
+Agent-steward's standalone CLI routes tasks to a native Codex, Pi, or agy executable. `router start --dry-run` produces a route preview; a live `router start <task>` launches the selected native process in the foreground. `stop check` assesses a user-prepared stopped-agent observation but does not send input. `quota refresh` collects measured limits from existing Codex, Pi, and AGY logins into local snapshots; routing never fetches quota. The CLI does not create steward-managed sessions, inspect existing sessions, adjust effort, or use Herdr to launch agents. Configuration describes a local inventory only. The separate bundled Herdr adapter is opt-in; building this package does not install or activate it.
+
+See the [release notes](RELEASE_NOTES.md) for unreleased changes and published alpha history.
 
 ## Install and run
 
