@@ -109,7 +109,7 @@ export async function route(input: {
       provider: selectedCandidate.provider,
       model: selectedCandidate.model,
       thinking_level: selectedLevel,
-      account_id: selectedCandidate.account_id,
+      quota_bucket: selectedCandidate.quota_bucket,
       quota_pool: selectedCandidate.quota_pool,
     },
     quota: selectedQuota,

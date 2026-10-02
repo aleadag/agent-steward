@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "codex",
-  "account_id": "codex-subscription-example",
+  "identity_fingerprint": "abababababababababababababababababababababababababababababababab",
   "windows": [
     {
       "scope": { "type": "account" },

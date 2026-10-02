@@ -241,7 +241,7 @@ export function renderDecisionCard(result: SelectedResult): string {
     `provider: ${jsonValue(selected.provider)}`,
     `model: ${jsonValue(selected.model)}`,
     `thinking level: ${jsonValue(selected.thinking_level)}`,
-    `account: ${jsonValue(selected.account_id)}`,
+    `account: ${jsonValue(selected.quota_bucket)}`,
     `quota source: ${jsonValue(quota.source)}`,
     `snapshot status: ${quota.snapshot_status}`,
     `pool: ${jsonValue(selected.quota_pool)}`,
@@ -440,7 +440,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
               provider: selected.selected.provider,
               model: selected.selected.model,
               thinking_level: selected.selected.thinking_level,
-              account_id: selected.selected.account_id,
+              account_id: selected.selected.quota_bucket,
             },
             usage: selected.evaluations.pair.usage,
           }),
@@ -532,7 +532,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
         `provider requested/unverified: ${jsonValue(safeResult.selected.provider)}; ` +
         `model requested/unverified: ${jsonValue(safeResult.selected.model)}; ` +
         `thinking requested/unverified: ${jsonValue(safeResult.selected.thinking_level)}; ` +
-        `account requested/unverified: ${jsonValue(safeResult.selected.account_id)}\n`;
+        `account requested/unverified: ${jsonValue(safeResult.selected.quota_bucket)}\n`;
       assertNoCredentials(summary, apiKey);
       runtime.stderr(summary);
       await recordEvent('launched', safeResult);

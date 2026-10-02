@@ -45,6 +45,62 @@ test('config schema is strict, preserves configured text, and defaults only docu
   assert.equal(ConfigSchema.safeParse({ ...config(), candidates: [candidate({ model: null })] }).success, false);
 });
 
+test('config requires quota_bucket pairing and rejects accounts and account_id', () => {
+  assert.equal(ConfigSchema.safeParse(config()).success, true);
+  assert.equal(ConfigSchema.safeParse({ ...config(), accounts: [] }).success, false);
+  assert.equal(ConfigSchema.safeParse(config({ candidates: [candidate({ account_id: 'shared' })] })).success, false);
+  assert.equal(ConfigSchema.safeParse(config({ candidates: [candidate({ quota_bucket: undefined })] })).success, false);
+  for (const tool of ['codex', 'pi', 'agy']) {
+    for (const quota_bucket of ['codex', 'pi_codex', 'pi_xai', 'antigravity', 'unknown']) {
+      const allowed =
+        tool === 'codex'
+          ? quota_bucket === 'codex'
+          : tool === 'pi'
+            ? ['pi_codex', 'pi_xai'].includes(quota_bucket)
+            : quota_bucket === 'antigravity';
+      assert.equal(
+        ConfigSchema.safeParse(config({ candidates: [candidate({ tool, quota_bucket })] })).success,
+        allowed,
+        `${tool}/${quota_bucket}`,
+      );
+    }
+  }
+});
+
+test('snapshot requires identity_fingerprint and optional window cadence', () => {
+  assert.equal(SnapshotSchema.safeParse(snapshot([windowFact({ type: 'account' })])).success, true);
+  for (const identity_fingerprint of [
+    undefined,
+    '',
+    'ab'.repeat(31),
+    'ab'.repeat(33),
+    'AB'.repeat(32),
+    'gh'.repeat(32),
+  ]) {
+    assert.equal(SnapshotSchema.safeParse({ ...snapshot([]), identity_fingerprint }).success, false);
+  }
+  assert.equal(SnapshotSchema.safeParse({ ...snapshot([]), account_id: 'shared' }).success, false);
+  for (const source of ['codex', 'pi_codex', 'pi_xai']) {
+    assert.equal(
+      SnapshotSchema.safeParse(
+        snapshot([windowFact({ type: 'account' }, { id: 'primary', cadence: 'weekly' })], {
+          identity_fingerprint: 'ab'.repeat(32),
+          source,
+        }),
+      ).success,
+      true,
+    );
+  }
+  assert.equal(SnapshotSchema.safeParse(snapshot([], { source: 'antigravity' })).success, false);
+  assert.equal(
+    SnapshotSchema.safeParse(snapshot([windowFact({ type: 'account' }, { cadence: 'other' })])).success,
+    true,
+  );
+  for (const overrides of [{ id: '' }, { id: '  ' }, { cadence: 'daily' }, { extra: true }]) {
+    assert.equal(SnapshotSchema.safeParse(snapshot([windowFact({ type: 'account' }, overrides)])).success, false);
+  }
+});
+
 test('config schema rejects duplicate IDs, invalid references, invalid numbers, and 256 levels', () => {
   const duplicateAccount = config({
     accounts: [
@@ -83,11 +139,11 @@ test('checked-in example parses and keeps its three illustrative tool/provider p
   const parsed = ConfigSchema.parse(raw);
   assert.equal(parsed.candidates.length, 3);
   assert.deepEqual(
-    parsed.candidates.map(({ tool, provider, account_id, model }) => ({ tool, provider, account_id, model })),
+    parsed.candidates.map(({ tool, provider, quota_bucket, model }) => ({ tool, provider, quota_bucket, model })),
     [
-      { tool: 'codex', provider: 'openai', account_id: 'codex-subscription-example', model: 'gpt-astra-example' },
-      { tool: 'pi', provider: 'openai-codex', account_id: 'codex-subscription-example', model: 'gpt-astra-example' },
-      { tool: 'agy', provider: 'google', account_id: 'antigravity-subscription-example', model: 'gemini-example' },
+      { tool: 'codex', provider: 'openai', quota_bucket: 'codex', model: 'gpt-astra-example' },
+      { tool: 'pi', provider: 'openai-codex', quota_bucket: 'pi_codex', model: 'gpt-astra-example' },
+      { tool: 'agy', provider: 'google', quota_bucket: 'antigravity', model: 'gemini-example' },
     ],
   );
   assert.deepEqual(
@@ -294,12 +350,12 @@ test('result contract accepts the shared selected, evaluated approval, local app
       provider: 'openai',
       model: 'gpt-astra-example',
       thinking_level: 'low',
-      account_id: 'shared',
+      quota_bucket: 'codex',
       quota_pool: 'primary',
     },
     quota: {
       source: 'codex',
-      account_id: 'shared',
+      quota_bucket: 'codex',
       pool_id: 'primary',
       snapshot_status: 'loaded',
       account_status: 'known',
@@ -322,6 +378,27 @@ test('result contract accepts the shared selected, evaluated approval, local app
       effort: { kind: 'fixed', level: 'low' },
     },
   };
+  assert.equal(ResultSchema.safeParse(selected).success, true);
+  for (const key of ['selected', 'quota'] as const) {
+    assert.equal(
+      ResultSchema.safeParse({ ...selected, [key]: { ...selected[key], account_id: 'shared' } }).success,
+      false,
+    );
+    assert.equal(
+      ResultSchema.safeParse({ ...selected, [key]: { ...selected[key], quota_bucket: undefined } }).success,
+      false,
+    );
+  }
+  assert.equal(
+    ResultSchema.safeParse({
+      ...selected,
+      quota: {
+        ...selected.quota,
+        windows: [{ ...validWindow, id: 'primary', cadence: 'weekly', status: 'known', reason: null }],
+      },
+    }).success,
+    true,
+  );
   const approvalResult = {
     ...common,
     decision: 'approve',

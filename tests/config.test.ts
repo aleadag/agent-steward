@@ -22,13 +22,10 @@ async function rejectsConfig(
   );
 }
 
-test('XDG config, relative quota path, and nested defaults', async () => {
+test('XDG config and nested defaults without snapshot path configuration', async () => {
   const { jev: _jev, ...rawWithoutJev } = config();
-  const [firstAccount] = rawWithoutJev.accounts;
-  assert.ok(firstAccount);
   const raw = {
     ...rawWithoutJev,
-    accounts: [{ ...firstAccount, snapshot: 'quota.json' }],
     thresholds: { risky: 0.7 },
   };
   const reads: string[] = [];
@@ -41,18 +38,14 @@ test('XDG config, relative quota path, and nested defaults', async () => {
     },
   });
   assert.deepEqual(reads, ['/isolated/xdg/agent-steward/config.json']);
-  const [resolvedAccount] = result.accounts;
-  assert.ok(resolvedAccount);
-  assert.equal(resolvedAccount.snapshot, '/isolated/xdg/agent-steward/quota.json');
+  assert.deepEqual(result.candidates, raw.candidates);
+  assert.equal('accounts' in result, false);
   assert.equal(result.jev.model, 'jev-1.13.0');
   assert.deepEqual(result.thresholds, { risky: 0.7, choiceConfidence: 0.45 });
 });
 
-test('HOME fallback and relative explicit config resolve snapshots from its directory', async () => {
+test('HOME fallback and relative explicit config resolve the config path', async () => {
   const raw = config();
-  const firstAccount = raw.accounts[0];
-  assert.ok(firstAccount);
-  firstAccount.snapshot = '../quota.json';
   const reads: string[] = [];
   const result = await loadConfig('settings/config.json', {
     env: { HOME: '/isolated/home' },
@@ -63,9 +56,7 @@ test('HOME fallback and relative explicit config resolve snapshots from its dire
     },
   });
   assert.deepEqual(reads, ['/work/settings/config.json']);
-  const [resolvedAccount] = result.accounts;
-  assert.ok(resolvedAccount);
-  assert.equal(resolvedAccount.snapshot, '/work/quota.json');
+  assert.deepEqual(result, raw);
 
   const homeReads: string[] = [];
   await loadConfig(undefined, {
@@ -79,11 +70,8 @@ test('HOME fallback and relative explicit config resolve snapshots from its dire
   assert.deepEqual(homeReads, ['/isolated/home/.config/agent-steward/config.json']);
 });
 
-test('absolute override is used as-is and absolute snapshot remains absolute', async () => {
+test('absolute override is used as-is and parsed config is unchanged', async () => {
   const raw = config();
-  const firstAccount = raw.accounts[0];
-  assert.ok(firstAccount);
-  firstAccount.snapshot = '/snapshots/quota.json';
   const reads: string[] = [];
   const result = await loadConfig('/isolated/custom.json', {
     env: {},
@@ -94,9 +82,7 @@ test('absolute override is used as-is and absolute snapshot remains absolute', a
     },
   });
   assert.deepEqual(reads, ['/isolated/custom.json']);
-  const [resolvedAccount] = result.accounts;
-  assert.ok(resolvedAccount);
-  assert.equal(resolvedAccount.snapshot, '/snapshots/quota.json');
+  assert.deepEqual(result, raw);
 });
 
 test('rejects relative XDG paths and missing HOME without fallback reads', async () => {
@@ -208,7 +194,7 @@ test('disabled candidates remain configured and empty inventory is valid for app
   const empty = await loadConfig(undefined, {
     env: { HOME: '/isolated/home' },
     cwd,
-    readText: jsonReader(config({ tools: [], accounts: [], candidates: [] })),
+    readText: jsonReader(config({ tools: [], candidates: [] })),
   });
   assert.deepEqual(empty.candidates, []);
 });

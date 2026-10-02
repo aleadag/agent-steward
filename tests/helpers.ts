@@ -14,7 +14,6 @@ import type { Questions } from '../src/jev.ts';
 export function config(overrides: Partial<Config> | Record<string, unknown> = {}): Config {
   return {
     tools: ['codex', 'pi', 'agy'],
-    accounts: [{ id: 'shared', source: 'codex', snapshot: '/fixture/quota.json' }],
     candidates: [candidate()],
     jev: { model: 'jev-1.13.0' },
     thresholds: { risky: 0.6, choiceConfidence: 0.45 },
@@ -28,7 +27,7 @@ export function candidate(overrides: Partial<Candidate> | Record<string, unknown
     tool: 'codex',
     provider: 'openai',
     model: 'gpt-astra-example',
-    account_id: 'shared',
+    quota_bucket: 'codex',
     quota_pool: 'primary',
     capabilities: 'Illustrative coding model; not verified live',
     thinking_levels: [{ id: 'low', description: 'Configured low effort' }],
@@ -53,8 +52,8 @@ export function quotaFacts(
   overrides: Partial<QuotaFacts> | Record<string, unknown> = {},
 ): QuotaFacts {
   return {
-    source: 'codex',
-    account_id: candidate.account_id,
+    source: candidate.quota_bucket,
+    quota_bucket: candidate.quota_bucket,
     pool_id: candidate.quota_pool,
     snapshot_status: 'missing',
     account_status: 'unknown',
@@ -87,7 +86,13 @@ export function snapshot(
   windows: Snapshot['windows'],
   overrides: Partial<Snapshot> | Record<string, unknown> = {},
 ): Snapshot {
-  return { schema_version: 1, source: 'codex', account_id: 'shared', windows, ...overrides } as Snapshot;
+  return {
+    schema_version: 1,
+    source: 'codex',
+    identity_fingerprint: 'ab'.repeat(32),
+    windows,
+    ...overrides,
+  } as Snapshot;
 }
 
 export function windowFact(

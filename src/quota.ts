@@ -1,6 +1,6 @@
 import { SnapshotSchema, StewardError } from './contracts.ts';
 import type {
-  Account,
+  QuotaBucket,
   Config,
   Diagnostic,
   QuotaFacts,
@@ -19,15 +19,15 @@ type SnapshotLoad =
 const applies = (window: QuotaWindow, pool: string): boolean =>
   window.scope.type === 'account' || window.scope.pool_id === pool;
 
-async function readSnapshot(account: Account, readText: ReadText, diagnostic: Diagnostic): Promise<SnapshotLoad> {
-  if (account.snapshot === undefined) {
+async function readSnapshot(bucket: QuotaBucket, readText: ReadText, diagnostic: Diagnostic): Promise<SnapshotLoad> {
+  if (bucket === 'antigravity') {
     diagnostic('quota_missing');
     return { status: 'missing' };
   }
 
   let text: string;
   try {
-    text = await readText(account.snapshot);
+    text = await readText(bucket);
   } catch {
     diagnostic('quota_unreadable');
     return { status: 'unreadable' };
@@ -44,7 +44,7 @@ async function readSnapshot(account: Account, readText: ReadText, diagnostic: Di
     return { status: 'malformed' };
   }
 
-  if (snapshot.source !== account.source || snapshot.account_id !== account.id) {
+  if (snapshot.source !== bucket) {
     diagnostic('quota_identity_mismatch');
     return { status: 'identity_mismatch' };
   }
@@ -89,20 +89,17 @@ export async function loadQuota(
   const now = io.now.toISOString();
 
   const enabled = new Set(config.tools);
-  const accounts = new Map(config.accounts.map((account) => [account.id, account]));
   const cache = new Map<string, Promise<SnapshotLoad>>();
   const result = new Map<string, QuotaFacts>();
 
   for (const candidate of config.candidates) {
     if (!enabled.has(candidate.tool)) continue;
 
-    const account = accounts.get(candidate.account_id);
-    if (account === undefined) throw new StewardError('invalid_config');
-
-    let loaded = cache.get(account.id);
+    const bucket = candidate.quota_bucket;
+    let loaded = cache.get(bucket);
     if (loaded === undefined) {
-      loaded = readSnapshot(account, io.readText, io.diagnostic);
-      cache.set(account.id, loaded);
+      loaded = readSnapshot(bucket, io.readText, io.diagnostic);
+      cache.set(bucket, loaded);
     }
     const snapshotLoad = await loaded;
 
@@ -120,8 +117,8 @@ export async function loadQuota(
     }
 
     result.set(candidate.id, {
-      source: account.source,
-      account_id: account.id,
+      source: bucket,
+      quota_bucket: bucket,
       pool_id: candidate.quota_pool,
       snapshot_status: snapshotLoad.status,
       account_status: accountStatus,

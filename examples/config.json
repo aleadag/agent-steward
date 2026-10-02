@@ -1,24 +1,12 @@
 {
   "tools": ["codex", "pi", "agy"],
-  "accounts": [
-    {
-      "id": "codex-subscription-example",
-      "source": "codex",
-      "snapshot": "quota-codex.json"
-    },
-    {
-      "id": "antigravity-subscription-example",
-      "source": "antigravity",
-      "snapshot": "quota-antigravity.json"
-    }
-  ],
   "candidates": [
     {
       "id": "astra-codex-example",
       "tool": "codex",
       "provider": "openai",
       "model": "gpt-astra-example",
-      "account_id": "codex-subscription-example",
+      "quota_bucket": "codex",
       "quota_pool": "primary",
       "capabilities": "Illustrative coding model through Codex; not verified live",
       "thinking_levels": [
@@ -30,7 +18,7 @@
       "tool": "pi",
       "provider": "openai-codex",
       "model": "gpt-astra-example",
-      "account_id": "codex-subscription-example",
+      "quota_bucket": "pi_codex",
       "quota_pool": "primary",
       "capabilities": "Illustrative coding model through Pi; not verified live",
       "thinking_levels": [
@@ -42,7 +30,7 @@
       "tool": "agy",
       "provider": "google",
       "model": "gemini-example",
-      "account_id": "antigravity-subscription-example",
+      "quota_bucket": "antigravity",
       "quota_pool": "primary",
       "capabilities": "Illustrative Gemini model through agy; not verified live",
       "thinking_levels": [

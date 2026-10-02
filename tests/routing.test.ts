@@ -24,7 +24,7 @@ function routeInput(
           [
             item.id,
             quotaFacts(item, {
-              source: cfg.accounts.find((account) => account.id === item.account_id)?.source ?? 'codex',
+              source: item.quota_bucket,
             }),
           ] as const,
       ),
@@ -111,6 +111,7 @@ test('low-confidence winning pair and effort produce a complete selected result'
   const pi = candidate({
     id: 'pi-choice',
     tool: 'pi',
+    quota_bucket: 'pi_codex',
     provider: 'openai-codex',
     model: codex.model,
     thinking_levels: [
@@ -151,7 +152,7 @@ test('low-confidence winning pair and effort produce a complete selected result'
     provider: 'openai-codex',
     model: codex.model,
     thinking_level: 'medium',
-    account_id: 'shared',
+    quota_bucket: 'pi_codex',
     quota_pool: 'primary',
   });
   assert.deepEqual(result.planned_command.args, [
@@ -246,7 +247,13 @@ test('prototype-like candidate IDs remain valid record keys', async () => {
 
 test('same model through Codex and Pi remains independently selectable', async () => {
   const codex = candidate({ id: 'codex-model', model: 'shared-model' });
-  const pi = candidate({ id: 'pi-model', tool: 'pi', provider: 'openai-codex', model: 'shared-model' });
+  const pi = candidate({
+    id: 'pi-model',
+    tool: 'pi',
+    quota_bucket: 'pi_codex',
+    provider: 'openai-codex',
+    model: 'shared-model',
+  });
   const cfg = config({ candidates: [codex, pi] });
   const result = await route(
     routeInput(cfg, async (_state, questions) =>
@@ -276,14 +283,14 @@ test('unknown quota remains eligible and is preserved in the result', async () =
 });
 
 test('known quota freshness, source, and unverified command flags survive selection', async () => {
-  const cfg = config({ accounts: [{ id: 'shared', source: 'antigravity', snapshot: '/fixture/quota.json' }] });
+  const cfg = config();
   const body = JSON.stringify(
     snapshot(
       [
         windowFact({ type: 'account' }, { remaining_percent: 61 }),
         windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 37 }),
       ],
-      { source: 'antigravity' },
+      { source: 'codex' },
     ),
   );
   const quota = await loadQuota(cfg, { now: fixedNow, readText: async () => body, diagnostic: () => {} });
@@ -296,7 +303,7 @@ test('known quota freshness, source, and unverified command flags survive select
   );
 
   assert.equal(ResultSchema.safeParse(result).success, true);
-  assert.equal(result.quota.source, 'antigravity');
+  assert.equal(result.quota.source, 'codex');
   assert.equal(result.quota.snapshot_status, 'loaded');
   assert.equal(result.quota.account_status, 'known');
   assert.equal(result.quota.pool_status, 'known');
@@ -374,7 +381,7 @@ test('empty inventory and no enabled tools fail without selection', async () => 
 
 test('disabled candidates are excluded without fallback or syntax validation', async () => {
   const disabled = candidate({ id: 'disabled', tool: 'codex', model: '--not-a-model' });
-  const enabled = candidate({ id: 'enabled', tool: 'pi', provider: 'openai-codex' });
+  const enabled = candidate({ id: 'enabled', tool: 'pi', quota_bucket: 'pi_codex', provider: 'openai-codex' });
   const cfg = config({ tools: ['pi'], candidates: [disabled, enabled] });
   let call: { state: unknown; questions: Questions } | undefined;
   const result = await route(

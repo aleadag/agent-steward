@@ -30,7 +30,9 @@ const ProbabilityRecordSchema = z
   );
 
 const ToolSchema = z.enum(['codex', 'pi', 'agy']);
-const QuotaSourceSchema = z.enum(['codex', 'antigravity']);
+export const QuotaBucketSchema = z.enum(['codex', 'pi_codex', 'pi_xai', 'antigravity']);
+export const SnapshotSourceSchema = z.enum(['codex', 'pi_codex', 'pi_xai']);
+const QuotaSourceSchema = SnapshotSourceSchema;
 const ApprovalContextObjectSchema = z.custom<Record<string, unknown>>(
   (value) =>
     value !== null &&
@@ -39,17 +41,12 @@ const ApprovalContextObjectSchema = z.custom<Record<string, unknown>>(
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null),
 );
 const ThinkingLevelSchema = z.strictObject({ id: text, description: text });
-const AccountSchema = z.strictObject({
-  id: text,
-  source: QuotaSourceSchema,
-  snapshot: text.optional(),
-});
 const CandidateSchema = z.strictObject({
   id: text,
   tool: ToolSchema,
   provider: text,
   model: text,
-  account_id: text,
+  quota_bucket: QuotaBucketSchema,
   quota_pool: text,
   capabilities: text,
   thinking_levels: z
@@ -68,7 +65,6 @@ const CandidateSchema = z.strictObject({
 export const ConfigSchema = z
   .strictObject({
     tools: z.array(ToolSchema).refine((tools) => new Set(tools).size === tools.length),
-    accounts: z.array(AccountSchema),
     candidates: z.array(CandidateSchema),
     jev: z
       .strictObject({
@@ -83,20 +79,23 @@ export const ConfigSchema = z
       .default({ risky: 0.6, choiceConfidence: 0.45 }),
   })
   .superRefine((config, context) => {
-    const accountIds = new Set<string>();
-    config.accounts.forEach((account, index) => {
-      if (accountIds.has(account.id))
-        context.addIssue({ code: 'custom', path: ['accounts', index, 'id'], message: 'Duplicate account ID' });
-      accountIds.add(account.id);
-    });
-
     const candidateIds = new Set<string>();
     config.candidates.forEach((candidate, index) => {
       if (candidateIds.has(candidate.id))
         context.addIssue({ code: 'custom', path: ['candidates', index, 'id'], message: 'Duplicate candidate ID' });
       candidateIds.add(candidate.id);
-      if (!accountIds.has(candidate.account_id))
-        context.addIssue({ code: 'custom', path: ['candidates', index, 'account_id'], message: 'Unknown account ID' });
+      const paired =
+        candidate.tool === 'codex'
+          ? candidate.quota_bucket === 'codex'
+          : candidate.tool === 'pi'
+            ? candidate.quota_bucket === 'pi_codex' || candidate.quota_bucket === 'pi_xai'
+            : candidate.quota_bucket === 'antigravity';
+      if (!paired)
+        context.addIssue({
+          code: 'custom',
+          path: ['candidates', index, 'quota_bucket'],
+          message: 'Invalid tool/bucket pairing',
+        });
     });
   });
 
@@ -107,6 +106,8 @@ const dateTime = z.iso.datetime({ offset: true });
 const QuotaWindowSchema = z
   .strictObject({
     scope: ScopeSchema,
+    id: text.optional(),
+    cadence: z.enum(['weekly', 'other']).optional(),
     remaining_percent: z.number().finite().min(0).max(100),
     reset_at: dateTime,
     observed_at: dateTime,
@@ -125,8 +126,8 @@ const QuotaWindowSchema = z
 
 export const SnapshotSchema = z.strictObject({
   schema_version: z.literal(1),
-  source: QuotaSourceSchema,
-  account_id: text,
+  source: SnapshotSourceSchema,
+  identity_fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
   windows: z.array(QuotaWindowSchema),
 });
 
@@ -180,7 +181,7 @@ const ResetSchema = z.strictObject({
   reset_at: dateTime,
   observed_at: dateTime,
   valid_until: dateTime,
-  source: QuotaSourceSchema,
+  source: z.enum(['codex', 'antigravity']),
   account_id: text,
   pool_id: text,
   scope: ScopeSchema,
@@ -235,14 +236,16 @@ const QuotaWindowFactSchema = z.strictObject({
   status: z.enum(['known', 'unknown']),
   reason: z.union([z.null(), z.enum(['expired', 'reset_passed', 'future_observation'])]),
   scope: ScopeSchema,
+  id: text.optional(),
+  cadence: z.enum(['weekly', 'other']).optional(),
   remaining_percent: z.union([z.null(), z.number().finite().min(0).max(100)]),
   reset_at: dateTime,
   observed_at: dateTime,
   valid_until: dateTime,
 });
 const QuotaFactsSchema = z.strictObject({
-  source: QuotaSourceSchema,
-  account_id: text,
+  source: QuotaBucketSchema,
+  quota_bucket: QuotaBucketSchema,
   pool_id: text,
   snapshot_status: z.enum(['loaded', 'missing', 'unreadable', 'malformed', 'identity_mismatch']),
   account_status: z.enum(['known', 'unknown']),
@@ -268,7 +271,7 @@ const SelectedResultSchema = z.strictObject({
     provider: text,
     model: text,
     thinking_level: text,
-    account_id: text,
+    quota_bucket: QuotaBucketSchema,
     quota_pool: text,
   }),
   quota: QuotaFactsSchema,
@@ -501,7 +504,8 @@ export const ResultSchema = z.union([
 ]);
 
 export type Config = z.infer<typeof ConfigSchema>;
-export type Account = Config['accounts'][number];
+export type QuotaBucket = z.infer<typeof QuotaBucketSchema>;
+export type SnapshotSource = z.infer<typeof SnapshotSourceSchema>;
 export type Candidate = Config['candidates'][number];
 export type ThinkingLevel = Candidate['thinking_levels'][number];
 export type Snapshot = z.infer<typeof SnapshotSchema>;

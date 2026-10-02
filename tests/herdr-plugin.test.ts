@@ -635,7 +635,7 @@ test.skipIf(!pkg)(
       assertInstalledProcess(childPid, runtime, main);
 
       const { writeFifoWithDeadline } = await import(fifoWriterModule);
-      await writeFifoWithDeadline(fifo, JSON.stringify({ tools: [], accounts: [], candidates: [] }), readerIsAlive);
+      await writeFifoWithDeadline(fifo, JSON.stringify({ tools: [], candidates: [] }), readerIsAlive);
       const eventCode = await waitForChildClose(eventChild, 3_000);
       assert.equal(eventCode, 0, eventStderr);
       assert.match(eventStderr, /human_review_required \(decision_failed\)/);

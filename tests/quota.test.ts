@@ -32,7 +32,7 @@ function assertFactsUnknown(facts: QuotaFacts, status: QuotaFacts['snapshot_stat
 }
 
 test('shared read does not borrow another pool at reset boundary', async () => {
-  const cfg = config({ candidates: [candidate(), candidate({ id: 'pi-astra', tool: 'pi', quota_pool: 'absent' })] });
+  const cfg = config({ candidates: [candidate(), candidate({ id: 'codex-other', quota_pool: 'absent' })] });
   const data = snapshot([
     windowFact({ type: 'account' }),
     windowFact({ type: 'pool', pool_id: 'primary' }, { reset_at: '2026-09-28T10:30:00Z' }),
@@ -50,36 +50,28 @@ test('shared read does not borrow another pool at reset boundary', async () => {
   assert.equal(reads, 1);
   assert.equal(quota.get('codex-astra').account_status, 'known');
   assert.equal(quota.get('codex-astra').pool_status, 'unknown');
-  assert.equal(quota.get('pi-astra').pool_status, 'unknown');
+  assert.equal(quota.get('codex-other').pool_status, 'unknown');
   assert.deepEqual(
-    quota.get('pi-astra').windows.map((w) => w.scope),
+    quota.get('codex-other').windows.map((w) => w.scope),
     [{ type: 'account' }],
   );
   assert.equal(windowAt(quota.get('codex-astra'), 1).remaining_percent, null);
 });
 
-test('reads each referenced account once and does not mix equal pool IDs across accounts', async () => {
+test('reads each referenced bucket once and does not mix equal pool IDs across buckets', async () => {
   const cfg = config({
-    accounts: [
-      { id: 'shared', source: 'codex', snapshot: '/codex.json' },
-      { id: 'other', source: 'antigravity', snapshot: '/agy.json' },
-      { id: 'unused', source: 'codex', snapshot: '/unused.json' },
-    ],
     candidates: [
       candidate({ id: 'codex-first', quota_pool: 'primary' }),
-      candidate({ id: 'pi-second', tool: 'pi', quota_pool: 'primary' }),
-      candidate({ id: 'agy-primary', tool: 'agy', account_id: 'other', quota_pool: 'primary' }),
+      candidate({ id: 'codex-second', quota_pool: 'primary' }),
+      candidate({ id: 'pi-primary', tool: 'pi', quota_bucket: 'pi_codex', quota_pool: 'primary' }),
     ],
   });
   const reads: string[] = [];
   const files: Record<string, string> = {
-    '/codex.json': JSON.stringify(
-      snapshot([windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 20 })]),
-    ),
-    '/agy.json': JSON.stringify(
+    codex: JSON.stringify(snapshot([windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 20 })])),
+    pi_codex: JSON.stringify(
       snapshot([windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 80 })], {
-        source: 'antigravity',
-        account_id: 'other',
+        source: 'pi_codex',
       }),
     ),
   };
@@ -93,16 +85,16 @@ test('reads each referenced account once and does not mix equal pool IDs across 
     },
     diagnostic: () => {},
   });
-  assert.deepEqual(reads.sort(), ['/agy.json', '/codex.json']);
+  assert.deepEqual(reads.sort(), ['codex', 'pi_codex']);
   assert.equal(windowAt(quota.get('codex-first'), 0).remaining_percent, 20);
-  assert.equal(windowAt(quota.get('pi-second'), 0).remaining_percent, 20);
-  assert.equal(windowAt(quota.get('agy-primary'), 0).remaining_percent, 80);
-  assert.equal(quota.get('agy-primary').source, 'antigravity');
-  assert.equal(quota.get('agy-primary').account_id, 'other');
+  assert.equal(windowAt(quota.get('codex-second'), 0).remaining_percent, 20);
+  assert.equal(windowAt(quota.get('pi-primary'), 0).remaining_percent, 80);
+  assert.equal(quota.get('pi-primary').source, 'pi_codex');
+  assert.equal(quota.get('pi-primary').quota_bucket, 'pi_codex');
 });
 
 test('disabled candidates and empty inventory do not read snapshots', async () => {
-  for (const cfg of [config({ tools: ['pi'] }), config({ tools: [], accounts: [], candidates: [] })]) {
+  for (const cfg of [config({ tools: ['pi'] }), config({ tools: [], candidates: [] })]) {
     let reads = 0;
     const quota = await loadQuota(cfg, {
       now,
@@ -117,8 +109,8 @@ test('disabled candidates and empty inventory do not read snapshots', async () =
   }
 });
 
-test('missing snapshots and accounts without paths produce unknown facts and safe diagnostics', async () => {
-  const cfg = config({ accounts: [{ id: 'shared', source: 'codex' }] });
+test('unsupported bucket produces unknown facts and safe diagnostics without a read', async () => {
+  const cfg = config({ candidates: [candidate({ tool: 'agy', quota_bucket: 'antigravity' })] });
   const diagnostics: string[] = [];
   const quota = await loadQuota(cfg, {
     now,
@@ -161,10 +153,10 @@ test('bad JSON, invalid dates, oversized text, and excessive depth are malformed
   }
 });
 
-test('snapshot account and source identity must match configured account', async () => {
+test('snapshot source must match configured bucket', async () => {
   for (const data of [
-    snapshot([windowFact({ type: 'account' })], { account_id: 'another-account' }),
-    snapshot([windowFact({ type: 'account' })], { source: 'antigravity' }),
+    snapshot([windowFact({ type: 'account' })], { source: 'pi_codex' }),
+    snapshot([windowFact({ type: 'account' })], { source: 'pi_xai' }),
   ]) {
     const diagnostics: string[] = [];
     const quota = await loadQuota(config(), {

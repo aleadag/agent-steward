@@ -11,7 +11,7 @@ type JevWire = { model: string; state: unknown; questions: Questions };
 type PostAnswer = (wire: JevWire, index: number) => unknown;
 
 const CONFIG_PATH = '/isolated/xdg/agent-steward/config.json';
-const SNAPSHOT_PATH = '/isolated/xdg/agent-steward/quota.json';
+const SNAPSHOT_PATH = 'codex';
 const NOW = new Date('2026-09-28T10:30:00Z');
 
 function runtime(overrides: Partial<Runtime> = {}) {
@@ -20,7 +20,7 @@ function runtime(overrides: Partial<Runtime> = {}) {
     reads: string[] = [],
     launches: NativeLaunch[] = [];
   const { launch: launchOverride, ...ioOverrides } = overrides;
-  const cfg = config({ accounts: [], candidates: [] });
+  const cfg = config({ candidates: [] });
   const files = new Map<string, string>();
   const io: Runtime = {
     appendText: async (path, text) => {
@@ -58,7 +58,7 @@ function routeConfig(
   candidates = [candidate()],
   tools: Config['tools'] = [...new Set(candidates.map((item) => item.tool))],
 ) {
-  return config({ tools, accounts: [{ id: 'shared', source: 'codex', snapshot: 'quota.json' }], candidates });
+  return config({ tools, candidates });
 }
 
 function fakePost(answerFor: PostAnswer) {
@@ -271,6 +271,7 @@ test('live route launches only the selected native command with a prefixed origi
     candidate({
       id: 'pi-chosen',
       tool: 'pi',
+      quota_bucket: 'pi_codex',
       provider: 'openai-codex',
       model: 'pi-model',
       thinking_levels: [
@@ -314,7 +315,7 @@ test('live route launches only the selected native command with a prefixed origi
   assert.match(err.join(''), /provider requested\/unverified: "openai-codex"/);
   assert.match(err.join(''), /model requested\/unverified: "pi-model"/);
   assert.match(err.join(''), /thinking requested\/unverified: "high"/);
-  assert.match(err.join(''), /account requested\/unverified: "shared"/);
+  assert.match(err.join(''), /account requested\/unverified: "pi_codex"/);
   assert.doesNotMatch(err.join(''), /-review @private\.md|second line|SyntheticKey-Not-Pattern-4f91/);
 });
 
@@ -488,7 +489,7 @@ test('human route card contains complete facts, command and explicit limitations
   assert.match(card, /provider: "openai"/);
   assert.match(card, /model: "gpt-astra-example"/);
   assert.match(card, /thinking level: "low"/);
-  assert.match(card, /account: "shared"/);
+  assert.match(card, /account: "codex"/);
   assert.match(card, /quota source: "codex"/);
   assert.match(card, /pool: "primary"/);
   assert.match(card, /account remaining: 55%/);
@@ -545,6 +546,7 @@ test('pair choices remain independent across tools and chosen effort uses config
     candidate({
       id: 'pi-choice',
       tool: 'pi',
+      quota_bucket: 'pi_codex',
       provider: 'openai-codex',
       thinking_levels: [{ id: 'minimal', description: 'Minimal' }],
     }),
@@ -580,12 +582,12 @@ test('fixed and selected effort use explicit safe human rendering', () => {
       provider: 'openai',
       model: 'm',
       thinking_level: 'low',
-      account_id: 'a',
+      quota_bucket: 'codex',
       quota_pool: 'p',
     },
     quota: {
       source: 'codex',
-      account_id: 'a',
+      quota_bucket: 'codex',
       pool_id: 'p',
       snapshot_status: 'missing',
       account_status: 'unknown',
@@ -817,7 +819,7 @@ test('configured non-pattern key rejects generated and caller IDs containing it 
 });
 
 test('stop assessment reads no quota and needs no routing inventory', async () => {
-  const empty = config({ accounts: [], candidates: [] });
+  const empty = config({ candidates: [] });
   const { post } = fakePost((wire) => stopAnswer(wire, 'approve_edit'));
   const { io, out, reads } = runtime({
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
@@ -858,7 +860,7 @@ test('lazy credentials fail only when evaluation is needed and never make a live
 
 test('custom config, enabled-tool filtering, and quota diagnostics remain local and safe', async () => {
   const cfg = routeConfig(
-    [candidate(), candidate({ id: 'disabled', tool: 'pi', provider: 'openai-codex' })],
+    [candidate(), candidate({ id: 'disabled', tool: 'pi', quota_bucket: 'pi_codex', provider: 'openai-codex' })],
     ['codex'],
   );
   const { post } = fakePost(routeAnswer);
@@ -872,7 +874,7 @@ test('custom config, enabled-tool filtering, and quota diagnostics remain local 
     post,
   });
   assert.equal(await run(['router', 'start', 'task', '--config', 'custom.json', '--dry-run', '--json'], io), 0);
-  assert.deepEqual(reads, ['/isolated/work/custom.json', '/isolated/work/quota.json']);
+  assert.deepEqual(reads, ['/isolated/work/custom.json', 'codex']);
   assert.match(err.join(''), /quota_unreadable/);
   assert.doesNotMatch(err.join(''), /missing fixture|custom\.json|task/);
   assert.equal(result(out).selected.candidate_id, 'codex-astra');

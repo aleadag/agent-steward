@@ -122,7 +122,7 @@ test.skipIf(!pkg)('installed failures stay local, structured, and credential-fre
       },
     };
     mkdirSync(join(xdg, 'agent-steward'));
-    writeConfig(join(xdg, 'agent-steward', 'config.json'), { tools: [], accounts: [], candidates: [] });
+    writeConfig(join(xdg, 'agent-steward', 'config.json'), { tools: [], candidates: [] });
 
     const local = { ...stop, request_id: 'installed-local', context: null };
     const localResult = run(['stop', 'check'], JSON.stringify(local));
@@ -198,30 +198,29 @@ test.skipIf(!pkg || !packagedProcess)(
   12000,
 );
 
-test.skipIf(!pkg)('installed routing reads a relative quota snapshot before a local missing-key failure', () => {
+test.skipIf(!pkg)('installed routing reads a bucket snapshot before a local missing-key failure', () => {
   withIsolatedHome(({ root, xdg, run }) => {
     const configDir = join(xdg, 'agent-steward');
     mkdirSync(configDir);
     writeConfig(join(configDir, 'config.json'), {
       tools: ['codex'],
-      accounts: [{ id: 'local', source: 'codex', snapshot: 'quota.json' }],
       candidates: [
         {
           id: 'codex-local',
           tool: 'codex',
           provider: 'openai',
           model: 'example-model',
-          account_id: 'local',
+          quota_bucket: 'codex',
           quota_pool: 'primary',
           capabilities: 'test only',
           thinking_levels: [{ id: 'low', description: 'low' }],
         },
       ],
     });
-    writeConfig(join(configDir, 'quota.json'), {
+    writeConfig(join(root, 'codex'), {
       schema_version: 1,
       source: 'codex',
-      account_id: 'local',
+      identity_fingerprint: 'ab'.repeat(32),
       windows: [],
     });
     const result = run(['router', 'start', 'task', '--dry-run', '--json']);

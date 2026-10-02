@@ -1,4 +1,4 @@
-import { dirname, isAbsolute, resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { ConfigSchema, StewardError } from './contracts.ts';
 import type { Config, ConfigEnv, ReadText } from './contracts.ts';
 import { assertByteLength, assertJsonDepth } from './limits.ts';
@@ -32,16 +32,7 @@ export async function loadConfig(
     assertByteLength(contents);
     const parsed: unknown = JSON.parse(contents);
     assertJsonDepth(parsed);
-    const config = ConfigSchema.parse(parsed);
-    const configDirectory = dirname(configPath);
-    return {
-      ...config,
-      accounts: config.accounts.map((account) =>
-        account.snapshot === undefined || isAbsolute(account.snapshot)
-          ? account
-          : { ...account, snapshot: resolve(configDirectory, account.snapshot) },
-      ),
-    };
+    return ConfigSchema.parse(parsed);
   } catch {
     throw new StewardError('invalid_config');
   }
