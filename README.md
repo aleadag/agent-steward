@@ -109,10 +109,10 @@ For agy, configure one Gemini model with ordinary thinking levels, not a separat
 Run `agent-steward quota refresh` before routing when you want fresh measured limits. It refreshes each enabled, referenced credential bucket once, without a TTY, Jev, or a TypeSafe key. Human output is one line per bucket, such as `codex: written`. `--json` returns one object and a newline:
 
 ```json
-{"schema_version":1,"request_id":"generated-id","decision":"quota_refresh","buckets":[{"bucket":"codex","status":"written"},{"bucket":"antigravity","status":"unsupported"}]}
+{"schema_version":1,"request_id":"generated-id","decision":"quota_refresh","buckets":[{"bucket":"codex","status":"written"},{"bucket":"antigravity","status":"written"}]}
 ```
 
-Statuses are `written`, `unsupported`, `auth`, `fetch`, and `malformed`. Exit 0 means every referenced collectable bucket was written; unsupported Antigravity and an empty inventory do not fail refresh. Other failures exit 1. Fixed stderr diagnostics are `quota_unsupported`, `quota_auth`, `quota_fetch`, and `quota_malformed`; output never includes upstream bodies or auth paths.
+Statuses retain `written`, `unsupported`, `auth`, `fetch`, and `malformed`; Antigravity is now collectable, not unsupported. Exit 0 requires every enabled, referenced bucket to be written; an empty inventory also exits 0. Failures exit 1. Fixed diagnostics include `quota_auth`, `quota_fetch`, `quota_malformed`, `quota_agy_setup`, and `quota_agy_trust`; refresh output never includes upstream bodies, terminal/renderer output, or auth paths.
 
 Collectors read existing logins only:
 
@@ -121,17 +121,35 @@ Collectors read existing logins only:
 | `codex` | `$CODEX_HOME/auth.json`, default `~/.codex/auth.json`; ChatGPT login | ChatGPT WHAM usage |
 | `pi_codex` | `$PI_CODING_AGENT_DIR/auth.json`, default `~/.pi/agent/auth.json`; `openai-codex` OAuth | ChatGPT WHAM usage |
 | `pi_xai` | The same Pi file; `xai` OAuth (SuperGrok) | Grok CLI-proxy billing credits |
-| `antigravity` | None | Unsupported; quota stays unknown |
+| `antigravity` | `~/.gemini/antigravity-cli/antigravity-oauth-token`; consumer OAuth | Native AGY `/usage` and request-correlated statusLine quota |
 
-Explicit `CODEX_HOME` and `PI_CODING_AGENT_DIR` values must be absolute and nonempty. Collectors do not log in, refresh tokens, write auth stores, scan browsers/keyrings, scrape CSRF tokens, or send model prompts. Missing, expired, or unusable credentials report `quota_auth`. Each request uses pinned HTTPS endpoints, a 15-second deadline, no retries, and at most one same-host HTTPS redirect.
+Explicit `CODEX_HOME` and `PI_CODING_AGENT_DIR` values must be absolute and nonempty. Codex/Pi collectors do not renew tokens: missing, expired, or unusable credentials report `quota_auth`. Their pinned HTTPS requests have a 15-second deadline, no retries, and at most one same-host redirect. Steward never implements OAuth renewal, writes credentials, scans browsers/keyrings, scrapes CSRF tokens, or sends model prompts. AGY may renew its existing consumer login itself, provided the native principal remains unchanged.
 
-Snapshots live at `$XDG_STATE_HOME/agent-steward/quota/<bucket>.json`, falling back to `~/.local/state/agent-steward/quota/<bucket>.json` when XDG state is unset or empty. The directory is `0700`; files are atomically replaced with mode `0600`. No Antigravity snapshot is written. A failed collection preserves a same-identity snapshot. If the current credential reveals a different identity and collection fails, the previous snapshot is removed so routing cannot reuse the old login's percentages.
+Snapshots live at `$XDG_STATE_HOME/agent-steward/quota/<bucket>.json`, falling back to `~/.local/state/agent-steward/quota/<bucket>.json` when XDG state is unset or empty. The directory is `0700`; files are atomically replaced with mode `0600`. A same-identity failure preserves the original snapshot and timestamps. A detected login change invalidates old data; AGY also invalidates it when native identity becomes unknown.
+
+### One-time AGY setup and service operation
+
+Run as the user who owns the intended native AGY login:
+
+```sh
+agent-steward quota setup agy
+cd "${XDG_STATE_HOME:-$HOME/.local/state}/agent-steward/agy-quota-workdir"
+agy
+```
+
+Explicitly trust that directory in native AGY if prompted, then exit without a model prompt. Setup creates the directory but never grants trust or performs login. `HOME` and a nonempty `XDG_STATE_HOME` must be absolute. The collector always uses this dedicated directory, not the caller's repository or service cwd, and rejects a symlinked workdir. Give the service the same HOME/state environment and a PATH containing the intended `agy` executable. Scheduling, service units and deployment pins remain separate work.
+
+Setup preserves unrelated native settings and statusLine options. It saves the original renderer privately in `$XDG_STATE_HOME/agent-steward/agy/statusline.json` (default `~/.local/state/agent-steward/agy/statusline.json`) and installs `quota hook agy`. Ordinary native sessions still render the original admitted stdin unchanged and never refresh snapshots. A previously disabled or absent renderer stays disabled or absent. Renderer execution is limited to two seconds and 1 MiB of stdout; capture failures do not suppress the old display. Re-run setup after package upgrades; it refuses unexpected user edits rather than overwriting them. To restore manually, copy the manifest's `previousStatusLine` into the native settings `statusLine` field, or remove that field when the saved value is null. Preserve unrelated settings and stop active refreshes before restoring.
+
+On-demand refresh uses a private Bun PTY even with closed caller stdin. It starts AGY without a task, confirms `/usage` is a recognized built-in before submitting Enter, then requires a refreshed `Models & Quota` panel and a correlated hook observation. Startup cache alone is not accepted. AGY 1.2.12's native `/usage` backend-refresh behavior is the freshness assumption, not an independently traced backend request. Changed/unrecognized UI fails closed. Native invocation has a 45-second deadline plus five seconds for process cleanup; terminal and hook input are bounded to 1 MiB. Automatic CLI updates are disabled for that invocation. Trust/login/settings dialogs are never approved; cloud/ADC/gateway and inherited external language-server/auth overrides are unsupported. Native identity is re-read after shutdown; changed or unknown principal invalidates prior data. Decoded local ID-token claims are an identity source, not independent serving-account proof.
+
+Migrate AGY candidates from `quota_pool: "primary"` to `"gemini"` or `"third_party"`. Native `gemini-5h`/`gemini-weekly` map to `gemini`; `3p-5h`/`3p-weekly` map to `third_party`. Both limits are required for a measured pool. An incomplete pool is omitted, an invalid present measurement rejects refresh, and unmatched pools remain unknown. No pool aliases or terminal-percentage scraping are used. Linux PTY/service behavior is tested; Darwin needs its native check run before a portability claim.
 
 ### Snapshot contract
 
-[`examples/quota.json`](examples/quota.json) illustrates collector-shaped data, not live measurements. A snapshot has `schema_version: 1`, a `source` (`codex`, `pi_codex`, or `pi_xai`), a 64-character lowercase SHA-256 `identity_fingerprint`, and `windows`. The fingerprint hashes the bucket prefix and provider identity; raw account IDs, emails, and tokens are never stored. Each window has a scope (`{"type":"account"}` or `{"type":"pool","pool_id":"primary"}`), `remaining_percent`, `observed_at`, `reset_at`, and `valid_until`. Optional `id` and `cadence` (`weekly` or `other`) preserve measured window labels. Times must be RFC 3339 with an offset; observation must precede reset and validity. Collectors cap validity at the earlier of reset and one hour after observation.
+[`examples/quota.json`](examples/quota.json) illustrates collector-shaped data, not live measurements. A snapshot has `schema_version: 1`, a `source` (`codex`, `pi_codex`, `pi_xai`, or `antigravity`), a 64-character lowercase SHA-256 `identity_fingerprint`, and `windows`. The fingerprint hashes the bucket prefix and provider identity; raw account IDs, emails, and tokens are never stored. Each window has a scope (`{"type":"account"}` or `{"type":"pool","pool_id":"primary"}`), `remaining_percent`, `observed_at`, `reset_at`, and `valid_until`. Optional `id` and `cadence` (`weekly` or `other`) preserve measured window labels. Times must be RFC 3339 with an offset; observation must precede reset and validity. Collectors cap validity at the earlier of reset and one hour after observation.
 
-Routing reads snapshots once per enabled bucket and never reads auth stores. Route JSON and ledger selections use `selected.quota_bucket`; route quota facts use `quota.quota_bucket`. Account-scoped windows apply to every candidate on the bucket; a pool window applies only to the exact configured pool. Extra measured provider limits stay account-scoped; collectors do not invent pool IDs from limit names. All applicable facts are retained. Missing fingerprints, missing or unmatched pool windows, malformed/unreadable snapshots, expired validity, passed resets, and future observations make affected quota unknown, never full. Stale remaining percentages are withheld. A snapshot does not bind a launched agent to that login.
+Routing reads snapshots once per enabled bucket and never reads auth stores. Route JSON and ledger selections use `selected.quota_bucket`; route quota facts use `quota.quota_bucket`. Account-scoped windows apply to every candidate on the bucket; a pool window applies only to the exact configured pool. Extra HTTP-provider limits stay account-scoped; AGY uses only the explicit native pool mapping above. All applicable facts are retained. Missing fingerprints, missing or unmatched pool windows, malformed/unreadable snapshots, expired validity, passed resets, and future observations make affected quota unknown, never full. Stale remaining percentages are withheld. A snapshot does not bind a launched agent to that login.
 
 Config files, snapshots, stop stdin, quota responses, and Jev request/response bodies are each limited to 1,048,576 UTF-8 bytes and 64 nested object/array levels. Inputs over a limit are rejected rather than truncated.
 

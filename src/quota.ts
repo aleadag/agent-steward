@@ -12,6 +12,7 @@ import type {
 } from './contracts.ts';
 import { assertByteLength, assertJsonDepth } from './limits.ts';
 import { compareRfc3339Timestamps } from './timestamps.ts';
+import { completeAgyPools } from './agy-quota.ts';
 
 type QuotaEnv = { XDG_STATE_HOME?: string; HOME?: string };
 
@@ -38,11 +39,6 @@ async function readSnapshot(
   readText: ReadText,
   diagnostic: Diagnostic,
 ): Promise<SnapshotLoad> {
-  if (bucket === 'antigravity') {
-    diagnostic('quota_missing');
-    return { status: 'missing' };
-  }
-
   const file = quotaFile(env, bucket);
   let text: string;
   try {
@@ -80,6 +76,7 @@ async function readSnapshot(
     diagnostic('quota_identity_mismatch');
     return { status: 'identity_mismatch' };
   }
+  if (snapshot.source === 'antigravity') snapshot.windows = completeAgyPools(snapshot.windows);
   return { status: 'loaded', snapshot };
 }
 

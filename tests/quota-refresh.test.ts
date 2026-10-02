@@ -19,6 +19,9 @@ import {
   refreshQuota,
 } from '../src/quota-refresh.ts';
 
+import { agyAuth, agyQuota } from './agy-helpers.ts';
+import { readAgyIdentity } from '../src/agy-auth.ts';
+
 const observed = '2026-10-02T12:00:00.000Z';
 const now = new Date(observed);
 const expires = 1790946000; // 2026-10-02T13:00:00Z, in seconds
@@ -99,6 +102,8 @@ function refreshIO(
   const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' });
   const io: QuotaRefreshIO = {
     env: { HOME: '/home' },
+    withAgyLock: async (_path, action) => action(),
+    collectAgy: async () => ({ status: 'fetch' }),
     now: () => now,
     readText: async (path) => {
       operations.push(['read', path]);
@@ -135,6 +140,159 @@ function refreshIO(
   };
   return { io, files, operations, requests };
 }
+
+test('AGY renewal accepts the same principal and writes separate private pools once', async () => {
+  const { io, files, operations, requests } = refreshIO();
+  const auth = '/home/.gemini/antigravity-cli/antigravity-oauth-token';
+  let calls = 0;
+  files.set(auth, agyAuth('same', '2026-10-02T11:00:00Z'));
+  io.withAgyLock = async (_path, action) => action();
+  io.collectAgy = async (paths, requestId) => {
+    calls++;
+    assert.equal(paths.auth, auth);
+    files.set(auth, agyAuth('same'));
+    return { status: 'captured', observation: { requestId, observedAt: observed, quota: agyQuota() } };
+  };
+  assert.deepEqual(await refreshQuota(refreshConfig(['antigravity', 'antigravity']), io), {
+    buckets: [{ bucket: 'antigravity', status: 'written' }],
+  });
+  assert.equal(calls, 1);
+  assert.equal(requests.length, 0);
+  const body = files.get(`${quotaDir}/antigravity.json`)!;
+  const saved = SnapshotSchema.parse(JSON.parse(body));
+  assert.equal(saved.source, 'antigravity');
+  assert.equal(saved.identity_fingerprint, readAgyIdentity(agyAuth('same'))!.identityFingerprint);
+  assert.deepEqual([...new Set(saved.windows.map((w) => (w.scope.type === 'pool' ? w.scope.pool_id : null)))].sort(), [
+    'gemini',
+    'third_party',
+  ]);
+  assert.equal(body.includes('synthetic-access'), false);
+  assert.equal(body.includes('same'), false);
+  assert.equal(operations.filter(([op]) => op === 'write').length, 1);
+  assert.equal(operations.find(([op]) => op === 'write')?.[2], 0o600);
+});
+test('AGY changed or unknown identity invalidates previous data; same-principal failure preserves bytes', async () => {
+  for (const next of ['same', 'changed', null]) {
+    const { io, files } = refreshIO();
+    const auth = '/home/.gemini/antigravity-cli/antigravity-oauth-token',
+      dest = `${quotaDir}/antigravity.json`;
+    const original = JSON.stringify(
+      snapshot([windowFact({ type: 'pool', pool_id: 'gemini' })], {
+        source: 'antigravity',
+        identity_fingerprint: readAgyIdentity(agyAuth('same'))!.identityFingerprint,
+      }),
+    );
+    files.set(auth, agyAuth('same'));
+    files.set(dest, original);
+    io.withAgyLock = async (_p, a) => a();
+    io.collectAgy = async () => {
+      if (next === null) files.delete(auth);
+      else files.set(auth, agyAuth(next));
+      return { status: 'fetch' };
+    };
+    assert.deepEqual(await refreshQuota(refreshConfig(['antigravity']), io), {
+      buckets: [{ bucket: 'antigravity', status: next === 'same' ? 'fetch' : 'auth' }],
+    });
+    assert.equal(files.get(dest), next === 'same' ? original : undefined);
+  }
+});
+test('AGY native failure still checks changed identity, and serialized updates do not overlap', async () => {
+  const { io, files } = refreshIO();
+  const auth = '/home/.gemini/antigravity-cli/antigravity-oauth-token',
+    dest = `${quotaDir}/antigravity.json`;
+  files.set(auth, agyAuth('same'));
+  files.set(dest, storedSnapshot('antigravity'));
+  io.collectAgy = async () => {
+    files.set(auth, agyAuth('changed'));
+    throw new Error('private-native-error');
+  };
+  assert.equal((await refreshQuota(refreshConfig(['antigravity']), io)).buckets[0]?.status, 'auth');
+  assert.equal(files.has(dest), false);
+  let queue = Promise.resolve(),
+    active = 0,
+    peak = 0;
+  io.withAgyLock = async (_path, action) => {
+    const before = queue;
+    let release = () => {};
+    queue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await before;
+    try {
+      return await action();
+    } finally {
+      release();
+    }
+  };
+  io.collectAgy = async (_paths, requestId) => {
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    active--;
+    return { status: 'captured', observation: { requestId, observedAt: observed, quota: agyQuota() } };
+  };
+  const results = await Promise.all([
+    refreshQuota(refreshConfig(['antigravity']), io),
+    refreshQuota(refreshConfig(['antigravity']), io),
+  ]);
+  assert.equal(peak, 1);
+  assert.ok(results.every((r) => r.buckets[0]?.status === 'written'));
+});
+test('mixed HTTP/native collection feeds offline reader without borrowing the other AGY pool', async () => {
+  const { io, files, requests, operations } = refreshIO();
+  files.set('/home/.gemini/antigravity-cli/antigravity-oauth-token', agyAuth());
+  let native = 0;
+  const quota = agyQuota();
+  for (const [key, window] of Object.entries(quota)) window.remaining_fraction = key.startsWith('gemini') ? 0.2 : 0.8;
+  io.collectAgy = async (_paths, requestId) => {
+    native++;
+    return { status: 'captured', observation: { requestId, observedAt: observed, quota } };
+  };
+  assert.deepEqual(
+    (await refreshQuota(refreshConfig(['antigravity', 'codex']), io)).buckets.map((b) => b.status),
+    ['written', 'written'],
+  );
+  assert.equal(requests.length, 1);
+  assert.equal(native, 1);
+  const cfg = config({
+    tools: ['agy'],
+    candidates: [
+      candidate({ id: 'gemini', tool: 'agy', quota_bucket: 'antigravity', quota_pool: 'gemini' }),
+      candidate({ id: 'third', tool: 'agy', quota_bucket: 'antigravity', quota_pool: 'third_party' }),
+    ],
+  });
+  operations.length = 0;
+  const facts = await loadQuota(cfg, { env: io.env, now, readText: io.readText, diagnostic: () => {} });
+  const gemini = facts.get('gemini'),
+    third = facts.get('third');
+  assert.ok(gemini && third);
+  assert.equal(gemini.pool_status, 'known');
+  assert.ok(gemini.windows.every((w) => w.remaining_percent === 20));
+  assert.equal(third.pool_status, 'known');
+  assert.ok(third.windows.every((w) => w.remaining_percent === 80));
+  assert.deepEqual(operations, [['read', `${quotaDir}/antigravity.json`]]);
+  assert.equal(native, 1);
+});
+
+test('AGY unsupported auth starts no process; malformed capture retains same-identity snapshot', async () => {
+  const { io, files } = refreshIO();
+  const auth = '/home/.gemini/antigravity-cli/antigravity-oauth-token';
+  let calls = 0;
+  io.withAgyLock = async (_p, a) => a();
+  io.collectAgy = async (_p, requestId) => {
+    calls++;
+    return {
+      status: 'captured',
+      observation: { requestId, observedAt: observed, quota: { 'gemini-5h': { remaining_fraction: 2 } } },
+    };
+  };
+  files.set(auth, JSON.stringify({ ...JSON.parse(agyAuth()), auth_method: 'adc' }));
+  assert.equal((await refreshQuota(refreshConfig(['antigravity']), io)).buckets[0]?.status, 'auth');
+  assert.equal(calls, 0);
+  files.set(auth, agyAuth());
+  assert.equal((await refreshQuota(refreshConfig(['antigravity']), io)).buckets[0]?.status, 'malformed');
+  assert.equal(calls, 1);
+});
 
 // Each assertion covers the collector's boundary effects, not mapper internals:
 // bucket gating, pinned requests, atomic permissions, or preservation/invalidation.
@@ -229,11 +387,11 @@ test('refresh uses distinct Pi credentials, pinned headers, and XDG state paths'
   }
 });
 
-test('antigravity and disabled buckets do not open files or sockets', async () => {
+test('disabled and unreferenced Antigravity buckets do not open files or sockets', async () => {
   const { io, operations, requests } = refreshIO();
   io.env = {};
-  assert.deepEqual(await refreshQuota(refreshConfig(['antigravity', 'codex', 'pi_xai', 'antigravity'], ['agy']), io), {
-    buckets: [{ bucket: 'antigravity', status: 'unsupported' }],
+  assert.deepEqual(await refreshQuota(refreshConfig(['antigravity', 'codex', 'pi_xai', 'antigravity'], []), io), {
+    buckets: [],
   });
   assert.deepEqual(await refreshQuota(refreshConfig(['codex'], []), io), { buckets: [] });
   assert.deepEqual(operations, []);
@@ -251,7 +409,7 @@ test('mixed buckets continue after failure and collect each enabled bucket only 
       { bucket: 'codex', status: 'auth' },
       { bucket: 'pi_codex', status: 'fetch' },
       { bucket: 'pi_xai', status: 'written' },
-      { bucket: 'antigravity', status: 'unsupported' },
+      { bucket: 'antigravity', status: 'auth' },
     ],
   });
   assert.equal(requests.length, 2);

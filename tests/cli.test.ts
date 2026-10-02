@@ -42,6 +42,16 @@ function runtime(overrides: Partial<Runtime> = {}) {
     httpGet: async () => {
       throw new Error('unexpected quota GET');
     },
+    withAgyLock: async (_path, action) => action(),
+    collectAgy: async () => {
+      throw new Error('unexpected native quota');
+    },
+    setupAgy: async () => {
+      throw new Error('unexpected setup');
+    },
+    runAgyHook: async () => {
+      throw new Error('unexpected hook');
+    },
     mkdirp: async () => {},
     chmod: async () => {},
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg' },
@@ -68,6 +78,55 @@ function runtime(overrides: Partial<Runtime> = {}) {
   };
   return { out, err, reads, launches, io, files };
 }
+
+test('exact quota setup/hook parsing rejects config, JSON flags and extra arguments', () => {
+  assert.deepEqual(parseArgs(['quota', 'setup', 'agy']), { kind: 'quota-setup-agy' });
+  assert.deepEqual(parseArgs(['quota', 'hook', 'agy']), { kind: 'quota-hook-agy' });
+  for (const verb of ['setup', 'hook']) {
+    assert.deepEqual(parseArgs(['quota', verb, 'agy', '--help']), { kind: 'help' });
+    for (const extra of [['--json'], ['extra'], ['--', 'extra'], ['--config', 'config.json']])
+      assert.throws(() => parseArgs(['quota', verb, 'agy', ...extra]));
+  }
+});
+test('setup/hook dispatch is config-free, offline and non-TTY', async () => {
+  let setups = 0;
+  let original = '';
+  const { io, reads, out } = runtime({
+    terminal: { stdin: false, stdout: false },
+    setupAgy: async () => {
+      setups++;
+    },
+    runAgyHook: async (input) => {
+      original = input;
+      return { stdout: 'original renderer\n', exitCode: 7 };
+    },
+    readStdin: async () => '{ malformed input',
+  });
+  assert.equal(await run(['quota', 'setup', 'agy'], io), 0);
+  assert.equal(setups, 1);
+  assert.match(out.join(''), /trust/i);
+  assert.match(out.join(''), /restor/i);
+  out.length = 0;
+  assert.equal(await run(['quota', 'hook', 'agy'], io), 7);
+  assert.equal(original, '{ malformed input');
+  assert.deepEqual(out, ['original renderer\n']);
+  assert.deepEqual(reads, []);
+});
+
+test('AGY setup/trust failure diagnostics are fixed and failed refresh exits one', async () => {
+  const { agyAuth } = await import('./agy-helpers.ts');
+  for (const diagnostic of ['quota_agy_setup', 'quota_agy_trust'] as const) {
+    const cfg = routeConfig([candidate({ tool: 'agy', quota_bucket: 'antigravity' })]);
+    const { io, out, err } = runtime({
+      terminal: { stdin: false, stdout: false },
+      readText: async (path) => (path.endsWith('/config.json') ? JSON.stringify(cfg) : agyAuth()),
+      collectAgy: async () => ({ status: 'fetch', diagnostic }),
+    });
+    assert.equal(await run(['quota', 'refresh', '--json'], io), 1);
+    assert.deepEqual(result(out).buckets, [{ bucket: 'antigravity', status: 'fetch' }]);
+    assert.deepEqual(err, [`agent-steward: ${diagnostic}\n`, 'agent-steward: quota_fetch\n']);
+  }
+});
 
 function routeConfig(
   candidates = [candidate()],
@@ -212,21 +271,25 @@ test('quota refresh JSON writes secret-free snapshots without Jev, launch, stdin
       };
     },
   });
-  assert.equal(await run(['--config', 'custom.json', 'quota', 'refresh', '--json'], io), 0);
+  assert.equal(await run(['--config', 'custom.json', 'quota', 'refresh', '--json'], io), 1);
   assert.deepEqual(result(out), {
     schema_version: 1,
     request_id: 'generated-1',
     decision: 'quota_refresh',
     buckets: [
       { bucket: 'codex', status: 'written' },
-      { bucket: 'antigravity', status: 'unsupported' },
+      { bucket: 'antigravity', status: 'auth' },
     ],
   });
   assert.equal(out.length, 1);
   assert.ok(out[0]!.endsWith('\n'));
-  assert.deepEqual(err, ['agent-steward: quota_unsupported\n']);
+  assert.deepEqual(err, ['agent-steward: quota_auth\n']);
   assert.deepEqual(gets, ['https://chatgpt.com/backend-api/wham/usage']);
-  assert.deepEqual(reads, ['/isolated/work/custom.json', '/isolated/codex/auth.json']);
+  assert.deepEqual(reads, [
+    '/isolated/work/custom.json',
+    '/isolated/codex/auth.json',
+    '/isolated/home/.gemini/antigravity-cli/antigravity-oauth-token',
+  ]);
   assert.deepEqual([...files.keys()], [SNAPSHOT_PATH]);
   assert.equal(JSON.parse(files.get(SNAPSHOT_PATH)!).windows[0].remaining_percent, 75);
   assert.doesNotMatch(
@@ -240,12 +303,12 @@ test('quota refresh JSON writes secret-free snapshots without Jev, launch, stdin
 
 test('quota refresh reports fixed failure diagnostics and exits one only for collectable failures', async () => {
   const token = `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ sub: 'private-user' })).toString('base64url')}.signature`;
-  for (const status of ['auth', 'fetch', 'malformed', 'written', 'unsupported', 'empty']) {
+  for (const status of ['auth', 'fetch', 'malformed', 'written', 'agy_auth', 'empty']) {
     const cfg = routeConfig(
       status === 'empty'
         ? []
         : [
-            status === 'unsupported'
+            status === 'agy_auth'
               ? candidate({ tool: 'agy', quota_bucket: 'antigravity' })
               : candidate({ tool: 'pi', quota_bucket: 'pi_xai' }),
           ],
@@ -269,16 +332,19 @@ test('quota refresh reports fixed failure diagnostics and exits one only for col
         };
       },
     });
-    assert.equal(
-      await run(['quota', 'refresh'], io),
-      ['written', 'unsupported', 'empty'].includes(status) ? 0 : 1,
-      status,
-    );
+    assert.equal(await run(['quota', 'refresh'], io), ['written', 'empty'].includes(status) ? 0 : 1, status);
     assert.equal(
       out.join(''),
-      status === 'empty' ? '' : `${status === 'unsupported' ? 'antigravity' : 'pi_xai'}: ${status}\n`,
+      status === 'empty'
+        ? ''
+        : `${status === 'agy_auth' ? 'antigravity' : 'pi_xai'}: ${status === 'agy_auth' ? 'auth' : status}\n`,
     );
-    assert.deepEqual(err, ['written', 'empty'].includes(status) ? [] : [`agent-steward: quota_${status}\n`]);
+    assert.deepEqual(
+      err,
+      ['written', 'empty'].includes(status)
+        ? []
+        : [`agent-steward: quota_${status === 'agy_auth' ? 'auth' : status}\n`],
+    );
     assert.ok([...files.keys()].every((path) => path.endsWith('/quota/pi_xai.json')));
   }
 });

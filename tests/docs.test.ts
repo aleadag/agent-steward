@@ -72,6 +72,18 @@ async function emittedHelp(): Promise<string> {
     unlink: async () => {
       throw new Error('help must not unlink files');
     },
+    withAgyLock: async () => {
+      throw new Error('help must not lock AGY');
+    },
+    collectAgy: async () => {
+      throw new Error('help must not collect AGY');
+    },
+    setupAgy: async () => {
+      throw new Error('help must not setup AGY');
+    },
+    runAgyHook: async () => {
+      throw new Error('help must not run AGY hook');
+    },
     httpGet: async () => {
       throw new Error('help must not fetch quota');
     },
@@ -108,7 +120,19 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
   });
   assert.deepEqual(
     invocations.map((item) => item.kind),
-    ['help', 'route', 'route', 'route', 'list', 'list', 'show', 'quota-refresh', 'stop'],
+    [
+      'help',
+      'route',
+      'route',
+      'route',
+      'list',
+      'list',
+      'show',
+      'quota-refresh',
+      'quota-setup-agy',
+      'quota-hook-agy',
+      'stop',
+    ],
   );
   const routes = invocations.filter((item) => item.kind === 'route');
   assert.equal(routes.length, 3);

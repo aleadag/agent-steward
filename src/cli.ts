@@ -1,7 +1,8 @@
 import { StopInputSchema, StopResultSchema, StewardError, errorResult } from './contracts.ts';
 import type { ErrorResult, Result, SelectedResult, StopInput, StopResult } from './contracts.ts';
 import { loadConfig } from './config.ts';
-import { validateCandidateSyntax } from './commands.ts';
+import { validateCandidateSyntax, shellQuote } from './commands.ts';
+import { agyPaths } from './agy-setup.ts';
 import { assertByteLength, assertJsonDepth } from './limits.ts';
 import { loadQuota } from './quota.ts';
 import { refreshQuota } from './quota-refresh.ts';
@@ -15,9 +16,12 @@ import { assertLiveTask, buildNativeLaunch } from './launch.ts';
 import type { NativeLaunch } from './launch.ts';
 import { appendEvent, readLedger, formatLedgerRecords } from './ledger.ts';
 import type { LedgerEventKind, LedgerRuntime } from './ledger.ts';
+import type { AgyHookResult } from './agy-hook.ts';
 
 export type Invocation =
   | { kind: 'help' }
+  | { kind: 'quota-setup-agy' }
+  | { kind: 'quota-hook-agy' }
   | { kind: 'route'; config?: string; task: string; dryRun: boolean; json: boolean }
   | { kind: 'list'; limit: number; json: boolean }
   | { kind: 'show'; requestId: string; json: boolean }
@@ -40,6 +44,8 @@ export type Runtime = QuotaRefreshIO & {
   now: () => Date;
   newRequestId: () => string;
   post: HttpPost;
+  setupAgy: () => Promise<void>;
+  runAgyHook: (input: string) => Promise<AgyHookResult>;
   terminal: { stdin: boolean; stdout: boolean };
   launch: (command: NativeLaunch) => Promise<number>;
 };
@@ -55,6 +61,8 @@ Usage:
   agent-steward router list --json
   agent-steward router show <request-id> [--json]
   agent-steward [--config <path>] quota refresh [--json]
+  agent-steward quota setup agy
+  agent-steward quota hook agy
   agent-steward [--config <path>] stop check < stopped-state.json
 
 Live router start requires terminal input and output and launches the selected native agent in the foreground.
@@ -64,8 +72,9 @@ Provider, model, thinking level and account are requested, not verified; the CLI
 Native permission controls remain with the selected tool. The CLI does not invoke the optional Herdr wrapper.
 Router list/show read local request history only, without config or Jev. List defaults to 20 records.
 History never stores task text; exited means native-process return, not job success.
-Quota refresh collects Codex/Pi quota into $XDG_STATE_HOME/agent-steward/quota/ (default ~/.local/state/agent-steward/quota/).
-Routing reads snapshots only; Antigravity quota remains unknown. Refresh needs no Jev key or terminal.
+Quota refresh collects Codex/Pi/AGY quota into $XDG_STATE_HOME/agent-steward/quota/ (default ~/.local/state/agent-steward/quota/).
+AGY requires explicit hook setup and native trust of its dedicated workdir; missing quota remains unknown.
+Routing reads snapshots only. Refresh/setup/hook need no Jev key or caller terminal.
 Stop check reads JSON from stdin and writes a version-2 JSON result.
 `;
 
@@ -78,6 +87,8 @@ const DIAGNOSTICS: Record<string, string> = {
   quota_unsupported: 'agent-steward: quota_unsupported',
   quota_auth: 'agent-steward: quota_auth',
   quota_fetch: 'agent-steward: quota_fetch',
+  quota_agy_setup: 'agent-steward: quota_agy_setup',
+  quota_agy_trust: 'agent-steward: quota_agy_trust',
 };
 
 function invalidInput(): never {
@@ -136,6 +147,13 @@ export function parseArgs(argv: readonly string[]): Invocation {
     if (kind === 'list') return { kind, limit, json };
     if (requestId === undefined) invalidInput();
     return { kind: 'show', requestId, json };
+  }
+
+  if (commandTokens[0] === 'quota' && (commandTokens[1] === 'setup' || commandTokens[1] === 'hook')) {
+    if (config !== undefined || separator >= 0 || commandTokens.length !== 3 || commandTokens[2] !== 'agy')
+      invalidInput();
+    if (help) return { kind: 'help' };
+    return { kind: commandTokens[1] === 'setup' ? 'quota-setup-agy' : 'quota-hook-agy' };
   }
 
   if (commandTokens[0] === 'quota' && commandTokens[1] === 'refresh') {
@@ -425,12 +443,37 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
 
   const apiKey = readOptionalApiKey(runtime);
   let requestId: string | null = null;
+  if (invocation.kind === 'quota-setup-agy') {
+    try {
+      await runtime.setupAgy();
+      const text = `AGY quota hook installed. For one-time native trust, run:\n  cd ${shellQuote(agyPaths(runtime.env).workdir)} && agy\nExplicitly trust this directory if prompted, then exit without a model prompt. Setup does not grant trust or log in. To restore the previous renderer, copy previousStatusLine from the private agent-steward/agy/statusline.json manifest into native settings (remove statusLine when null). Preserve unrelated settings.\n`;
+      assertNoCredentials(text, apiKey);
+      runtime.stdout(text);
+      return 0;
+    } catch {
+      runtime.stderr(`${DIAGNOSTICS.quota_agy_setup}\n`);
+      return 1;
+    }
+  }
+  if (invocation.kind === 'quota-hook-agy') {
+    try {
+      const result = await runtime.runAgyHook(await runtime.readStdin());
+      runtime.stdout(result.stdout);
+      return result.exitCode;
+    } catch {
+      runtime.stderr(`${DIAGNOSTICS.quota_malformed}\n`);
+      return 1;
+    }
+  }
   if (invocation.kind === 'quota-refresh') {
     try {
       requestId = safeRequestId(runtime.newRequestId(), apiKey);
       if (requestId === null) throw new StewardError('credential_detected');
       const config = await loadConfig(invocation.config, runtime);
-      const { buckets } = await refreshQuota(config, runtime);
+      const { buckets } = await refreshQuota(config, {
+        ...runtime,
+        diagnostic: (code) => runtime.stderr(`${DIAGNOSTICS[code]}\n`),
+      });
       const result = { schema_version: 1, request_id: requestId, decision: 'quota_refresh', buckets };
       assertNoCredentials(result, apiKey);
       for (const { status } of buckets) {
@@ -438,7 +481,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       }
       if (invocation.json) runtime.stdout(`${JSON.stringify(result)}\n`);
       else for (const { bucket, status } of buckets) runtime.stdout(`${bucket}: ${status}\n`);
-      return buckets.every(({ status }) => status === 'written' || status === 'unsupported') ? 0 : 1;
+      return buckets.every(({ status }) => status === 'written') ? 0 : 1;
     } catch (error) {
       return emitError(runtime, error, requestId, apiKey, !invocation.json);
     }

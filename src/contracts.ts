@@ -31,7 +31,7 @@ const ProbabilityRecordSchema = z
 
 const ToolSchema = z.enum(['codex', 'pi', 'agy']);
 export const QuotaBucketSchema = z.enum(['codex', 'pi_codex', 'pi_xai', 'antigravity']);
-export const SnapshotSourceSchema = z.enum(['codex', 'pi_codex', 'pi_xai']);
+export const SnapshotSourceSchema = z.enum(['codex', 'pi_codex', 'pi_xai', 'antigravity']);
 const QuotaSourceSchema = SnapshotSourceSchema;
 const ApprovalContextObjectSchema = z.custom<Record<string, unknown>>(
   (value) =>

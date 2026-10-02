@@ -200,6 +200,7 @@ test('reads each enabled collectable bucket once from XDG state per invocation',
       diagnostic: () => {},
     });
     assert.deepEqual(reads.sort(), [
+      '/state/agent-steward/quota/antigravity.json',
       '/state/agent-steward/quota/codex.json',
       '/state/agent-steward/quota/pi_codex.json',
       '/state/agent-steward/quota/pi_xai.json',
@@ -208,7 +209,7 @@ test('reads each enabled collectable bucket once from XDG state per invocation',
     assert.equal(quota.get('codex-second').snapshot_status, 'loaded');
     assertFactsUnknown(quota.get('pi-codex'), 'missing');
     assertFactsUnknown(quota.get('pi-xai'), 'unreadable');
-    assertFactsUnknown(quota.get('agy'), 'missing');
+    assertFactsUnknown(quota.get('agy'), 'unreadable');
   }
 });
 
@@ -228,20 +229,45 @@ test('disabled candidates and empty inventory do not read snapshots', async () =
   }
 });
 
-test('unsupported bucket produces unknown facts and safe diagnostics without a read', async () => {
+test('offline Antigravity reader does not expose an incomplete or nonnative pool', async () => {
+  const cfg = config({
+    tools: ['agy'],
+    candidates: [candidate({ tool: 'agy', quota_bucket: 'antigravity', quota_pool: 'gemini' })],
+  });
+  for (const windows of [
+    [windowFact({ type: 'pool', pool_id: 'gemini' }, { id: 'gemini-5h', cadence: 'other' })],
+    [
+      windowFact({ type: 'pool', pool_id: 'gemini' }, { id: 'unverified', cadence: 'other' }),
+      windowFact({ type: 'account' }),
+    ],
+  ]) {
+    const facts = await loadQuota(cfg, {
+      env: { HOME: '/home' },
+      now,
+      readText: async () => JSON.stringify(snapshot(windows, { source: 'antigravity' })),
+      diagnostic: () => {},
+    });
+    const fact = facts.get(cfg.candidates[0]!.id);
+    assert.ok(fact);
+    assert.equal(fact.pool_status, 'unknown');
+    assert.deepEqual(fact.windows, []);
+  }
+});
+
+test('missing antigravity snapshots produce unknown facts with safe diagnostics', async () => {
   const cfg = config({ candidates: [candidate({ tool: 'agy', quota_bucket: 'antigravity' })] });
   const diagnostics: string[] = [];
   let reads = 0;
   const quota = await loadQuota(cfg, {
-    env: {},
+    env: { HOME: '/home' },
     now,
     readText: async () => {
       reads++;
-      throw new Error('/private/quota.json');
+      throw Object.assign(new Error('/private/quota.json'), { code: 'ENOENT' });
     },
     diagnostic: (code) => diagnostics.push(code),
   });
-  assert.equal(reads, 0);
+  assert.equal(reads, 1);
   assertFactsUnknown(quota.get('codex-astra'), 'missing');
   assert.deepEqual(diagnostics, ['quota_missing']);
 });

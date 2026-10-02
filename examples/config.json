@@ -33,7 +33,7 @@
       "provider": "google",
       "model": "gemini-3.8-flash",
       "quota_bucket": "antigravity",
-      "quota_pool": "primary",
+      "quota_pool": "gemini",
       "cost": 1,
       "capabilities": "Illustrative Gemini model through agy; not verified live",
       "thinking_levels": [

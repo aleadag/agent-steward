@@ -6,6 +6,13 @@ import { assertByteLength, assertJsonDepth } from './limits.ts';
 import { assertNoCredentials } from './privacy.ts';
 import { quotaFile } from './quota.ts';
 import { compareRfc3339Timestamps } from './timestamps.ts';
+import { agyPaths } from './agy-setup.ts';
+import type { AgyPaths } from './agy-setup.ts';
+import { readAgyIdentity } from './agy-auth.ts';
+import { mapAgyQuota } from './agy-quota.ts';
+import type { NativeAgyResult } from './agy-runtime.ts';
+
+type HttpSnapshotSource = Exclude<SnapshotSource, 'antigravity'>;
 
 type AuthFailure = { status: 'auth' };
 type MappedWindows = { windows: QuotaWindow[] } | { status: 'malformed' };
@@ -192,13 +199,16 @@ export type QuotaRefreshIO = {
   rename: (from: string, to: string) => Promise<void>;
   unlink: (path: string) => Promise<void>;
   httpGet: QuotaHttpGet;
+  collectAgy: (paths: AgyPaths, requestId: string) => Promise<NativeAgyResult>;
+  withAgyLock: <T>(file: string, action: () => Promise<T>) => Promise<T>;
+  diagnostic?: (code: 'quota_agy_setup' | 'quota_agy_trust') => void;
 };
 
 type RefreshStatus = 'written' | 'unsupported' | 'auth' | 'fetch' | 'malformed';
 
 // Identity survives expiry solely to invalidate another login's snapshot. It never
 // authorizes a request; the public auth readers still gate every HTTP call.
-function credentialIdentity(bucket: SnapshotSource, text: string): string | null {
+function credentialIdentity(bucket: HttpSnapshotSource, text: string): string | null {
   const auth = parseRecord(text);
   const access =
     bucket === 'codex'
@@ -236,7 +246,7 @@ async function invalidatePrevious(dest: string, identityFingerprint: string | nu
 }
 
 async function collectWindows(
-  bucket: SnapshotSource,
+  bucket: HttpSnapshotSource,
   access: string,
   identity: string,
   observedAt: string,
@@ -283,7 +293,7 @@ export async function refreshQuota(
   const result: { bucket: QuotaBucket; status: RefreshStatus }[] = [];
   for (const bucket of buckets) {
     if (bucket === 'antigravity') {
-      result.push({ bucket, status: 'unsupported' });
+      result.push({ bucket, status: await refreshAgy(io) });
       continue;
     }
     const dest = quotaFile(io.env, bucket);
@@ -332,22 +342,85 @@ export async function refreshQuota(
       result.push({ bucket, status: 'malformed' });
       continue;
     }
-    const temp = `${dest}.${randomUUID()}.tmp`;
-    let tempCreated = false;
-    try {
-      await io.mkdirp(dirname(dest), 0o700);
-      await io.chmod(dirname(dest), 0o700);
-      await io.writeText(temp, serialized, 0o600);
-      tempCreated = true;
-      await io.rename(temp, dest);
-    } catch (error) {
-      if (tempCreated) await unlinkIfPresent(temp, io);
-      await invalidatePrevious(dest, identityFingerprint, io);
-      throw error;
-    }
+    await writeQuotaSnapshot(dest, serialized, identityFingerprint, io);
     result.push({ bucket, status: 'written' });
   }
   return { buckets: result };
+}
+
+export async function writeQuotaSnapshot(
+  dest: string,
+  serialized: string,
+  identityFingerprint: string | null,
+  io: QuotaRefreshIO,
+): Promise<void> {
+  assertByteLength(serialized);
+  SnapshotSchema.parse(JSON.parse(serialized));
+  const temp = `${dest}.${randomUUID()}.tmp`;
+  let created = false;
+  try {
+    await io.mkdirp(dirname(dest), 0o700);
+    await io.chmod(dirname(dest), 0o700);
+    await io.writeText(temp, serialized, 0o600);
+    created = true;
+    await io.rename(temp, dest);
+  } catch (error) {
+    if (created) await unlinkIfPresent(temp, io);
+    await invalidatePrevious(dest, identityFingerprint, io);
+    throw error;
+  }
+}
+async function refreshAgy(io: QuotaRefreshIO): Promise<RefreshStatus> {
+  const paths = agyPaths(io.env),
+    dest = quotaFile(io.env, 'antigravity');
+  const identity = async () => {
+    try {
+      return readAgyIdentity(await io.readText(paths.auth));
+    } catch {
+      return null;
+    }
+  };
+  try {
+    return await io.withAgyLock(dest, async () => {
+      const before = await identity();
+      if (!before) {
+        await unlinkIfPresent(dest, io);
+        return 'auth';
+      }
+      await invalidatePrevious(dest, before.identityFingerprint, io);
+      if (Date.parse(before.expiresAt) <= io.now().getTime() && !before.renewable) return 'auth';
+      let collected: NativeAgyResult;
+      try {
+        collected = await io.collectAgy(paths, randomUUID());
+      } catch {
+        collected = { status: 'fetch' };
+      }
+      const after = await identity();
+      if (!after || after.identityFingerprint !== before.identityFingerprint) {
+        await unlinkIfPresent(dest, io);
+        return 'auth';
+      }
+      if (Date.parse(after.expiresAt) <= io.now().getTime()) return 'auth';
+      if (collected.status !== 'captured') {
+        if (collected.diagnostic === 'quota_agy_setup' || collected.diagnostic === 'quota_agy_trust')
+          io.diagnostic?.(collected.diagnostic);
+        return collected.status;
+      }
+      const mapped = mapAgyQuota(collected.observation.quota, collected.observation.observedAt);
+      if ('status' in mapped) return mapped.status;
+      const saved = SnapshotSchema.parse({
+        schema_version: 1,
+        source: 'antigravity',
+        identity_fingerprint: after.identityFingerprint,
+        windows: mapped.windows,
+      });
+      const text = assertNoCredentials(saved, '')!;
+      await writeQuotaSnapshot(dest, text, after.identityFingerprint, io);
+      return 'written';
+    });
+  } catch {
+    return 'fetch';
+  }
 }
 
 export function mapGrokBilling(payload: unknown, observedAt: string): MappedWindows {

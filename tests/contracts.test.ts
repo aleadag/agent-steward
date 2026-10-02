@@ -101,7 +101,7 @@ test('snapshot requires identity_fingerprint and optional window cadence', () =>
       true,
     );
   }
-  assert.equal(SnapshotSchema.safeParse(snapshot([], { source: 'antigravity' })).success, false);
+  assert.equal(SnapshotSchema.safeParse(snapshot([], { source: 'antigravity' })).success, true);
   assert.equal(
     SnapshotSchema.safeParse(snapshot([windowFact({ type: 'account' }, { cadence: 'other' })])).success,
     true,

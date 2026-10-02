@@ -25,6 +25,18 @@ function memoryRuntime(files: Map<string, string>, env: Runtime['env']) {
     unlink: async () => {
       throw new Error('must not unlink files');
     },
+    withAgyLock: async () => {
+      throw new Error('must not lock AGY');
+    },
+    collectAgy: async () => {
+      throw new Error('must not collect AGY');
+    },
+    setupAgy: async () => {
+      throw new Error('must not setup AGY');
+    },
+    runAgyHook: async () => {
+      throw new Error('must not run AGY hook');
+    },
     httpGet: async () => {
       throw new Error('must not fetch quota');
     },

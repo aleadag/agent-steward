@@ -125,7 +125,9 @@
           ln -s ../../../bin/agent-steward-herdr-adapter \
             "$out/share/agent-steward/herdr-plugin/agent-steward-herdr-adapter"
           makeWrapper "$out/lib/agent-steward/bun/bin/bun" "$out/bin/agent-steward" \
-            --add-flags "$out/lib/agent-steward/dist/src/main.js"
+            --add-flags "$out/lib/agent-steward/dist/src/main.js" \
+            --set AGENT_STEWARD_COMMAND "$out/bin/agent-steward" \
+            --set AGENT_STEWARD_SHELL "${pkgs.runtimeShell}"
           makeWrapper "$out/lib/agent-steward/bun/bin/bun" "$out/bin/agent-steward-herdr-adapter" \
             --add-flags "$out/lib/agent-steward/dist/src/herdr-adapter/entry.js"
           runHook postInstall
@@ -159,11 +161,12 @@
             AGENT_STEWARD_DIRNAME="${pkgs.coreutils}/bin/dirname" \
             AGENT_STEWARD_MKFIFO="${pkgs.coreutils}/bin/mkfifo" \
             AGENT_STEWARD_FIFO_WRITER="${./tests/fifo-writer.ts}" \
+            AGENT_STEWARD_FAKE_AGY="${./tests/fake-agy.ts}" \
             AGENT_STEWARD_SH="${pkgs.bash}/bin/bash" \
             AGENT_STEWARD_PS="${psPath}" \
             AGENT_STEWARD_PROCESS_PATH="${processPath}/bin/process-path" \
             AGENT_STEWARD_PROCESS_OBSERVER="${./tests/installed-process.ts}" \
-            ${pkgs.bun}/bin/bun test ${./tests/installed.test.ts} ${./tests/herdr-plugin.test.ts} ${./tests/installed-delivery.test.ts}
+            ${pkgs.bun}/bin/bun test ${./tests/installed.test.ts} ${./tests/herdr-plugin.test.ts} ${./tests/installed-delivery.test.ts} ${./tests/installed-agy.test.ts}
           touch "$out"
         '';
       };
