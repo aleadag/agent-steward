@@ -104,10 +104,23 @@ export async function readLedger(runtime: LedgerRuntime): Promise<LedgerRecord[]
   return [...folded.values()].reverse();
 }
 
-export function formatLedgerRecord(record: LedgerRecord): string {
-  const selected = record.selected;
-  const route = selected ? `${selected.tool}/${selected.model}/${selected.thinking_level}` : '-';
-  const fields = [record.request_id, record.recorded_at, route, selected?.quota_bucket ?? '-', record.event];
-  const line = fields.map((field) => JSON.stringify(field).slice(1, -1)).join('  ');
-  return `${line}${record.exit_code === undefined ? '' : `  exit_code=${record.exit_code}`}\n`;
+export function formatLedgerRecords(records: LedgerRecord[]): string {
+  if (records.length === 0) return '';
+  const headers = ['REQUEST ID', 'TIME (UTC)', 'ROUTE', 'ACCOUNT', 'STATUS'];
+  const hasExitCode = records.some((record) => record.exit_code !== undefined);
+  if (hasExitCode) headers.push('EXIT CODE');
+  const rows = records.map((record) => {
+    const selected = record.selected;
+    const route = selected ? `${selected.tool}/${selected.model}/${selected.thinking_level}` : '—';
+    const time = record.recorded_at.replace(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?Z$/, '$1 $2');
+    const fields = [record.request_id, time, route, selected?.quota_bucket ?? '—', record.event];
+    if (hasExitCode) fields.push(record.exit_code === undefined ? '—' : String(record.exit_code));
+    return fields.map((field) => JSON.stringify(field).slice(1, -1));
+  });
+  const widths = headers.map((header, column) => Math.max(header.length, ...rows.map((row) => row[column]!.length)));
+  return `${[headers, ...rows]
+    .map((row) =>
+      row.map((field, column) => (column === row.length - 1 ? field : field.padEnd(widths[column]!))).join('  '),
+    )
+    .join('\n')}\n`;
 }

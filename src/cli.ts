@@ -13,7 +13,7 @@ import { route } from './routing.ts';
 import { assessStop } from './triage.ts';
 import { assertLiveTask, buildNativeLaunch } from './launch.ts';
 import type { NativeLaunch } from './launch.ts';
-import { appendEvent, readLedger, formatLedgerRecord } from './ledger.ts';
+import { appendEvent, readLedger, formatLedgerRecords } from './ledger.ts';
 import type { LedgerEventKind, LedgerRuntime } from './ledger.ts';
 
 export type Invocation =
@@ -408,7 +408,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       if (invocation.kind === 'list') {
         const listed = records.slice(0, invocation.limit);
         if (invocation.json) runtime.stdout(`${JSON.stringify(listed)}\n`);
-        else if (listed.length > 0) runtime.stdout(listed.map(formatLedgerRecord).join(''));
+        else if (listed.length > 0) runtime.stdout(formatLedgerRecords(listed));
       } else {
         const record = records.find((record) => record.request_id === invocation.requestId);
         if (record === undefined) {

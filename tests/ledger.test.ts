@@ -263,6 +263,60 @@ test('oversized UTF-8 events are rejected without changing retained history', as
   }
 });
 
+test('human list aligns headers and full IDs while retaining exit codes and JSON history', async () => {
+  const { rt, out } = memoryRuntime(new Map(), { XDG_STATE_HOME: '/isolated/state' });
+  await appendEvent(rt, {
+    schema_version: 1,
+    request_id: '7f032e75-fc1f-40e1-ac78-1e5a2cbb1d26',
+    recorded_at: '2026-10-02T17:01:29.732Z',
+    event: 'exited',
+    selected: {
+      tool: 'pi',
+      provider: 'openai',
+      model: 'gpt-6.1-sol',
+      thinking_level: 'xhigh',
+      quota_bucket: 'pi_codex',
+    },
+    exit_code: 0,
+  });
+  await appendEvent(rt, {
+    schema_version: 1,
+    request_id: '102da780-0ae6-49fa-9b88-1ce041d71f57',
+    recorded_at: '2026-10-02T14:22:14.422Z',
+    event: 'evaluation_failed',
+  });
+  assert.equal(await run(['router', 'list'], rt), 0);
+  const [header, failed, exited, end] = out.join('').split('\n');
+  assert.equal(
+    header,
+    'REQUEST ID                            TIME (UTC)           ROUTE                 ACCOUNT   STATUS             EXIT CODE',
+  );
+  assert.equal(
+    failed,
+    '102da780-0ae6-49fa-9b88-1ce041d71f57  2026-10-02 14:22:14  —                     —         evaluation_failed  —',
+  );
+  assert.equal(
+    exited,
+    '7f032e75-fc1f-40e1-ac78-1e5a2cbb1d26  2026-10-02 17:01:29  pi/gpt-6.1-sol/xhigh  pi_codex  exited             0',
+  );
+  assert.equal(end, '');
+  out.length = 0;
+  assert.equal(await run(['router', 'list', '--json'], rt), 0);
+  const records = JSON.parse(out.join(''));
+  assert.equal(records[1].recorded_at, '2026-10-02T17:01:29.732Z');
+  assert.equal(records[1].request_id, '7f032e75-fc1f-40e1-ac78-1e5a2cbb1d26');
+  assert.equal(records[1].exit_code, 0);
+});
+
+test('human list omits the exit column when no exit codes are recorded', async () => {
+  const { rt, out } = memoryRuntime(new Map(), { XDG_STATE_HOME: '/isolated/state' });
+  await appendEvent(rt, { ...rotationEvent, recorded_at: 'historical-time' });
+  assert.equal(await run(['router', 'list'], rt), 0);
+  assert.match(out.join(''), /^REQUEST ID\s+TIME \(UTC\)\s+ROUTE\s+ACCOUNT\s+STATUS\n/);
+  assert.doesNotMatch(out.join(''), /EXIT CODE/);
+  assert.match(out.join(''), /historical-time/);
+});
+
 test('append then list folds by request_id without task text', async () => {
   const files = new Map<string, string>();
   const { rt, out, modes } = memoryRuntime(files, { XDG_STATE_HOME: '/isolated/state' });
@@ -405,7 +459,7 @@ for (const alias of ['codex-subscription-example', 'codex', 'pi_codex', 'pi_xai'
     assert.equal(record?.exit_code, 0);
     assert.deepEqual(record?.usage, { input_tokens: 20, output_tokens: 5 });
     assert.equal(await run(['router', 'list'], rt), 0);
-    assert.match(out.join(''), /legacy-pi.*pi\/historical-model\/high  -  exited/);
+    assert.match(out.join(''), /legacy-pi.*pi\/historical-model\/high\s+—\s+exited/);
     out.length = 0;
     assert.equal(await run(['router', 'show', 'legacy-pi', '--json'], rt), 0);
     assert.deepEqual(JSON.parse(out.join('')).selected, selected);
@@ -494,7 +548,7 @@ test('human list escapes control characters in decision metadata', async () => {
     },
   });
   assert.equal(await run(['router', 'list'], rt), 0);
-  assert.equal(out.join('').split('\n').length, 2);
+  assert.equal(out.join('').split('\n').length, 3);
   assert.ok(!out.join('').includes('\u001b'));
   assert.match(out.join(''), /model\\u001b\[31m\\nspoof/);
 });
