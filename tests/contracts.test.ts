@@ -51,11 +51,7 @@ test('config requires finite positive cost on each candidate', () => {
   const { cost: _cost, ...withoutCost } = candidate();
   assert.equal(ConfigSchema.safeParse(config({ candidates: [withoutCost] })).success, false);
   for (const cost of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, '1', null, undefined]) {
-    assert.equal(
-      ConfigSchema.safeParse(config({ candidates: [candidate({ cost })] })).success,
-      false,
-      String(cost),
-    );
+    assert.equal(ConfigSchema.safeParse(config({ candidates: [candidate({ cost })] })).success, false, String(cost));
   }
 });
 

@@ -166,7 +166,7 @@ test('optional adapter documents incomplete shutdown and offline recovery bounda
 
 test('unreleased portability does not rewrite published-alpha or live-runtime claims', () => {
   for (const platform of ['x86_64-linux', 'aarch64-linux', 'aarch64-darwin']) assert.ok(readme.includes(platform));
-  assert.match(readme, /Published `v0\.1\.0-alpha\.2` remains the Linux-only release/);
+  assert.match(readme, /Published `v0\.1\.0-alpha\.3` remains the Linux-only release/);
   assert.match(readme, /Portable packaging is unreleased/);
   assert.match(readme, /Export\/evaluation is not native validation/);
   assert.match(readme, /Three-platform validation is established only when all three native\s+jobs/);

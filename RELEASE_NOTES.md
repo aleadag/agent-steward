@@ -1,6 +1,6 @@
-# v0.1.0-alpha.2 — quota refresh and relative cost
+# v0.1.0-alpha.3 — quota refresh and relative cost
 
-Approved release notes for `v0.1.0-alpha.2`. Package metadata reports `0.1.0-alpha.2`; remote publication requires separate authorization.
+Approved release notes for `v0.1.0-alpha.3`. Package metadata reports `0.1.0-alpha.3`; remote publication requires separate authorization. Same features as the `v0.1.0-alpha.2` tag, plus Oxfmt on the cost-contract test so the Nix package check passes.
 
 This alpha adds explicit `quota refresh` and relative candidate `cost`. Routing still does not fetch quota. Config is breaking versus `v0.1.0-alpha.1`.
 

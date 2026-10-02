@@ -27,7 +27,7 @@ The package installs `result/bin/agent-steward` and `result/bin/agent-steward-he
 
 This development flake exports packages, the default app, a development shell,
 and build/installed checks for `x86_64-linux`, `aarch64-linux`
-and `aarch64-darwin`. Published `v0.1.0-alpha.2` remains the Linux-only release;
+and `aarch64-darwin`. Published `v0.1.0-alpha.3` remains the Linux-only release;
 its tag is unchanged. Portable packaging is unreleased and is not a new claim
 about that published alpha.
 
