@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { SnapshotSchema, StewardError } from './contracts.ts';
-import type { QuotaWindow, SnapshotSource } from './contracts.ts';
+import type { Config, QuotaBucket, QuotaWindow, ReadText, SnapshotSource } from './contracts.ts';
+import { assertByteLength, assertJsonDepth } from './limits.ts';
+import { quotaFile } from './quota.ts';
 import { compareRfc3339Timestamps } from './timestamps.ts';
 
 type AuthFailure = { status: 'auth' };
@@ -33,11 +35,15 @@ function parseRecord(text: string): Record<string, unknown> | null {
   }
 }
 
-function tokenClaims(access: string, now: Date, requireExpiry: boolean): Record<string, unknown> | null {
+function decodeClaims(access: string): Record<string, unknown> | null {
   const parts = access.split('.');
   const payload = parts[1];
   if (parts.length !== 3 || !parts[0] || !parts[2] || !payload || !/^[A-Za-z0-9_-]+$/.test(payload)) return null;
-  const claims = parseRecord(Buffer.from(payload, 'base64url').toString('utf8'));
+  return parseRecord(Buffer.from(payload, 'base64url').toString('utf8'));
+}
+
+function tokenClaims(access: string, now: Date, requireExpiry: boolean): Record<string, unknown> | null {
+  const claims = decodeClaims(access);
   if (claims === null || !Number.isFinite(now.getTime())) return null;
   if (requireExpiry || claims.exp !== undefined) {
     if (!finite(claims.exp) || claims.exp <= now.getTime() / 1000) return null;
@@ -171,6 +177,163 @@ export function mapCodexUsage(payload: unknown, observedAt: string): MappedWindo
     }
   }
   return { windows };
+}
+
+export type QuotaHttpGet = (url: string, headers: Record<string, string>) => Promise<{ status: number; body: string }>;
+
+export type QuotaRefreshIO = {
+  env: AuthEnv & { XDG_STATE_HOME?: string };
+  now: () => Date;
+  readText: ReadText;
+  mkdirp: (path: string, mode: number) => Promise<void>;
+  chmod: (path: string, mode: number) => Promise<void>;
+  writeText: (path: string, text: string, mode: number) => Promise<void>;
+  rename: (from: string, to: string) => Promise<void>;
+  unlink: (path: string) => Promise<void>;
+  httpGet: QuotaHttpGet;
+};
+
+type RefreshStatus = 'written' | 'unsupported' | 'auth' | 'fetch' | 'malformed';
+
+// Identity survives expiry solely to invalidate another login's snapshot. It never
+// authorizes a request; the public auth readers still gate every HTTP call.
+function credentialIdentity(bucket: SnapshotSource, text: string): string | null {
+  const auth = parseRecord(text);
+  const access =
+    bucket === 'codex'
+      ? record(auth?.tokens)?.access_token
+      : record(auth?.[bucket === 'pi_codex' ? 'openai-codex' : 'xai'])?.access;
+  if (!nonempty(access)) return null;
+  const claims = decodeClaims(access);
+  if (claims === null) return null;
+  const identity =
+    bucket === 'pi_xai' ? (nonempty(claims.principal_id) ? claims.principal_id : claims.sub) : codexIdentity(claims);
+  return nonempty(identity) ? identity : null;
+}
+
+async function unlinkIfPresent(path: string, io: QuotaRefreshIO): Promise<void> {
+  try {
+    await io.unlink(path);
+  } catch (error) {
+    if (error === null || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') throw error;
+  }
+}
+
+async function invalidatePrevious(dest: string, identityFingerprint: string | null, io: QuotaRefreshIO): Promise<void> {
+  if (identityFingerprint === null) return;
+  let previous;
+  try {
+    const text = await io.readText(dest);
+    assertByteLength(text);
+    const parsed: unknown = JSON.parse(text);
+    assertJsonDepth(parsed);
+    previous = SnapshotSchema.parse(parsed);
+  } catch {
+    return;
+  }
+  if (previous.identity_fingerprint !== identityFingerprint) await unlinkIfPresent(dest, io);
+}
+
+async function collectWindows(
+  bucket: SnapshotSource,
+  access: string,
+  identity: string,
+  observedAt: string,
+  httpGet: QuotaHttpGet,
+): Promise<MappedWindows | { status: 'fetch' }> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${access}`,
+    Accept: 'application/json',
+    'User-Agent': 'agent-steward-quota-refresh',
+  };
+  const grok = bucket === 'pi_xai';
+  headers[grok ? 'x-xai-token-auth' : 'ChatGPT-Account-Id'] = grok ? 'xai-grok-cli' : identity;
+  let body: string;
+  try {
+    const response = await httpGet(
+      grok ? 'https://cli-chat-proxy.grok.com/v1/billing?format=credits' : 'https://chatgpt.com/backend-api/wham/usage',
+      headers,
+    );
+    if (response.status !== 200) return { status: 'fetch' };
+    assertByteLength(response.body);
+    body = response.body;
+  } catch {
+    return { status: 'fetch' };
+  }
+  try {
+    const payload: unknown = JSON.parse(body);
+    assertJsonDepth(payload);
+    return grok ? mapGrokBilling(payload, observedAt) : mapCodexUsage(payload, observedAt);
+  } catch {
+    return { status: 'malformed' };
+  }
+}
+
+export async function refreshQuota(
+  config: Config,
+  io: QuotaRefreshIO,
+): Promise<{ buckets: { bucket: QuotaBucket; status: RefreshStatus }[] }> {
+  const now = io.now();
+  if (!Number.isFinite(now.getTime())) throw new StewardError('invalid_input');
+  const enabled = new Set(config.tools);
+  const buckets = new Set(
+    config.candidates.filter((candidate) => enabled.has(candidate.tool)).map((candidate) => candidate.quota_bucket),
+  );
+  const result: { bucket: QuotaBucket; status: RefreshStatus }[] = [];
+  for (const bucket of buckets) {
+    if (bucket === 'antigravity') {
+      result.push({ bucket, status: 'unsupported' });
+      continue;
+    }
+    const dest = quotaFile(io.env, bucket);
+    const path = authPath(bucket === 'codex' ? 'codex' : 'pi', io.env);
+    let text: string;
+    try {
+      text = await io.readText(path);
+    } catch {
+      result.push({ bucket, status: 'auth' });
+      continue;
+    }
+    const identity = credentialIdentity(bucket, text);
+    const identityFingerprint = identity === null ? null : fingerprint(bucket, identity);
+    const auth =
+      bucket === 'codex'
+        ? readCodexAuth(text, now)
+        : readPiAuth(text, bucket === 'pi_codex' ? 'openai-codex' : 'xai', now);
+    const mapped =
+      'status' in auth || identity === null
+        ? { status: 'auth' as const }
+        : await collectWindows(bucket, auth.access, identity, now.toISOString(), io.httpGet);
+    if ('status' in mapped) {
+      await invalidatePrevious(dest, identityFingerprint, io);
+      result.push({ bucket, status: mapped.status });
+      continue;
+    }
+    const snapshot = SnapshotSchema.safeParse({
+      schema_version: 1,
+      source: bucket,
+      identity_fingerprint: identityFingerprint,
+      windows: mapped.windows,
+    });
+    if (!snapshot.success) {
+      await invalidatePrevious(dest, identityFingerprint, io);
+      result.push({ bucket, status: 'malformed' });
+      continue;
+    }
+    const temp = `${dest}.tmp`;
+    try {
+      await io.mkdirp(dirname(dest), 0o700);
+      await io.chmod(dirname(dest), 0o700);
+      await io.writeText(temp, JSON.stringify(snapshot.data), 0o600);
+      await io.rename(temp, dest);
+    } catch (error) {
+      await unlinkIfPresent(temp, io);
+      await invalidatePrevious(dest, identityFingerprint, io);
+      throw error;
+    }
+    result.push({ bucket, status: 'written' });
+  }
+  return { buckets: result };
 }
 
 export function mapGrokBilling(payload: unknown, observedAt: string): MappedWindows {

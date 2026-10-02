@@ -2,6 +2,9 @@ import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { SnapshotSchema, StewardError } from '../src/contracts.ts';
+import type { QuotaBucket, SnapshotSource } from '../src/contracts.ts';
+import { candidate, config, snapshot, windowFact } from './helpers.ts';
+import type { QuotaHttpGet, QuotaRefreshIO } from '../src/quota-refresh.ts';
 import {
   authPath,
   fingerprint,
@@ -9,6 +12,7 @@ import {
   mapGrokBilling,
   readCodexAuth,
   readPiAuth,
+  refreshQuota,
 } from '../src/quota-refresh.ts';
 
 const observed = '2026-10-02T12:00:00.000Z';
@@ -46,6 +50,349 @@ function billing(overrides: Record<string, unknown> = {}) {
     },
   };
 }
+
+const quotaDir = '/home/.local/state/agent-steward/quota';
+const nativeAccess = jwt({ ...accountClaim, exp: expires });
+const xaiAccess = jwt({ principal_id: 'principal', sub: 'ignored', exp: expires });
+
+function storedSnapshot(bucket: SnapshotSource, identity = 'acct'): string {
+  return JSON.stringify(
+    snapshot([windowFact({ type: 'account' })], {
+      source: bucket,
+      identity_fingerprint: createHash('sha256').update(`${bucket}:${identity}`).digest('hex'),
+    }),
+  );
+}
+
+function refreshConfig(buckets: QuotaBucket[], tools = ['codex', 'pi', 'agy']) {
+  return config({
+    tools,
+    candidates: buckets.map((bucket, index) =>
+      candidate({
+        id: `candidate-${index}`,
+        tool: bucket === 'codex' ? 'codex' : bucket === 'antigravity' ? 'agy' : 'pi',
+        quota_bucket: bucket,
+      }),
+    ),
+  });
+}
+
+function refreshIO(
+  httpGet: QuotaHttpGet = async () => ({ status: 200, body: JSON.stringify(codexUsage(measured())) }),
+) {
+  const files = new Map<string, string>([
+    ['/home/.codex/auth.json', codexAuth(nativeAccess)],
+    [
+      '/home/.pi/agent/auth.json',
+      JSON.stringify({
+        'openai-codex': { type: 'oauth', access: nativeAccess, expires: expires * 1000 },
+        xai: { type: 'oauth', access: xaiAccess, expires: expires * 1000 },
+      }),
+    ],
+  ]);
+  const operations: unknown[][] = [];
+  const requests: { url: string; headers: Record<string, string> }[] = [];
+  const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' });
+  const io: QuotaRefreshIO = {
+    env: { HOME: '/home' },
+    now: () => now,
+    readText: async (path) => {
+      operations.push(['read', path]);
+      const text = files.get(path);
+      if (text === undefined) throw missing();
+      return text;
+    },
+    mkdirp: async (path, mode) => {
+      operations.push(['mkdir', path, mode]);
+    },
+    chmod: async (path, mode) => {
+      operations.push(['chmod', path, mode]);
+    },
+    writeText: async (path, text, mode) => {
+      operations.push(['write', path, mode]);
+      files.set(path, text);
+    },
+    rename: async (from, to) => {
+      operations.push(['rename', from, to]);
+      const text = files.get(from);
+      if (text === undefined) throw missing();
+      files.set(to, text);
+      files.delete(from);
+    },
+    unlink: async (path) => {
+      operations.push(['unlink', path]);
+      if (!files.delete(path)) throw missing();
+    },
+    httpGet: async (url, headers) => {
+      requests.push({ url, headers });
+      return httpGet(url, headers);
+    },
+  };
+  return { io, files, operations, requests };
+}
+
+// Each assertion covers the collector's boundary effects, not mapper internals:
+// bucket gating, pinned requests, atomic permissions, or preservation/invalidation.
+test('refresh writes a private atomic snapshot without Jev or auth-store writes', async () => {
+  const { io, files, operations, requests } = refreshIO(async () => ({
+    status: 200,
+    body: JSON.stringify({ ...codexUsage(measured()), email: 'private@example.com', account_id: 'raw-account' }),
+  }));
+  const authBefore = files.get('/home/.codex/auth.json');
+  assert.deepEqual(await refreshQuota(refreshConfig(['codex', 'codex']), io), {
+    buckets: [{ bucket: 'codex', status: 'written' }],
+  });
+  assert.deepEqual(requests, [
+    {
+      url: 'https://chatgpt.com/backend-api/wham/usage',
+      headers: {
+        Authorization: `Bearer ${nativeAccess}`,
+        'ChatGPT-Account-Id': 'acct',
+        Accept: 'application/json',
+        'User-Agent': 'agent-steward-quota-refresh',
+      },
+    },
+  ]);
+  const dest = `${quotaDir}/codex.json`;
+  assert.deepEqual(
+    operations.filter(([op]) => op !== 'read'),
+    [
+      ['mkdir', quotaDir, 0o700],
+      ['chmod', quotaDir, 0o700],
+      ['write', `${dest}.tmp`, 0o600],
+      ['rename', `${dest}.tmp`, dest],
+    ],
+  );
+  const body = files.get(dest)!;
+  const saved = SnapshotSchema.parse(JSON.parse(body));
+  assert.equal(saved.source, 'codex');
+  assert.equal(saved.identity_fingerprint, createHash('sha256').update('codex:acct').digest('hex'));
+  assert.equal(saved.windows[0]?.remaining_percent, 75);
+  assert.equal(saved.windows[0]?.observed_at, observed);
+  for (const secret of [nativeAccess, 'private@example.com', 'raw-account']) assert.ok(!body.includes(secret));
+  assert.equal(files.get('/home/.codex/auth.json'), authBefore);
+  assert.equal(files.has(`${dest}.tmp`), false);
+});
+
+test('refresh uses distinct Pi credentials, pinned headers, and XDG state paths', async () => {
+  const { io, files, requests } = refreshIO(async (url) => ({
+    status: 200,
+    body: JSON.stringify(url.includes('grok.com') ? billing() : codexUsage(measured())),
+  }));
+  io.env.XDG_STATE_HOME = '/state';
+  io.env.PI_CODING_AGENT_DIR = '/pi';
+  files.set('/pi/auth.json', files.get('/home/.pi/agent/auth.json')!);
+  files.delete('/home/.pi/agent/auth.json');
+  assert.deepEqual(await refreshQuota(refreshConfig(['pi_codex', 'pi_xai', 'pi_codex']), io), {
+    buckets: [
+      { bucket: 'pi_codex', status: 'written' },
+      { bucket: 'pi_xai', status: 'written' },
+    ],
+  });
+  assert.deepEqual(requests, [
+    {
+      url: 'https://chatgpt.com/backend-api/wham/usage',
+      headers: {
+        Authorization: `Bearer ${nativeAccess}`,
+        'ChatGPT-Account-Id': 'acct',
+        Accept: 'application/json',
+        'User-Agent': 'agent-steward-quota-refresh',
+      },
+    },
+    {
+      url: 'https://cli-chat-proxy.grok.com/v1/billing?format=credits',
+      headers: {
+        Authorization: `Bearer ${xaiAccess}`,
+        'x-xai-token-auth': 'xai-grok-cli',
+        Accept: 'application/json',
+        'User-Agent': 'agent-steward-quota-refresh',
+      },
+    },
+  ]);
+  for (const [bucket, identity, remaining] of [
+    ['pi_codex', 'acct', 75],
+    ['pi_xai', 'principal', 60],
+  ] as const) {
+    const saved = SnapshotSchema.parse(JSON.parse(files.get(`/state/agent-steward/quota/${bucket}.json`)!));
+    assert.equal(saved.source, bucket);
+    assert.equal(saved.identity_fingerprint, createHash('sha256').update(`${bucket}:${identity}`).digest('hex'));
+    assert.equal(saved.windows[0]?.remaining_percent, remaining);
+  }
+});
+
+test('antigravity and disabled buckets do not open files or sockets', async () => {
+  const { io, operations, requests } = refreshIO();
+  io.env = {};
+  assert.deepEqual(await refreshQuota(refreshConfig(['antigravity', 'codex', 'pi_xai', 'antigravity'], ['agy']), io), {
+    buckets: [{ bucket: 'antigravity', status: 'unsupported' }],
+  });
+  assert.deepEqual(await refreshQuota(refreshConfig(['codex'], []), io), { buckets: [] });
+  assert.deepEqual(operations, []);
+  assert.deepEqual(requests, []);
+});
+
+test('mixed buckets continue after failure and collect each enabled bucket only once', async () => {
+  const { io, files, requests } = refreshIO(async (url) => ({
+    status: url.includes('grok.com') ? 200 : 403,
+    body: JSON.stringify(billing()),
+  }));
+  files.delete('/home/.codex/auth.json');
+  assert.deepEqual(await refreshQuota(refreshConfig(['codex', 'pi_codex', 'pi_xai', 'antigravity', 'pi_xai']), io), {
+    buckets: [
+      { bucket: 'codex', status: 'auth' },
+      { bucket: 'pi_codex', status: 'fetch' },
+      { bucket: 'pi_xai', status: 'written' },
+      { bucket: 'antigravity', status: 'unsupported' },
+    ],
+  });
+  assert.equal(requests.length, 2);
+  assert.ok(files.has(`${quotaDir}/pi_xai.json`));
+});
+
+for (const bucket of ['codex', 'pi_codex', 'pi_xai'] as const) {
+  for (const changed of [false, true]) {
+    test(`expired ${bucket} makes zero requests and ${changed ? 'invalidates changed' : 'preserves same'} identity`, async () => {
+      const { io, files, operations, requests } = refreshIO();
+      const identity = bucket === 'pi_xai' ? 'principal' : 'acct';
+      const dest = `${quotaDir}/${bucket}.json`;
+      const previous = storedSnapshot(bucket, changed ? 'previous-login' : identity);
+      files.set(dest, previous);
+      const access = jwt({ ...accountClaim, principal_id: 'principal', exp: 1 });
+      files.set(
+        bucket === 'codex' ? '/home/.codex/auth.json' : '/home/.pi/agent/auth.json',
+        bucket === 'codex' ? codexAuth(access) : piAuth(bucket === 'pi_codex' ? 'openai-codex' : 'xai', access),
+      );
+      assert.deepEqual(await refreshQuota(refreshConfig([bucket]), io), { buckets: [{ bucket, status: 'auth' }] });
+      assert.deepEqual(requests, []);
+      assert.equal(files.get(dest), changed ? undefined : previous);
+      assert.deepEqual(
+        operations.filter(([op]) => op !== 'read'),
+        changed ? [['unlink', dest]] : [],
+      );
+    });
+  }
+}
+
+const failureResponses: [string, QuotaHttpGet, 'fetch' | 'malformed'][] = [
+  ...[401, 403, 302, 500].map((status): [string, QuotaHttpGet, 'fetch'] => [
+    String(status),
+    async () => ({ status, body: 'private failure body' }),
+    'fetch',
+  ]),
+  [
+    'timeout',
+    async () => {
+      throw new Error('private timeout');
+    },
+    'fetch',
+  ],
+  [
+    'off-host redirect',
+    async () => {
+      throw new Error('redirect refused');
+    },
+    'fetch',
+  ],
+  ['oversize', async () => ({ status: 200, body: ' '.repeat(1_048_577) }), 'fetch'],
+  ['invalid JSON', async () => ({ status: 200, body: 'private malformed body' }), 'malformed'],
+  [
+    'invalid windows',
+    async () => ({ status: 200, body: JSON.stringify(codexUsage(measured({ used_percent: 101 }))) }),
+    'malformed',
+  ],
+  ['excess depth', async () => ({ status: 200, body: '['.repeat(65) + '0' + ']'.repeat(65) }), 'malformed'],
+];
+for (const [label, httpGet, status] of failureResponses) {
+  for (const changed of [false, true]) {
+    test(`${label} ${changed ? 'deletes different-identity' : 'preserves same-identity'} snapshot without retry`, async () => {
+      const { io, files, operations, requests } = refreshIO(httpGet);
+      const dest = `${quotaDir}/codex.json`;
+      const previous = storedSnapshot('codex', changed ? 'previous-login' : 'acct');
+      files.set(dest, previous);
+      assert.deepEqual(await refreshQuota(refreshConfig(['codex']), io), { buckets: [{ bucket: 'codex', status }] });
+      assert.equal(files.get(dest), changed ? undefined : previous);
+      assert.equal(requests.length, 1);
+      assert.deepEqual(
+        operations.filter(([op]) => op !== 'read'),
+        changed ? [['unlink', dest]] : [],
+      );
+    });
+  }
+}
+
+test('missing or undecodable credentials preserve the snapshot when identity is unknown', async () => {
+  for (const auth of [undefined, 'invalid json', codexAuth('invalid token')]) {
+    const { io, files, operations, requests } = refreshIO();
+    const previous = storedSnapshot('codex');
+    files.set(`${quotaDir}/codex.json`, previous);
+    if (auth === undefined) files.delete('/home/.codex/auth.json');
+    else files.set('/home/.codex/auth.json', auth);
+    assert.deepEqual(await refreshQuota(refreshConfig(['codex']), io), {
+      buckets: [{ bucket: 'codex', status: 'auth' }],
+    });
+    assert.equal(files.get(`${quotaDir}/codex.json`), previous);
+    assert.deepEqual(requests, []);
+    assert.deepEqual(
+      operations.filter(([op]) => op !== 'read'),
+      [],
+    );
+  }
+});
+
+test('successful changed identity replaces the previous snapshot', async () => {
+  const { io, files } = refreshIO();
+  const dest = `${quotaDir}/codex.json`;
+  const previous = storedSnapshot('codex', 'previous-login');
+  files.set(dest, previous);
+  assert.deepEqual(await refreshQuota(refreshConfig(['codex']), io), {
+    buckets: [{ bucket: 'codex', status: 'written' }],
+  });
+  assert.notEqual(files.get(dest), previous);
+  assert.equal(
+    JSON.parse(files.get(dest)!).identity_fingerprint,
+    createHash('sha256').update('codex:acct').digest('hex'),
+  );
+});
+
+test('failed atomic rename cleans up its temporary file and does not claim written', async () => {
+  const { io, files } = refreshIO();
+  const dest = `${quotaDir}/codex.json`;
+  const previous = storedSnapshot('codex');
+  files.set(dest, previous);
+  io.rename = async () => {
+    throw new Error('rename failed');
+  };
+  await assert.rejects(refreshQuota(refreshConfig(['codex']), io));
+  assert.equal(files.has(`${dest}.tmp`), false);
+  assert.equal(files.get(dest), previous);
+});
+
+test('invalid input paths and clock reject before HTTP or writes', async () => {
+  for (const env of [
+    { HOME: 'relative' },
+    { HOME: '/home', CODEX_HOME: '' },
+    { HOME: '/home', XDG_STATE_HOME: 'relative' },
+  ]) {
+    const { io, operations, requests } = refreshIO();
+    io.env = env;
+    await assert.rejects(
+      refreshQuota(refreshConfig(['codex']), io),
+      (error: unknown) => error instanceof StewardError && error.code === 'invalid_input',
+    );
+    assert.deepEqual(requests, []);
+    assert.deepEqual(
+      operations.filter(([op]) => op !== 'read'),
+      [],
+    );
+  }
+  const { io, requests } = refreshIO();
+  io.now = () => new Date(NaN);
+  await assert.rejects(
+    refreshQuota(refreshConfig(['codex']), io),
+    (error: unknown) => error instanceof StewardError && error.code === 'invalid_input',
+  );
+  assert.deepEqual(requests, []);
+});
 
 test('fingerprints hash bucket-prefixed identity and keep credential stores separate', () => {
   for (const bucket of ['codex', 'pi_codex', 'pi_xai'] as const) {
