@@ -51,6 +51,8 @@ export async function appendEvent(runtime: LedgerRuntime, event: LedgerEvent): P
   await runtime.chmod(file, 0o600);
 }
 
+const quotaBuckets = new Set(['codex', 'pi_codex', 'pi_xai', 'antigravity']);
+
 export async function readLedger(runtime: LedgerRuntime): Promise<LedgerEvent[]> {
   const text = await runtime.readTextIfPresent(ledgerFile(runtime.env));
   if (text === null) return [];
@@ -59,7 +61,22 @@ export async function readLedger(runtime: LedgerRuntime): Promise<LedgerEvent[]>
   for (const line of text.split('\n').filter((line) => line.trim() !== '')) {
     let event: LedgerEvent;
     try {
-      event = EventSchema.parse(JSON.parse(line));
+      const parsed: unknown = JSON.parse(line);
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const record = parsed as Record<string, unknown>;
+        if (record.selected !== null && typeof record.selected === 'object' && !Array.isArray(record.selected)) {
+          const selected = record.selected as Record<string, unknown>;
+          if (selected.quota_bucket === undefined) {
+            if (typeof selected.account_id === 'string' && quotaBuckets.has(selected.account_id)) {
+              selected.quota_bucket = selected.account_id;
+            } else {
+              delete record.selected;
+            }
+          }
+          if (record.selected !== undefined) delete selected.account_id;
+        }
+      }
+      event = EventSchema.parse(parsed);
     } catch {
       throw new StewardError('invalid_input');
     }

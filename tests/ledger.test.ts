@@ -93,6 +93,59 @@ test('append then list folds by request_id without task text', async () => {
   assert.equal(shown.event, 'exited');
 });
 
+test('list and show read legacy account_id-only and mixed ledger history', async () => {
+  const files = new Map<string, string>();
+  const { rt, out } = memoryRuntime(files, { XDG_STATE_HOME: '/isolated/state' });
+  files.set(
+    ledgerFile(rt.env),
+    [
+      JSON.stringify({
+        schema_version: 1,
+        request_id: 'legacy',
+        recorded_at: '2026-10-01T00:00:00.000Z',
+        event: 'launched',
+        selected: { tool: 'codex', provider: 'openai', model: 'm1', thinking_level: 'low', account_id: 'codex' },
+      }),
+      JSON.stringify({
+        schema_version: 1,
+        request_id: 'mixed',
+        recorded_at: '2026-10-02T00:00:00.000Z',
+        event: 'launched',
+        selected: {
+          tool: 'pi',
+          provider: 'openai-codex',
+          model: 'm2',
+          thinking_level: 'low',
+          account_id: 'not-a-bucket',
+          quota_bucket: 'pi_codex',
+        },
+      }),
+      JSON.stringify({
+        schema_version: 1,
+        request_id: 'unknown-account',
+        recorded_at: '2026-10-03T00:00:00.000Z',
+        event: 'launched',
+        selected: { tool: 'codex', provider: 'openai', model: 'm3', thinking_level: 'low', account_id: 'private-id' },
+      }),
+    ].join('\n'),
+  );
+
+  assert.equal(await run(['router', 'list', '--json'], rt), 0);
+  const listed = JSON.parse(out.join(''));
+  assert.equal(listed.length, 3);
+  assert.equal(listed[2].selected.quota_bucket, 'codex');
+  assert.equal(listed[1].selected.quota_bucket, 'pi_codex');
+  assert.equal(Object.hasOwn(listed[1].selected, 'account_id'), false);
+  assert.equal(Object.hasOwn(listed[0], 'selected'), false);
+
+  out.length = 0;
+  assert.equal(await run(['router', 'show', 'legacy', '--json'], rt), 0);
+  assert.equal(JSON.parse(out.join('')).selected.quota_bucket, 'codex');
+  out.length = 0;
+  assert.equal(await run(['router', 'show', 'unknown-account', '--json'], rt), 0);
+  assert.equal(Object.hasOwn(JSON.parse(out.join('')), 'selected'), false);
+});
+
 test('credential scan blocks writes before any filesystem side effect', async () => {
   const files = new Map<string, string>();
   const { rt, modes } = memoryRuntime(files, { XDG_STATE_HOME: '/isolated/state', TYPESAFE_API_KEY: 'sekrit' });
