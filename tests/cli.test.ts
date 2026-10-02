@@ -11,7 +11,7 @@ type JevWire = { model: string; state: unknown; questions: Questions };
 type PostAnswer = (wire: JevWire, index: number) => unknown;
 
 const CONFIG_PATH = '/isolated/xdg/agent-steward/config.json';
-const SNAPSHOT_PATH = 'codex';
+const SNAPSHOT_PATH = '/isolated/home/.local/state/agent-steward/quota/codex.json';
 const NOW = new Date('2026-09-28T10:30:00Z');
 
 function runtime(overrides: Partial<Runtime> = {}) {
@@ -874,7 +874,7 @@ test('custom config, enabled-tool filtering, and quota diagnostics remain local 
     post,
   });
   assert.equal(await run(['router', 'start', 'task', '--config', 'custom.json', '--dry-run', '--json'], io), 0);
-  assert.deepEqual(reads, ['/isolated/work/custom.json', 'codex']);
+  assert.deepEqual(reads, ['/isolated/work/custom.json', SNAPSHOT_PATH]);
   assert.match(err.join(''), /quota_unreadable/);
   assert.doesNotMatch(err.join(''), /missing fixture|custom\.json|task/);
   assert.equal(result(out).selected.candidate_id, 'codex-astra');

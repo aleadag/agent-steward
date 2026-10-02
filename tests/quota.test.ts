@@ -1,13 +1,22 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { readFileText } from '../src/io.ts';
 import { loadQuota as loadQuotaSource } from '../src/quota.ts';
 import type { Config, QuotaFacts, QuotaWindowFact } from '../src/contracts.ts';
 import { config, candidate, snapshot, windowFact } from './helpers.ts';
 
 const now = new Date('2026-09-28T10:30:00Z');
 
-async function loadQuota(config: Config, io: Parameters<typeof loadQuotaSource>[1]) {
-  const loaded = await loadQuotaSource(config, io);
+type QuotaTestIO = Omit<Parameters<typeof loadQuotaSource>[1], 'env'> & {
+  env?: { HOME?: string; XDG_STATE_HOME?: string };
+};
+
+async function loadQuota(config: Config, io: QuotaTestIO) {
+  const input = { env: { HOME: '/isolated/home' }, ...io };
+  const loaded = await loadQuotaSource(config, input);
   return {
     size: loaded.size,
     get(candidateId: string): QuotaFacts {
@@ -30,6 +39,75 @@ function assertFactsUnknown(facts: QuotaFacts, status: QuotaFacts['snapshot_stat
   assert.equal(facts.pool_status, 'unknown');
   assert.deepEqual(facts.windows, []);
 }
+
+test('repository-local bucket files cannot supply known quota facts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'steward-quota-boundary-'));
+  try {
+    const repo = join(root, 'repo');
+    await mkdir(repo);
+    await writeFile(
+      join(repo, 'codex'),
+      JSON.stringify(snapshot([windowFact({ type: 'account' }, { remaining_percent: 100 })])),
+    );
+    const reads: string[] = [];
+    const diagnostics: string[] = [];
+    const quota = await loadQuota(config(), {
+      env: { HOME: join(root, 'home'), XDG_STATE_HOME: join(root, 'state') },
+      now,
+      readText: async (path) => {
+        reads.push(path);
+        return readFileText(resolve(repo, path));
+      },
+      diagnostic: (code) => diagnostics.push(code),
+    });
+    assertFactsUnknown(quota.get('codex-astra'), 'missing');
+    assert.deepEqual(reads, [join(root, 'state/agent-steward/quota/codex.json')]);
+    assert.deepEqual(diagnostics, ['quota_missing']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('quota reads use absolute generated-state paths with XDG precedence and HOME fallback', async () => {
+  for (const [env, expected] of [
+    [{ XDG_STATE_HOME: '/trusted/state', HOME: '/ignored/home' }, '/trusted/state/agent-steward/quota/pi_xai.json'],
+    [{ XDG_STATE_HOME: '/trusted/state' }, '/trusted/state/agent-steward/quota/pi_xai.json'],
+    [{ HOME: '/trusted/home' }, '/trusted/home/.local/state/agent-steward/quota/pi_xai.json'],
+    [{ XDG_STATE_HOME: '', HOME: '/trusted/home' }, '/trusted/home/.local/state/agent-steward/quota/pi_xai.json'],
+  ] as const) {
+    const reads: string[] = [];
+    const quota = await loadQuota(config({ candidates: [candidate({ tool: 'pi', quota_bucket: 'pi_xai' })] }), {
+      env,
+      now,
+      readText: async (path) => {
+        reads.push(path);
+        return JSON.stringify(snapshot([windowFact({ type: 'account' })], { source: 'pi_xai' }));
+      },
+      diagnostic: () => {},
+    });
+    assert.deepEqual(reads, [expected]);
+    assert.equal(quota.get('codex-astra').account_status, 'known');
+  }
+});
+
+test('relative or missing state roots fail closed before reading quota', async () => {
+  for (const env of [{ XDG_STATE_HOME: 'relative', HOME: '/trusted/home' }, { HOME: 'relative' }, {}, { HOME: '' }]) {
+    let reads = 0;
+    await assert.rejects(
+      loadQuota(config(), {
+        env,
+        now,
+        readText: async () => {
+          reads++;
+          return JSON.stringify(snapshot([windowFact({ type: 'account' })]));
+        },
+        diagnostic: () => {},
+      }),
+      (error: unknown) => error instanceof Error && 'code' in error && error.code === 'invalid_input',
+    );
+    assert.equal(reads, 0);
+  }
+});
 
 test('shared read does not borrow another pool at reset boundary', async () => {
   const cfg = config({ candidates: [candidate(), candidate({ id: 'codex-other', quota_pool: 'absent' })] });
@@ -68,8 +146,10 @@ test('reads each referenced bucket once and does not mix equal pool IDs across b
   });
   const reads: string[] = [];
   const files: Record<string, string> = {
-    codex: JSON.stringify(snapshot([windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 20 })])),
-    pi_codex: JSON.stringify(
+    '/isolated/home/.local/state/agent-steward/quota/codex.json': JSON.stringify(
+      snapshot([windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 20 })]),
+    ),
+    '/isolated/home/.local/state/agent-steward/quota/pi_codex.json': JSON.stringify(
       snapshot([windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 80 })], {
         source: 'pi_codex',
       }),
@@ -85,7 +165,10 @@ test('reads each referenced bucket once and does not mix equal pool IDs across b
     },
     diagnostic: () => {},
   });
-  assert.deepEqual(reads.sort(), ['codex', 'pi_codex']);
+  assert.deepEqual(reads.sort(), [
+    '/isolated/home/.local/state/agent-steward/quota/codex.json',
+    '/isolated/home/.local/state/agent-steward/quota/pi_codex.json',
+  ]);
   assert.equal(windowAt(quota.get('codex-first'), 0).remaining_percent, 20);
   assert.equal(windowAt(quota.get('codex-second'), 0).remaining_percent, 20);
   assert.equal(windowAt(quota.get('pi-primary'), 0).remaining_percent, 80);

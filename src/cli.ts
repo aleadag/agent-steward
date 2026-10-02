@@ -471,6 +471,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     if (invocation.kind === 'route') {
       assertRoutePreflight(config);
       quota = await loadQuota(config, {
+        env: runtime.env,
         readText: runtime.readText,
         now: runtime.now(),
         diagnostic: (code) => runtime.stderr(`${DIAGNOSTICS[code] ?? 'agent-steward: quota_diagnostic'}\n`),

@@ -1,3 +1,4 @@
+import { isAbsolute, join } from 'node:path';
 import { SnapshotSchema, StewardError } from './contracts.ts';
 import type {
   QuotaBucket,
@@ -12,6 +13,18 @@ import type {
 import { assertByteLength, assertJsonDepth } from './limits.ts';
 import { compareRfc3339Timestamps } from './timestamps.ts';
 
+type QuotaEnv = { XDG_STATE_HOME?: string; HOME?: string };
+
+export function quotaFile(env: QuotaEnv, bucket: QuotaBucket): string {
+  const state = env.XDG_STATE_HOME;
+  if (state !== undefined && state.length > 0) {
+    if (!isAbsolute(state)) throw new StewardError('invalid_input');
+    return join(state, 'agent-steward', 'quota', `${bucket}.json`);
+  }
+  if (env.HOME === undefined || !isAbsolute(env.HOME)) throw new StewardError('invalid_input');
+  return join(env.HOME, '.local', 'state', 'agent-steward', 'quota', `${bucket}.json`);
+}
+
 type SnapshotLoad =
   | { status: 'loaded'; snapshot: Snapshot }
   | { status: 'missing' | 'unreadable' | 'malformed' | 'identity_mismatch' };
@@ -19,16 +32,26 @@ type SnapshotLoad =
 const applies = (window: QuotaWindow, pool: string): boolean =>
   window.scope.type === 'account' || window.scope.pool_id === pool;
 
-async function readSnapshot(bucket: QuotaBucket, readText: ReadText, diagnostic: Diagnostic): Promise<SnapshotLoad> {
+async function readSnapshot(
+  bucket: QuotaBucket,
+  env: QuotaEnv,
+  readText: ReadText,
+  diagnostic: Diagnostic,
+): Promise<SnapshotLoad> {
   if (bucket === 'antigravity') {
     diagnostic('quota_missing');
     return { status: 'missing' };
   }
 
+  const file = quotaFile(env, bucket);
   let text: string;
   try {
-    text = await readText(bucket);
-  } catch {
+    text = await readText(file);
+  } catch (error) {
+    if (error !== null && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      diagnostic('quota_missing');
+      return { status: 'missing' };
+    }
     diagnostic('quota_unreadable');
     return { status: 'unreadable' };
   }
@@ -79,6 +102,7 @@ function summaryStatus(windows: readonly QuotaWindowFact[]): 'known' | 'unknown'
 export async function loadQuota(
   config: Config,
   io: {
+    env: QuotaEnv;
     readText: ReadText;
     now: Date;
     diagnostic: Diagnostic;
@@ -98,7 +122,7 @@ export async function loadQuota(
     const bucket = candidate.quota_bucket;
     let loaded = cache.get(bucket);
     if (loaded === undefined) {
-      loaded = readSnapshot(bucket, io.readText, io.diagnostic);
+      loaded = readSnapshot(bucket, io.env, io.readText, io.diagnostic);
       cache.set(bucket, loaded);
     }
     const snapshotLoad = await loaded;

@@ -77,6 +77,7 @@ test('winning low-confidence pair is not returned when effort fails', async () =
     ],
   });
   const quota = await loadQuota(cfg, {
+    env: { HOME: '/isolated/home' },
     now: fixedNow,
     readText: async () => {
       throw new Error('absent');
@@ -293,7 +294,12 @@ test('known quota freshness, source, and unverified command flags survive select
       { source: 'codex' },
     ),
   );
-  const quota = await loadQuota(cfg, { now: fixedNow, readText: async () => body, diagnostic: () => {} });
+  const quota = await loadQuota(cfg, {
+    env: { HOME: '/isolated/home' },
+    now: fixedNow,
+    readText: async () => body,
+    diagnostic: () => {},
+  });
   const result = await route(
     routeInput(
       cfg,

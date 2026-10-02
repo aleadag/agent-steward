@@ -198,8 +198,8 @@ test.skipIf(!pkg || !packagedProcess)(
   12000,
 );
 
-test.skipIf(!pkg)('installed routing reads a bucket snapshot before a local missing-key failure', () => {
-  withIsolatedHome(({ root, xdg, run }) => {
+test.skipIf(!pkg)('installed routing ignores cwd bucket files and reads trusted state snapshots', () => {
+  withIsolatedHome(({ root, home, xdg, run }) => {
     const configDir = join(xdg, 'agent-steward');
     mkdirSync(configDir);
     writeConfig(join(configDir, 'config.json'), {
@@ -217,12 +217,21 @@ test.skipIf(!pkg)('installed routing reads a bucket snapshot before a local miss
         },
       ],
     });
-    writeConfig(join(root, 'codex'), {
+    const snapshot = {
       schema_version: 1,
       source: 'codex',
       identity_fingerprint: 'ab'.repeat(32),
       windows: [],
-    });
+    };
+    writeConfig(join(root, 'codex'), snapshot);
+    const missing = run(['router', 'start', 'task', '--dry-run', '--json']);
+    assert.equal(missing.status, 1);
+    assert.equal(parsed(missing).reason_code, 'missing_credentials');
+    assert.match(missing.stderr, /quota_missing/);
+
+    const quotaDir = join(home, '.local/state/agent-steward/quota');
+    mkdirSync(quotaDir, { recursive: true });
+    writeConfig(join(quotaDir, 'codex.json'), snapshot);
     const result = run(['router', 'start', 'task', '--dry-run', '--json']);
     assert.equal(result.status, 1);
     assert.equal(parsed(result).reason_code, 'missing_credentials');
