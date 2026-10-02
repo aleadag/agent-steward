@@ -27,6 +27,19 @@ function runtime(overrides: Partial<Runtime> = {}) {
       files.set(path, (files.get(path) ?? '') + text);
     },
     readTextIfPresent: async (path) => files.get(path) ?? null,
+    writeText: async (path, text) => {
+      files.set(path, text);
+    },
+    rename: async (from, to) => {
+      files.set(to, files.get(from)!);
+      files.delete(from);
+    },
+    unlink: async (path) => {
+      files.delete(path);
+    },
+    httpGet: async () => {
+      throw new Error('unexpected quota GET');
+    },
     mkdirp: async () => {},
     chmod: async () => {},
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg' },
@@ -119,6 +132,174 @@ function stopAnswer(wire: JevWire, waitingFor = 'recoverable_api_error', risk = 
   });
 }
 
+test('quota refresh parses only config, json and help options', () => {
+  assert.deepEqual(parseArgs(['quota', 'refresh']), { kind: 'quota-refresh', json: false });
+  assert.deepEqual(parseArgs(['quota', 'refresh', '--json']), { kind: 'quota-refresh', json: true });
+  for (const args of [
+    ['--config', 'custom.json', 'quota', 'refresh', '--json'],
+    ['quota', 'refresh', '--json', '--config', 'custom.json'],
+  ])
+    assert.deepEqual(parseArgs(args), { kind: 'quota-refresh', config: 'custom.json', json: true });
+  assert.deepEqual(parseArgs(['quota', 'refresh', '--help']), { kind: 'help' });
+  for (const tail of [
+    ['--json', '--json'],
+    ['--dry-run'],
+    ['task'],
+    ['--'],
+    ['--', 'task'],
+    ['--unknown'],
+    ['--unknown', '--help'],
+  ]) {
+    assert.throws(() => parseArgs(['quota', 'refresh', ...tail]), { code: 'invalid_input' });
+  }
+});
+
+test('quota refresh JSON writes secret-free snapshots without Jev, launch, stdin or history', async () => {
+  const token = `eyJhbGciOiJub25lIn0.${Buffer.from(
+    JSON.stringify({
+      exp: NOW.getTime() / 1000 + 3600,
+      'https://api.openai.com/auth': { chatgpt_account_id: 'private-account' },
+    }),
+  ).toString('base64url')}.signature`;
+  const cfg = routeConfig(
+    [
+      candidate(),
+      candidate({ id: 'same-bucket' }),
+      candidate({
+        id: 'agy',
+        tool: 'agy',
+        provider: 'google',
+        quota_bucket: 'antigravity',
+      }),
+      candidate({ id: 'disabled', tool: 'pi', quota_bucket: 'pi_xai' }),
+    ],
+    ['codex', 'agy'],
+  );
+  const gets: string[] = [];
+  let posts = 0,
+    stdin = 0;
+  const { io, files, out, err, reads, launches } = runtime({
+    terminal: { stdin: false, stdout: false },
+    env: { HOME: '/isolated/home', CODEX_HOME: '/isolated/codex' },
+    readText: async (path) => {
+      reads.push(path);
+      if (path === '/isolated/work/custom.json') return JSON.stringify(cfg);
+      if (path === '/isolated/codex/auth.json')
+        return JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: token } });
+      throw new Error('unexpected read');
+    },
+    readStdin: async () => {
+      stdin++;
+      throw new Error('must not read stdin');
+    },
+    post: async () => {
+      posts++;
+      throw new Error('must not evaluate');
+    },
+    httpGet: async (url, headers) => {
+      gets.push(url);
+      assert.equal(headers.Authorization, `Bearer ${token}`);
+      return {
+        status: 200,
+        body: JSON.stringify({
+          email: 'private@example.com',
+          rate_limit: {
+            primary_window: { used_percent: 25, limit_window_seconds: 604800, reset_at: '2026-09-29T10:30:00Z' },
+          },
+        }),
+      };
+    },
+  });
+  assert.equal(await run(['--config', 'custom.json', 'quota', 'refresh', '--json'], io), 0);
+  assert.deepEqual(result(out), {
+    schema_version: 1,
+    request_id: 'generated-1',
+    decision: 'quota_refresh',
+    buckets: [
+      { bucket: 'codex', status: 'written' },
+      { bucket: 'antigravity', status: 'unsupported' },
+    ],
+  });
+  assert.equal(out.length, 1);
+  assert.ok(out[0]!.endsWith('\n'));
+  assert.deepEqual(err, ['agent-steward: quota_unsupported\n']);
+  assert.deepEqual(gets, ['https://chatgpt.com/backend-api/wham/usage']);
+  assert.deepEqual(reads, ['/isolated/work/custom.json', '/isolated/codex/auth.json']);
+  assert.deepEqual([...files.keys()], [SNAPSHOT_PATH]);
+  assert.equal(JSON.parse(files.get(SNAPSHOT_PATH)!).windows[0].remaining_percent, 75);
+  assert.doesNotMatch(
+    out.join('') + err.join('') + [...files.values()].join(''),
+    /private-account|private@example.com|eyJhbGci/,
+  );
+  assert.deepEqual(launches, []);
+  assert.equal(posts, 0);
+  assert.equal(stdin, 0);
+});
+
+test('quota refresh reports fixed failure diagnostics and exits one only for collectable failures', async () => {
+  const token = `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ sub: 'private-user' })).toString('base64url')}.signature`;
+  for (const status of ['auth', 'fetch', 'malformed', 'written', 'unsupported', 'empty']) {
+    const cfg = routeConfig(
+      status === 'empty'
+        ? []
+        : [
+            status === 'unsupported'
+              ? candidate({ tool: 'agy', quota_bucket: 'antigravity' })
+              : candidate({ tool: 'pi', quota_bucket: 'pi_xai' }),
+          ],
+    );
+    const { io, out, err, files } = runtime({
+      env: { HOME: '/isolated/home', PI_CODING_AGENT_DIR: '/isolated/pi' },
+      readText: async (path) => {
+        if (path.endsWith('/config.json')) return JSON.stringify(cfg);
+        if (path === '/isolated/pi/auth.json' && status !== 'auth')
+          return JSON.stringify({ xai: { type: 'oauth', access: token, expires: NOW.getTime() + 3600_000 } });
+        throw new Error('private auth path');
+      },
+      httpGet: async () => {
+        if (status === 'fetch') throw new Error('private upstream body');
+        return {
+          status: 200,
+          body:
+            status === 'malformed'
+              ? '{'
+              : JSON.stringify({ config: { creditUsagePercent: 40, billingPeriodEnd: '2026-09-29T10:30:00Z' } }),
+        };
+      },
+    });
+    assert.equal(
+      await run(['quota', 'refresh'], io),
+      ['written', 'unsupported', 'empty'].includes(status) ? 0 : 1,
+      status,
+    );
+    assert.equal(
+      out.join(''),
+      status === 'empty' ? '' : `${status === 'unsupported' ? 'antigravity' : 'pi_xai'}: ${status}\n`,
+    );
+    assert.deepEqual(err, ['written', 'empty'].includes(status) ? [] : [`agent-steward: quota_${status}\n`]);
+    assert.ok([...files.keys()].every((path) => path.endsWith('/quota/pi_xai.json')));
+  }
+});
+
+test('quota refresh validates IDs and errors without leaking credentials or writing history', async () => {
+  for (const mode of ['id', 'config', 'env']) {
+    const key = 'SyntheticKey-Not-Pattern-4f91';
+    const { io, out, err, files } = runtime({
+      env: { HOME: '/isolated/home', TYPESAFE_API_KEY: key, CODEX_HOME: 'relative' },
+      newRequestId: () => (mode === 'id' ? `prefix-${key}` : 'safe-id'),
+      readText: async () => (mode === 'config' ? '{' : JSON.stringify(routeConfig())),
+    });
+    assert.equal(await run(['quota', 'refresh', '--json'], io), 1);
+    assert.equal(
+      result(out).reason_code,
+      mode === 'id' ? 'credential_detected' : mode === 'config' ? 'invalid_config' : 'invalid_input',
+    );
+    assert.equal(result(out).request_id, mode === 'id' ? null : 'safe-id');
+    assert.equal((out.join('') + err.join('')).includes(key), false);
+    assert.equal(files.size, 0);
+  }
+});
+
 test('router list and show parse local-only options', () => {
   assert.deepEqual(parseArgs(['router', 'list']), { kind: 'list', limit: 20, json: false });
   assert.deepEqual(parseArgs(['router', 'list', '--limit', '3', '--json']), { kind: 'list', limit: 3, json: true });
@@ -171,6 +352,8 @@ test('route history records dry-run, native exit, launch failure and evaluation 
     if (mode === 'live') assert.equal(events[1].exit_code, 7);
     if (mode === 'dry-run') {
       assert.equal(events[0].selected.model, 'gpt-astra-example');
+      assert.equal(events[0].selected.quota_bucket, 'codex');
+      assert.equal(Object.hasOwn(events[0].selected, 'account_id'), false);
       assert.ok(events[0].usage);
     }
   }
@@ -526,6 +709,10 @@ test('JSON route returns one complete schema-v1 result with a generated request 
   assert.equal(parsed.decision, 'selected');
   assert.equal(parsed.request_id, 'generated-1');
   assert.equal(parsed.selected.tool, 'codex');
+  assert.equal(parsed.selected.quota_bucket, 'codex');
+  assert.equal(parsed.quota.quota_bucket, 'codex');
+  assert.equal(Object.hasOwn(parsed.selected, 'account_id'), false);
+  assert.equal(Object.hasOwn(parsed.quota, 'account_id'), false);
   assert.equal(parsed.planned_command.runtime_selection, 'unverified');
   assert.equal(parsed.evaluations.effort.kind, 'fixed');
   assert.equal(out.length, 1);

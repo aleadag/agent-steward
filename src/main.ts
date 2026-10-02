@@ -1,12 +1,67 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
 import process from 'node:process';
-import { appendFile, readFile, mkdir, chmod } from 'node:fs/promises';
+import { appendFile, readFile, writeFile, mkdir, chmod, rename, unlink } from 'node:fs/promises';
+import https from 'node:https';
+import type { ClientRequest, IncomingMessage } from 'node:http';
+import type { QuotaHttpGet } from './quota-refresh.ts';
 import { postHttps } from './jev.ts';
 import { readBoundedUtf8, readFileText } from './io.ts';
 import { run } from './cli.ts';
 import { launchForeground } from './process.ts';
 import type { NativeLaunch } from './launch.ts';
+
+export const httpGet: QuotaHttpGet = async (url, headers) => {
+  const original = new URL(url);
+  const signal = AbortSignal.timeout(15_000);
+  let target = original;
+  for (let redirects = 0; ; redirects++) {
+    if (target.protocol !== 'https:' || target.host !== original.host || target.username || target.password)
+      throw new Error('quota_fetch');
+    const response = await new Promise<{ status: number; body: string; location?: string }>((resolve, reject) => {
+      let request: ClientRequest | undefined;
+      let stream: IncomingMessage | undefined;
+      let settled = false;
+      const finish = (value?: { status: number; body: string; location?: string }): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', fail);
+        if (value === undefined) {
+          stream?.destroy();
+          request?.destroy();
+          reject(new Error('quota_fetch'));
+        } else resolve(value);
+      };
+      const fail = (): void => finish();
+      if (signal.aborted) {
+        fail();
+        return;
+      }
+      try {
+        request = https.request(target, { method: 'GET', headers, signal }, (incoming) => {
+          stream = incoming;
+          const status = incoming.statusCode ?? 0;
+          if (status !== 200) {
+            incoming.destroy();
+            const location = incoming.headers.location;
+            finish({ status, body: '', ...(location === undefined ? {} : { location }) });
+            return;
+          }
+          readBoundedUtf8(incoming).then((body) => finish({ status, body }), fail);
+        });
+        request.once('error', fail);
+        signal.addEventListener('abort', fail, { once: true });
+        if (signal.aborted) fail();
+        else request.end();
+      } catch {
+        fail();
+      }
+    });
+    if (![301, 302, 303, 307, 308].includes(response.status)) return { status: response.status, body: response.body };
+    if (redirects !== 0 || !response.location) throw new Error('quota_fetch');
+    target = new URL(response.location, target);
+  }
+};
 
 const runtime = {
   env: {
@@ -22,9 +77,20 @@ const runtime = {
     get TYPESAFE_API_KEY() {
       return process.env.TYPESAFE_API_KEY;
     },
+    get CODEX_HOME() {
+      return process.env.CODEX_HOME;
+    },
+    get PI_CODING_AGENT_DIR() {
+      return process.env.PI_CODING_AGENT_DIR;
+    },
   },
   cwd: process.cwd(),
   readText: readFileText,
+  writeText: (path: string, text: string, mode: number) =>
+    writeFile(path, text, { encoding: 'utf8', mode, flag: 'wx' }),
+  rename,
+  unlink,
+  httpGet,
   appendText: async (path: string, text: string) => {
     try {
       await chmod(path, 0o600);
@@ -59,4 +125,4 @@ const runtime = {
   launch: (command: NativeLaunch) => launchForeground(command, { cwd: process.cwd(), env: process.env }),
 };
 
-process.exitCode = await run(process.argv.slice(2), runtime);
+if (import.meta.main) process.exitCode = await run(process.argv.slice(2), runtime);

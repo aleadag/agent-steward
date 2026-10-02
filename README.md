@@ -1,6 +1,6 @@
 # Agent-steward
 
-Agent-steward's standalone CLI routes tasks to a native Codex, Pi, or agy executable. `router start --dry-run` produces a route preview; a live `router start <task>` launches the selected native process in the foreground. `stop check` assesses a user-prepared stopped-agent observation but does not send input. The CLI does not create steward-managed sessions, inspect existing sessions, adjust effort, collect live quota, or use Herdr to launch agents. Configuration describes a local inventory only. The separate bundled Herdr adapter is opt-in; building this package does not install or activate it.
+Agent-steward's standalone CLI routes tasks to a native Codex, Pi, or agy executable. `router start --dry-run` produces a route preview; a live `router start <task>` launches the selected native process in the foreground. `stop check` assesses a user-prepared stopped-agent observation but does not send input. `quota refresh` collects measured limits from existing Codex and Pi logins into local snapshots; routing never fetches quota. The CLI does not create steward-managed sessions, inspect existing sessions, adjust effort, or use Herdr to launch agents. Configuration describes a local inventory only. The separate bundled Herdr adapter is opt-in; building this package does not install or activate it.
 
 ## Install and run
 
@@ -58,16 +58,17 @@ agent-steward --config ./config.json router start --dry-run -- "--help"
 agent-steward router list
 agent-steward router list --json
 agent-steward router show "generated-id" --json
+agent-steward --config ./config.json quota refresh --json
 agent-steward --config ./config.json stop check < stopped-state.json
 ```
 
-The first `router start` command launches the selected native agent in the foreground; the next returns a JSON route preview without launching. The `--` separator ends option parsing. The fourth command previews the literal task `--help`; text after the separator is never treated as a CLI option. For start and stop, `--config <path>` can appear before or after command tokens, before the separator. List and show reject `--config`. Each route task is exactly one argument; quote multiword tasks. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
+The first `router start` command launches the selected native agent in the foreground; the next returns a JSON route preview without launching. The `--` separator ends option parsing. The fourth command previews the literal task `--help`; text after the separator is never treated as a CLI option. For start, stop, and quota refresh, `--config <path>` can appear before or after command tokens, before the separator. List and show reject `--config`. Each route task is exactly one argument; quote multiword tasks. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
 
 ### Local route history
 
 `router list` shows the latest 20 recorded requests; `--limit <n>` changes the display without pruning history. `router show <request-id>` shows the folded decision fields, latest event, and exit code when recorded. Both commands support `--json` and read local history without loading config, requiring credentials, or calling Jev. A missing ledger gives an empty list; an unknown request ID exits 2 with `agent-steward: not_found` on stderr.
 
-The append-only ledger is `$XDG_STATE_HOME/agent-steward/router.jsonl`, or `$HOME/.local/state/agent-steward/router.jsonl` when XDG state is unset. Its directory is `0700` and file is `0600`. Events record selected tool/provider/model/thinking/account, evaluator usage, and native exit code when known. They never store task/prompt text, keys, pane IDs, PIDs, or planned-command displays. Credential detection blocks writes.
+The append-only ledger is `$XDG_STATE_HOME/agent-steward/router.jsonl`, or `$HOME/.local/state/agent-steward/router.jsonl` when XDG state is unset. Its directory is `0700` and file is `0600`. Events record selected tool/provider/model/thinking/`quota_bucket`, evaluator usage, and native exit code when known. They never store task/prompt text, keys, pane IDs, PIDs, or planned-command displays. Credential detection blocks writes.
 
 Records fold by Jev's `request_id`, not a workflow or native session ID. Events are `dry-run`, `launched`, `launch-failed`, `evaluation_failed`, and `exited`. `exited` means the foreground native process returned, not that its assigned job succeeded.
 
@@ -93,29 +94,52 @@ Routing first selects a tool/model pair, then selects one of that pair's configu
 
 ## Configuration
 
-The default file is `$XDG_CONFIG_HOME/agent-steward/config.json`. If `XDG_CONFIG_HOME` is unset or empty, the CLI uses `~/.config/agent-steward/config.json`; a nonempty relative XDG path is invalid. `--config <path>` selects another file. Relative overrides resolve from the current directory, while relative account snapshot paths resolve from the selected config file's directory.
+The default file is `$XDG_CONFIG_HOME/agent-steward/config.json`. If `XDG_CONFIG_HOME` is unset or empty, the CLI uses `~/.config/agent-steward/config.json`; a nonempty relative XDG path is invalid. `--config <path>` selects another file. Relative overrides resolve from the current directory. Snapshot paths are generated state, not configurable paths.
 
-Start from [`examples/config.json`](examples/config.json). It shows GPT Astra through Codex (`openai`) and Pi (`openai-codex`) using an illustrative Codex account and pool, plus a Gemini-through-`agy` candidate with a separate Antigravity account. IDs ending in `-example` are placeholders, not claims about live availability. `default` as a thinking-level ID means omit the effort override; configure it only when omission is valid for that exact model selector. Credentials do not belong in this file. When an evaluation is needed, provide the TypeSafe key separately through `TYPESAFE_API_KEY`.
+Start from [`examples/config.json`](examples/config.json). It shows GPT Astra through Codex (`openai`) and Pi (`openai-codex`) using separate `codex` and `pi_codex` credential buckets, plus a Gemini-through-`agy` candidate using `antigravity`. IDs ending in `-example` are placeholders, not claims about live availability. `default` as a thinking-level ID means omit the effort override; configure it only when omission is valid for that exact model selector. Credentials do not belong in this file. When an evaluation is needed, provide the TypeSafe key separately through `TYPESAFE_API_KEY`.
 
-`tools` lists enabled tool IDs. Candidates using a known but disabled tool remain configured and are not considered. Account/candidate IDs must be unique, references must resolve, and unknown fields are rejected. The default evaluator model is `jev-1.13.0`; missing `thresholds.risky` and `thresholds.choiceConfidence` default to `0.60` and `0.45` respectively. Both are finite probabilities in `[0,1]`.
+`tools` lists enabled tool IDs. Candidates using a known but disabled tool remain configured and are not considered. Candidate IDs must be unique and unknown fields are rejected. Each candidate names a `quota_bucket`: `codex` allows only `codex`, `pi` allows `pi_codex` or `pi_xai`, and `agy` allows only `antigravity`. Native Codex and Pi Codex snapshots stay separate even when the logins match. `quota_pool` remains a candidate field; provider account IDs, `accounts`, `account_id`, and snapshot paths are not accepted in config. The default evaluator model is `jev-1.13.0`; missing `thresholds.risky` and `thresholds.choiceConfidence` default to `0.60` and `0.45` respectively. Both are finite probabilities in `[0,1]`.
 
-## Quota snapshot contract
+## Refresh quota snapshots
 
-[`examples/quota.json`](examples/quota.json) is an illustrative hand-authored input, not output from a collector. A snapshot has `schema_version: 1`, a `source` (`codex` or `antigravity`), an `account_id`, and `windows`. Each window has a scope (`{"type":"account"}` or `{"type":"pool","pool_id":"primary"}`), `remaining_percent`, `observed_at`, `reset_at`, and `valid_until` timestamps. Times must be RFC 3339 with an offset; observation must precede reset and validity. Configured snapshots are read-only and loaded once per account per route invocation.
+Run `agent-steward quota refresh` before routing when you want fresh measured limits. It refreshes each enabled, referenced credential bucket once, without a TTY, Jev, or a TypeSafe key. Human output is one line per bucket, such as `codex: written`. `--json` returns one object and a newline:
 
-Account-wide windows apply to every candidate on that account; a pool window applies only to candidates using that exact configured pool. All applicable facts are retained. A missing or unmatched pool window, malformed/unreadable snapshot, expired validity time, passed reset, or future observation makes the affected quota unknown, never full. If any applicable window is stale, the summary is unknown and the stale remaining percentage is withheld. The CLI does not fetch or refresh live quota.
+```json
+{"schema_version":1,"request_id":"generated-id","decision":"quota_refresh","buckets":[{"bucket":"codex","status":"written"},{"bucket":"antigravity","status":"unsupported"}]}
+```
 
-Config files, snapshots, stop stdin, and Jev request/response bodies are each limited to 1,048,576 UTF-8 bytes and 64 nested object/array levels. Inputs over a limit are rejected rather than truncated.
+Statuses are `written`, `unsupported`, `auth`, `fetch`, and `malformed`. Exit 0 means every referenced collectable bucket was written; unsupported Antigravity and an empty inventory do not fail refresh. Other failures exit 1. Fixed stderr diagnostics are `quota_unsupported`, `quota_auth`, `quota_fetch`, and `quota_malformed`; output never includes upstream bodies or auth paths.
+
+Collectors read existing logins only:
+
+| Bucket | Auth store | Measured endpoint |
+| --- | --- | --- |
+| `codex` | `$CODEX_HOME/auth.json`, default `~/.codex/auth.json`; ChatGPT login | ChatGPT WHAM usage |
+| `pi_codex` | `$PI_CODING_AGENT_DIR/auth.json`, default `~/.pi/agent/auth.json`; `openai-codex` OAuth | ChatGPT WHAM usage |
+| `pi_xai` | The same Pi file; `xai` OAuth (SuperGrok) | Grok CLI-proxy billing credits |
+| `antigravity` | None | Unsupported; quota stays unknown |
+
+Explicit `CODEX_HOME` and `PI_CODING_AGENT_DIR` values must be absolute and nonempty. Collectors do not log in, refresh tokens, write auth stores, scan browsers/keyrings, scrape CSRF tokens, or send model prompts. Missing, expired, or unusable credentials report `quota_auth`. Each request uses pinned HTTPS endpoints, a 15-second deadline, no retries, and at most one same-host HTTPS redirect.
+
+Snapshots live at `$XDG_STATE_HOME/agent-steward/quota/<bucket>.json`, falling back to `~/.local/state/agent-steward/quota/<bucket>.json` when XDG state is unset or empty. The directory is `0700`; files are atomically replaced with mode `0600`. No Antigravity snapshot is written. A failed collection preserves a same-identity snapshot. If the current credential reveals a different identity and collection fails, the previous snapshot is removed so routing cannot reuse the old login's percentages.
+
+### Snapshot contract
+
+[`examples/quota.json`](examples/quota.json) illustrates collector-shaped data, not live measurements. A snapshot has `schema_version: 1`, a `source` (`codex`, `pi_codex`, or `pi_xai`), a 64-character lowercase SHA-256 `identity_fingerprint`, and `windows`. The fingerprint hashes the bucket prefix and provider identity; raw account IDs, emails, and tokens are never stored. Each window has a scope (`{"type":"account"}` or `{"type":"pool","pool_id":"primary"}`), `remaining_percent`, `observed_at`, `reset_at`, and `valid_until`. Optional `id` and `cadence` (`weekly` or `other`) preserve measured window labels. Times must be RFC 3339 with an offset; observation must precede reset and validity. Collectors cap validity at the earlier of reset and one hour after observation.
+
+Routing reads snapshots once per enabled bucket and never reads auth stores. Route JSON and ledger selections use `selected.quota_bucket`; route quota facts use `quota.quota_bucket`. Account-scoped windows apply to every candidate on the bucket; a pool window applies only to the exact configured pool. Extra measured provider limits stay account-scoped; collectors do not invent pool IDs from limit names. All applicable facts are retained. Missing fingerprints, missing or unmatched pool windows, malformed/unreadable snapshots, expired validity, passed resets, and future observations make affected quota unknown, never full. Stale remaining percentages are withheld. A snapshot does not bind a launched agent to that login.
+
+Config files, snapshots, stop stdin, quota responses, and Jev request/response bodies are each limited to 1,048,576 UTF-8 bytes and 64 nested object/array levels. Inputs over a limit are rejected rather than truncated.
 
 ## Decision and privacy boundaries
 
-Both dry-run previews and live starts send the supplied task, configured candidate facts, applicable snapshot facts, and fixed evaluator questions to `https://api.typesafe.ai/v1/systemone`. `stop check` sends the supplied version-2 observation, including context and any structured action hints, with fixed classification questions when evaluation is needed. Send only the excerpt around the current stop. Agent-steward does not inspect terminal history, repository files, provider credentials, live account state, or Herdr, and it does not persist request/response bodies. If context is absent, blank, null, or empty, even action hints produce local manual review without a Jev call or API-key requirement. A meaningful context is required before Jev evaluation.
+Both dry-run previews and live starts send the supplied task, configured candidate facts, applicable snapshot facts, and fixed evaluator questions to `https://api.typesafe.ai/v1/systemone`. `stop check` sends the supplied version-2 observation, including context and any structured action hints, with fixed classification questions when evaluation is needed. Send only the excerpt around the current stop. Routing and stop checks do not inspect terminal history, repository files, provider credentials, live account state, or Herdr, and do not persist request/response bodies. Only explicit `quota refresh` reads the documented auth stores and contacts quota endpoints; credentials never enter Jev state. If context is absent, blank, null, or empty, even action hints produce local manual review without a Jev call or API-key requirement. A meaningful context is required before Jev evaluation.
 
 Before sending, the CLI rejects the configured TypeSafe key if it appears in outbound data and checks a limited set of recognizable credential patterns: private-key headers, common `sk-`/GitHub token prefixes, AWS `AKIA` keys, Bearer tokens, and values under credential-named fields. It also checks caller IDs and output for the configured key. Detection is incomplete and may miss unfamiliar or encoded secrets, while rejecting token-like ordinary text. Do not rely on it to make sensitive input safe. The opt-in evaluation sends the supplied context to TypeSafe.
 
 A stop observation identifies the agent and pane, current status and episode, and retry history. Those adapter-supplied fields are separate from untrusted context and action text. Approval proposals require a blocked agent, meaningful context, and a nonblank `pending_action.action`; they do not approve or execute anything. The assessment preserves the existing restriction and risk cutoff: ties, low confidence, unclear state, explicit caller restrictions, or risk at/above the threshold require `manual_review`. Jev's Noul value is not a calibrated probability of harm. `automatic_approval_forbidden: true` records a known restriction; `false` never grants permission.
 
-Other stop proposals are a fixed recovery instruction for a classified recoverable API error, a wait deadline for a classified quota limit, `manual_review` for uncertain or non-actionable cases, and `no_action` only for a settled `done` state. The CLI neither waits nor sends the instruction. A caller must re-read the agent before recovery delivery; approval additionally requires proof of the exact current permission request and accepting control. It must preserve the tool's existing permission controls, never guess a UI key, and never treat a proposal as a capability. Asserted reset data does not establish a live account or quota binding, and this CLI does not collect live quota. Stop assessments do not launch, restart, or change another session.
+Other stop proposals are a fixed recovery instruction for a classified recoverable API error, a wait deadline for a classified quota limit, `manual_review` for uncertain or non-actionable cases, and `no_action` only for a settled `done` state. The CLI neither waits nor sends the instruction. A caller must re-read the agent before recovery delivery; approval additionally requires proof of the exact current permission request and accepting control. It must preserve the tool's existing permission controls, never guess a UI key, and never treat a proposal as a capability. Asserted reset data and refreshed snapshots do not establish a live account or quota binding. Stop assessments do not launch, restart, or change another session.
 
 ### Optional Herdr adapter (not activated)
 

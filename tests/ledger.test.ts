@@ -11,6 +11,18 @@ function memoryRuntime(files: Map<string, string>, env: Runtime['env']) {
   const rt: Runtime = {
     env,
     cwd: '/isolated',
+    writeText: async () => {
+      throw new Error('must not write snapshots');
+    },
+    rename: async () => {
+      throw new Error('must not rename files');
+    },
+    unlink: async () => {
+      throw new Error('must not unlink files');
+    },
+    httpGet: async () => {
+      throw new Error('must not fetch quota');
+    },
     appendText: async (path, text) => {
       files.set(path, (files.get(path) ?? '') + text);
     },
@@ -54,7 +66,7 @@ test('append then list folds by request_id without task text', async () => {
     request_id: 'req-1',
     recorded_at: '2026-10-02T00:00:00.000Z',
     event: 'launched',
-    selected: { tool: 'agy', provider: 'google', model: 'g1', thinking_level: 'low', account_id: 'a' },
+    selected: { tool: 'agy', provider: 'google', model: 'g1', thinking_level: 'low', quota_bucket: 'antigravity' },
   });
   await appendEvent(rt, {
     schema_version: 1,
@@ -75,6 +87,8 @@ test('append then list folds by request_id without task text', async () => {
   assert.equal(await run(['router', 'show', 'req-1', '--json'], rt), 0);
   const shown = JSON.parse(out.join(''));
   assert.equal(shown.selected.provider, 'google');
+  assert.equal(shown.selected.quota_bucket, 'antigravity');
+  assert.equal(Object.hasOwn(shown.selected, 'account_id'), false);
   assert.equal(shown.exit_code, 0);
   assert.equal(shown.event, 'exited');
 });
@@ -116,7 +130,7 @@ test('human list escapes control characters in decision metadata', async () => {
       provider: 'google',
       model: 'model\u001b[31m\nspoof',
       thinking_level: 'low',
-      account_id: 'a',
+      quota_bucket: 'antigravity',
     },
   });
   assert.equal(await run(['router', 'list'], rt), 0);

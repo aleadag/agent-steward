@@ -22,6 +22,7 @@ function shellWords(command: string): string[] {
 function invocationForm(invocation: Invocation): string {
   if (invocation.kind === 'help') return 'help';
   if (invocation.kind === 'stop') return 'stop-stdin';
+  if (invocation.kind === 'quota-refresh') return 'quota-refresh';
   if (invocation.kind === 'list') return invocation.json ? 'list-json' : 'list';
   if (invocation.kind === 'show') return 'show';
   return invocation.task.startsWith('-') ? 'route-literal-task' : 'route-task';
@@ -36,6 +37,7 @@ function parseUsageForm(line: string): Invocation {
   form = form.replace('router list [--limit <n>]', 'router list');
   form = form.replace('router show <request-id> [--json]', 'router show "generated-id" --json');
   form = form.replace('stop check < stopped-state.json', 'stop check');
+  form = form.replace('quota refresh [--json]', 'quota refresh --json');
   return parseArgs(shellWords(form));
 }
 
@@ -54,6 +56,18 @@ async function emittedHelp(): Promise<string> {
     },
     chmod: async () => {
       throw new Error('help must not change modes');
+    },
+    writeText: async () => {
+      throw new Error('help must not write snapshots');
+    },
+    rename: async () => {
+      throw new Error('help must not rename files');
+    },
+    unlink: async () => {
+      throw new Error('help must not unlink files');
+    },
+    httpGet: async () => {
+      throw new Error('help must not fetch quota');
     },
     cwd: '/isolated/work',
     readText: async () => {
@@ -93,7 +107,7 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
   });
   assert.deepEqual(
     invocations.map((item) => item.kind),
-    ['help', 'route', 'route', 'route', 'list', 'list', 'show', 'stop'],
+    ['help', 'route', 'route', 'route', 'list', 'list', 'show', 'quota-refresh', 'stop'],
   );
   const routes = invocations.filter((item) => item.kind === 'route');
   assert.equal(routes.length, 3);
@@ -108,6 +122,17 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
   assert.equal(thirdRoute.task, '--help');
   assert.equal(thirdRoute.dryRun, true);
   assert.equal(thirdRoute.json, false);
+});
+
+test('quota refresh usage parses and README describes generated state', () => {
+  assert.deepEqual(parseUsageForm('agent-steward [--config <path>] quota refresh [--json]'), {
+    kind: 'quota-refresh',
+    config: 'config.json',
+    json: true,
+  });
+  assert.ok(readme.includes('quota refresh'));
+  assert.ok(readme.includes('$XDG_STATE_HOME/agent-steward/quota/'));
+  assert.doesNotMatch(readme + skill, /does not (?:fetch or refresh|collect) live quota/);
 });
 
 test('skill stop JSON example parses with the real strict schema', () => {

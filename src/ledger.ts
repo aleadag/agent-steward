@@ -15,7 +15,7 @@ const EventSchema = z
         provider: z.string(),
         model: z.string(),
         thinking_level: z.string(),
-        account_id: z.string(),
+        quota_bucket: z.string(),
       })
       .strict()
       .optional(),
@@ -73,7 +73,7 @@ export async function readLedger(runtime: LedgerRuntime): Promise<LedgerEvent[]>
 export function formatLedgerRecord(record: LedgerEvent): string {
   const selected = record.selected;
   const route = selected ? `${selected.tool}/${selected.model}/${selected.thinking_level}` : '-';
-  const fields = [record.request_id, record.recorded_at, route, selected?.account_id ?? '-', record.event];
+  const fields = [record.request_id, record.recorded_at, route, selected?.quota_bucket ?? '-', record.event];
   const line = fields.map((field) => JSON.stringify(field).slice(1, -1)).join('  ');
   return `${line}${record.exit_code === undefined ? '' : `  exit_code=${record.exit_code}`}\n`;
 }

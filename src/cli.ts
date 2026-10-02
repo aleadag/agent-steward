@@ -4,6 +4,8 @@ import { loadConfig } from './config.ts';
 import { validateCandidateSyntax } from './commands.ts';
 import { assertByteLength, assertJsonDepth } from './limits.ts';
 import { loadQuota } from './quota.ts';
+import { refreshQuota } from './quota-refresh.ts';
+import type { QuotaRefreshIO } from './quota-refresh.ts';
 import { assertNoCredentials } from './privacy.ts';
 import { makeEvaluator } from './jev.ts';
 import type { Evaluate, HttpPost, Questions } from './jev.ts';
@@ -19,10 +21,11 @@ export type Invocation =
   | { kind: 'route'; config?: string; task: string; dryRun: boolean; json: boolean }
   | { kind: 'list'; limit: number; json: boolean }
   | { kind: 'show'; requestId: string; json: boolean }
-  | { kind: 'stop'; config?: string };
+  | { kind: 'stop'; config?: string }
+  | { kind: 'quota-refresh'; config?: string; json: boolean };
 
-export type Runtime = {
-  env: { HOME?: string; XDG_CONFIG_HOME?: string; XDG_STATE_HOME?: string; TYPESAFE_API_KEY?: string };
+export type Runtime = QuotaRefreshIO & {
+  env: QuotaRefreshIO['env'] & { XDG_CONFIG_HOME?: string; TYPESAFE_API_KEY?: string };
   appendText: (path: string, text: string) => Promise<void>;
   readTextIfPresent: (path: string) => Promise<string | null>;
   mkdirp: (path: string, mode: number) => Promise<void>;
@@ -49,6 +52,7 @@ Usage:
   agent-steward router list [--limit <n>]
   agent-steward router list --json
   agent-steward router show <request-id> [--json]
+  agent-steward [--config <path>] quota refresh [--json]
   agent-steward [--config <path>] stop check < stopped-state.json
 
 Live router start requires terminal input and output and launches the selected native agent in the foreground.
@@ -58,6 +62,8 @@ Provider, model, thinking level and account are requested, not verified; the CLI
 Native permission controls remain with the selected tool. The CLI does not invoke the optional Herdr wrapper.
 Router list/show read local request history only, without config or Jev. List defaults to 20 records.
 History never stores task text; exited means native-process return, not job success.
+Quota refresh collects Codex/Pi quota into $XDG_STATE_HOME/agent-steward/quota/ (default ~/.local/state/agent-steward/quota/).
+Routing reads snapshots only; Antigravity quota remains unknown. Refresh needs no Jev key or terminal.
 Stop check reads JSON from stdin and writes a version-2 JSON result.
 `;
 
@@ -67,6 +73,9 @@ const DIAGNOSTICS: Record<string, string> = {
   quota_malformed: 'agent-steward: quota_malformed',
   quota_identity_mismatch: 'agent-steward: quota_identity_mismatch',
   quota_stale: 'agent-steward: quota_stale',
+  quota_unsupported: 'agent-steward: quota_unsupported',
+  quota_auth: 'agent-steward: quota_auth',
+  quota_fetch: 'agent-steward: quota_fetch',
 };
 
 function invalidInput(): never {
@@ -125,6 +134,15 @@ export function parseArgs(argv: readonly string[]): Invocation {
     if (kind === 'list') return { kind, limit, json };
     if (requestId === undefined) invalidInput();
     return { kind: 'show', requestId, json };
+  }
+
+  if (commandTokens[0] === 'quota' && commandTokens[1] === 'refresh') {
+    if (separator >= 0) invalidInput();
+    const flags = commandTokens.slice(2);
+    if (flags.length > 1 || flags.some((flag) => flag !== '--json')) invalidInput();
+    if (help) return { kind: 'help' };
+    const invocation: Invocation = { kind: 'quota-refresh', json: flags.length === 1 };
+    return config === undefined ? invocation : { ...invocation, config };
   }
 
   if (help) {
@@ -405,6 +423,24 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
 
   const apiKey = readOptionalApiKey(runtime);
   let requestId: string | null = null;
+  if (invocation.kind === 'quota-refresh') {
+    try {
+      requestId = safeRequestId(runtime.newRequestId(), apiKey);
+      if (requestId === null) throw new StewardError('credential_detected');
+      const config = await loadConfig(invocation.config, runtime);
+      const { buckets } = await refreshQuota(config, runtime);
+      const result = { schema_version: 1, request_id: requestId, decision: 'quota_refresh', buckets };
+      assertNoCredentials(result, apiKey);
+      for (const { status } of buckets) {
+        if (status !== 'written') runtime.stderr(`${DIAGNOSTICS[`quota_${status}`]}\n`);
+      }
+      if (invocation.json) runtime.stdout(`${JSON.stringify(result)}\n`);
+      else for (const { bucket, status } of buckets) runtime.stdout(`${bucket}: ${status}\n`);
+      return buckets.every(({ status }) => status === 'written' || status === 'unsupported') ? 0 : 1;
+    } catch (error) {
+      return emitError(runtime, error, requestId, apiKey, !invocation.json);
+    }
+  }
   if (invocation.kind === 'route') {
     try {
       const generated = runtime.newRequestId();
@@ -440,7 +476,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
               provider: selected.selected.provider,
               model: selected.selected.model,
               thinking_level: selected.selected.thinking_level,
-              account_id: selected.selected.quota_bucket,
+              quota_bucket: selected.selected.quota_bucket,
             },
             usage: selected.evaluations.pair.usage,
           }),
