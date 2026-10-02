@@ -29,9 +29,10 @@ The package installs `result/bin/agent-steward` and `result/bin/agent-steward-he
 
 This development flake exports packages, the default app, a development shell,
 and build/installed checks for `x86_64-linux`, `aarch64-linux`
-and `aarch64-darwin`. Published `v0.1.0-alpha.3` remains the Linux-only release;
-its tag is unchanged. Portable packaging is unreleased and is not a new claim
-about that published alpha.
+and `aarch64-darwin`. Release `v0.1.0-alpha.4` is validated for x86_64-linux only;
+aarch64-linux and Darwin native validation remain outstanding. The published
+`v0.1.0-alpha.3` tag is unchanged. Portable packaging is unreleased and is not a
+cross-platform runtime claim for either alpha.
 
 Export/evaluation is not native validation. The native CI matrix checks the
 runner architecture and runs the complete frozen Bun and Nix gates on each

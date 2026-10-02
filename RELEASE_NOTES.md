@@ -1,10 +1,18 @@
-# Unreleased — native AGY quota
+# v0.1.0-alpha.4 — native AGY quota and bounded route history
+
+Release notes for x86_64-linux dogfooding. Package and Nix metadata report `0.1.0-alpha.4`. Earlier alpha tags remain unchanged.
 
 - Run `quota setup agy`, then explicitly trust the dedicated native working directory as described in the [README](README.md#one-time-agy-setup-and-service-operation). Setup preserves the previous statusLine renderer and never grants trust or logs in.
-- `quota refresh [--json]` now collects Antigravity quota without a caller TTY or model turn. Native AGY may renew the existing consumer login; changed or unknown identity invalidates old quota. Routing remains offline.
+- `quota refresh [--json]` now collects Antigravity quota without a caller TTY or model turn. Native AGY may renew the existing consumer login; changed or unknown identity invalidates old quota. Routing remains offline. An enabled AGY bucket must refresh successfully for exit 0; it no longer succeeds as unsupported.
 - Change AGY candidates from `quota_pool: "primary"` to `"gemini"` or `"third_party"`; both native limits are required per measured pool. Incomplete pools remain unknown.
+- Configure AGY's native model and effort separately: `gemini-3.8-flash` with `medium` requests `--model=gemini-3.8-flash --effort=medium`, without suffix translation. Requested settings remain unverified.
+- `router list` now displays aligned columns. History rotates at 5 MiB and retains one backup; list/show read both files. Normal retained size is at most 10 MiB. Older discarded history is unavailable; an existing oversized file can temporarily exceed that bound.
 
-Linux source and installed checks pass. Darwin native validation remains outstanding. Package version and published alpha tags are unchanged; these changes are not a published release.
+## Validation and release boundaries
+
+The alpha.4 preparation passed 607 source tests (17 installed-only skips), 22 installed tests, build, typecheck, lint, format and x86_64-linux Nix build/help/flake gates. Installed regression tests use a fake native executable. A real installed AGY 1.2.12 refresh with closed stdin also passed, writing complete Gemini and third-party pools without a model turn. Setup accepts the existing empty renderer type and preserves its original shape and unrelated native settings.
+
+AGY 1.2.12 `/usage` backend-refresh behavior is the freshness assumption, not independently traced network proof. Review was author self-review, not independent review. aarch64-linux and Darwin native validation remain outstanding; this alpha makes no cross-platform runtime claim. The optional Herdr adapter remains disabled, and automatic trust/login/permission approval is not enabled.
 
 # v0.1.0-alpha.3 — quota refresh and relative cost
 
