@@ -1,39 +1,52 @@
-# v0.1.0-alpha.1 — supervised CLI dogfooding
+# v0.1.0-alpha.2 — quota refresh and relative cost
 
-Approved release notes for `v0.1.0-alpha.1`. Package metadata reports `0.1.0-alpha.1`; remote publication requires separate authorization.
+Approved release notes for `v0.1.0-alpha.2`. Package metadata reports `0.1.0-alpha.2`; remote publication requires separate authorization.
 
-Agent-steward routes a task through Jev to a configured native agent and launches it in the foreground. This first alpha is for supervised CLI use: keep native permission controls in place and leave the optional Herdr plugin disabled.
+This alpha adds explicit `quota refresh` and relative candidate `cost`. Routing still does not fetch quota. Config is breaking versus `v0.1.0-alpha.1`.
+
+## Breaking config
+
+- Remove `accounts` and `candidates[].account_id`.
+- Each candidate names `quota_bucket`: Codex tool → `codex`, Pi → `pi_codex` or `pi_xai`, agy → `antigravity`. Native Codex and Pi Codex stay separate.
+- Each candidate requires finite `cost` greater than zero (relative ranking hint, not a bill). Example: Luna `1`, Sol `2`.
+- Snapshots are generated at `$XDG_STATE_HOME/agent-steward/quota/<bucket>.json` (or `~/.local/state/agent-steward/quota/` when XDG state is unset). They are not config paths.
+
+Copy [examples/config.json](examples/config.json) and replace illustrative models, buckets, and costs with your inventory.
 
 ## Try it
-
-The Nix package currently targets `x86_64-linux` and bundles its Bun runtime. Install your chosen native tool separately and configure its authentication.
 
 ```sh
 nix build path:.#agent-steward --no-update-lock-file
 ./result/bin/agent-steward --help
-./result/bin/agent-steward --config ./config.json session start "Reply hello without using tools" --dry-run --json
-./result/bin/agent-steward --config ./config.json session start "Reply hello without using tools"
+./result/bin/agent-steward --config ./config.json quota refresh --json
+./result/bin/agent-steward --config ./config.json router start "Reply hello without using tools" --dry-run --json
+./result/bin/agent-steward --config ./config.json router start "Reply hello without using tools"
 ```
 
-Create `config.json` from [examples/config.json](examples/config.json), replacing illustrative models and accounts with your local inventory. Provide `TYPESAFE_API_KEY` through the environment before either routing command. The live command requires a terminal; the native tool must be available through absolute, nonempty `PATH` entries.
+Provide `TYPESAFE_API_KEY` before routing. Live start needs a terminal. Native tools must be on absolute, nonempty `PATH` entries.
 
 ## Available in this alpha
 
-- `session start --dry-run --json` previews the selected tool, model, thinking level, and literal launch arguments without starting an agent.
-- `session start` launches native Codex, Pi, or agy in the foreground. Settings and account binding are requested, not independently verified.
+- `quota refresh [--json]` reads existing Codex (`~/.codex/auth.json`) and Pi (`~/.pi/agent/auth.json`) logins, fetches measured limits from pinned HTTPS endpoints, and writes secret-free snapshots. Antigravity is `unsupported`. No login, token refresh, CSRF scraping, or Jev.
+- `router start --dry-run --json` previews the selected tool, model, thinking level, quota facts, relative cost in evaluation state, and literal launch arguments without starting an agent.
+- `router start` launches native Codex, Pi, or agy in the foreground. Settings and account binding are requested, not independently verified.
+- `router list` / `router show` read local request history. Legacy `account_id` rows keep tool/model/thinking; they do not invent a bucket.
 - `stop check` assesses a user-prepared stopped-agent observation and returns JSON. It does not send input or authorize execution.
-- Quota snapshots are local, read-only inputs. Missing or stale quota remains unknown; there is no live quota collector.
 
 ## Validation and limits
 
-Pre-release checks passed: 393 offline tests, with six installed-test skips covered by a separate packaged suite of 11 passing tests; build, typecheck, formatting, Nix build, and flake checks. Lint exited successfully with nine warnings.
+Offline `bun test` on this revision: 541 passed, 13 installed-only skips. Build and typecheck passed in development. Lint may still report pre-existing warnings.
 
-One authorized live smoke exercised actual Jev routing and a real Pi launch. The route requested `openai-codex/gpt-6-luna` with `low` thinking. Pi returned the exact requested acknowledgement, used no tools, left the disposable working directory unchanged, and exited zero after `/quit`. This verifies that one Pi route received and answered its task, not task completion generally or effective runtime settings. Codex and agy live launches remain untested.
+The development flake lists `x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`. This published tag remains the Linux-only release until three-platform native CI is established for the tagged revision.
 
-The bundled Herdr adapter is experimental and disabled. Genuine-error recovery, Codex handling, and human-visible notifications remain unproven. Automatic approval is not enabled; approval proposals require a human.
+The bundled Herdr adapter stays experimental and disabled. Automatic approval is not enabled.
 
 ## Privacy and feedback
 
-Routing sends task text and configured candidate/quota facts to TypeSafe; evaluated `stop check` requests send the supplied observation. Credential detection is incomplete. Submit only nonsensitive text, and never put secrets in a task: live task arguments can appear in local process listings. The launcher removes `TYPESAFE_API_KEY` from the native child environment, while other native credentials pass through.
+Only `quota refresh` reads documented auth stores and quota hosts. Credentials, emails, and account IDs must not appear in snapshots, stdout, or Jev state. Routing still sends task text and configured candidate/quota facts (including `cost`) to TypeSafe. Credential detection is incomplete. Do not put secrets in a task.
 
-For dogfooding feedback, record the command form, requested tool/model/thinking, exit status, and whether the agent received the task. Redact credentials and private task or stop context before sharing. See the [README](README.md) for configuration, result schemas, and safety boundaries.
+For dogfooding, record the command form, requested tool/model/thinking, `quota_bucket`, `cost`, refresh statuses, exit status, and whether the agent received the task. Redact credentials and private context. See the [README](README.md) for schemas and safety boundaries.
+
+# v0.1.0-alpha.1 — supervised CLI dogfooding
+
+Approved release notes for `v0.1.0-alpha.1`. Commands used `session start`; current CLI uses `router start`. Quota was read-only snapshot input with no collector.
