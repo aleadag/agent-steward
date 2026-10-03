@@ -58,7 +58,7 @@
         root = ./.;
         fileset = lib.fileset.unions [
           ./package.json ./bun.lock ./tsconfig.json ./tsconfig.tests.json ./src ./tests
-          ./skills ./plugins ./examples ./README.md
+          ./skills ./herdr-plugins ./examples ./README.md
         ];
       };
       package = pkgs.stdenv.mkDerivation {
@@ -107,7 +107,9 @@
         installPhase = ''
           runHook preInstall
           mkdir -p "$out/lib/agent-steward/dist/src" "$out/lib/agent-steward/node_modules" \
-            "$out/bin" "$out/share/agent-steward/skills/agent-steward" "$out/share/agent-steward/herdr-plugin"
+            "$out/bin" "$out/share/agent-steward/skills/agent-steward" \
+            "$out/share/agent-steward/herdr-plugins/agent-steward-recover" \
+            "$out/share/agent-steward/herdr-plugins/agent-steward-launcher"
           cp -R "$TMPDIR/project/dist/src/." "$out/lib/agent-steward/dist/src/"
           mkdir -p "$out/lib/agent-steward/node_modules/zod"
           (
@@ -120,10 +122,12 @@
           )
           ln -s ${pkgs.bun} "$out/lib/agent-steward/bun"
           cp skills/agent-steward/SKILL.md "$out/share/agent-steward/skills/agent-steward/SKILL.md"
-          cp plugins/agent-steward/herdr-plugin.toml "$out/share/agent-steward/herdr-plugin/herdr-plugin.toml"
-          cp plugins/agent-steward/run.sh "$out/share/agent-steward/herdr-plugin/run.sh"
-          ln -s ../../../bin/agent-steward-herdr-adapter \
-            "$out/share/agent-steward/herdr-plugin/agent-steward-herdr-adapter"
+          cp herdr-plugins/agent-steward-recover/herdr-plugin.toml "$out/share/agent-steward/herdr-plugins/agent-steward-recover/herdr-plugin.toml"
+          cp herdr-plugins/agent-steward-recover/run.sh "$out/share/agent-steward/herdr-plugins/agent-steward-recover/run.sh"
+          ln -s ../../../../bin/agent-steward-herdr-adapter \
+            "$out/share/agent-steward/herdr-plugins/agent-steward-recover/agent-steward-herdr-adapter"
+          cp herdr-plugins/agent-steward-launcher/herdr-plugin.toml "$out/share/agent-steward/herdr-plugins/agent-steward-launcher/herdr-plugin.toml"
+          cp herdr-plugins/agent-steward-launcher/dispatch.sh "$out/share/agent-steward/herdr-plugins/agent-steward-launcher/dispatch.sh"
           makeWrapper "$out/lib/agent-steward/bun/bin/bun" "$out/bin/agent-steward" \
             --add-flags "$out/lib/agent-steward/dist/src/main.js" \
             --set AGENT_STEWARD_COMMAND "$out/bin/agent-steward" \

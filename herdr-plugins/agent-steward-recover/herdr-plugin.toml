@@ -1,5 +1,5 @@
-id = "agent-steward"
-name = "Agent Steward"
+id = "agent-steward-recover"
+name = "Agent Steward recover"
 version = "0.1.0"
 min_herdr_version = "0.9.1"
 description = "Opt-in stopped-agent scheduler; opening the visible supervisor pane can deliver gated recovery prompts. Approvals never send keys. Unsupported Herdr versions must not link this plugin."

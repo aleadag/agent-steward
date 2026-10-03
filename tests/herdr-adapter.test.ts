@@ -283,7 +283,7 @@ test('package-relative script uses only its sibling wrapper and rejects other co
   const base = await mkdtemp(join(tmpdir(), 'steward-wrapper-'));
   const script = join(base, 'run.sh');
   const wrapper = join(base, 'agent-steward-herdr-adapter');
-  await cp(new URL('../plugins/agent-steward/run.sh', import.meta.url), script);
+  await cp(new URL('../herdr-plugins/agent-steward-recover/run.sh', import.meta.url), script);
   await writeFile(wrapper, '#!/bin/sh\nprintf "%s" "$1"\n');
   await chmod(wrapper, 0o755);
   await writeFile(join(base, 'node'), '#!/bin/sh\nexit 43\n');
@@ -295,6 +295,15 @@ test('package-relative script uses only its sibling wrapper and rejects other co
   assert.equal(result.stdout, 'event');
   const refused = spawnSync('sh', [script, 'unknown'], { encoding: 'utf8' });
   assert.notEqual(refused.status, 0);
+  const override = join(base, 'override-adapter');
+  await writeFile(override, '#!/bin/sh\nprintf "over:%s" "$1"\n');
+  await chmod(override, 0o755);
+  const redirected = spawnSync('sh', [script, 'scheduler'], {
+    encoding: 'utf8',
+    env: { ...process.env, AGENT_STEWARD_HERDR_ADAPTER: override },
+  });
+  assert.equal(redirected.status, 0, redirected.stderr);
+  assert.equal(redirected.stdout, 'over:scheduler');
 });
 
 test('plain detection text is untrusted evidence: accepted without asserting an isolated stop', async () => {

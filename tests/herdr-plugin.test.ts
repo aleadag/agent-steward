@@ -445,7 +445,7 @@ test.skipIf(!pkg)(
   async () => {
     assert.ok(pkg, 'installed check must supply the package path');
     const root = mkdtempSync(join(tmpdir(), 'steward-herdr-installed-'));
-    const plugin = join(pkg, 'share/agent-steward/herdr-plugin');
+    const plugin = join(pkg, 'share/agent-steward/herdr-plugins/agent-steward-recover');
     const runtime = join(pkg, 'lib/agent-steward/bun/bin/bun');
     const entry = join(pkg, 'lib/agent-steward/dist/src/herdr-adapter/entry.js');
     const main = join(pkg, 'lib/agent-steward/dist/src/main.js');
@@ -535,7 +535,9 @@ test.skipIf(!pkg)(
       assert.ok(existsSync(join(plugin, 'run.sh')));
       const adapterLink = join(plugin, 'agent-steward-herdr-adapter');
       assert.ok(lstatSync(adapterLink).isSymbolicLink());
-      assert.equal(readlinkSync(adapterLink), '../../../bin/agent-steward-herdr-adapter');
+      assert.equal(readlinkSync(adapterLink), '../../../../bin/agent-steward-herdr-adapter');
+      assert.ok(existsSync(join(pkg, 'share/agent-steward/herdr-plugins/agent-steward-launcher/herdr-plugin.toml')));
+      assert.ok(existsSync(join(pkg, 'share/agent-steward/herdr-plugins/agent-steward-launcher/dispatch.sh')));
       assert.equal(realpathSync(adapterLink), realpathSync(join(pkg, 'bin/agent-steward-herdr-adapter')));
       assert.ok(existsSync(entry));
       assert.ok(existsSync(main));
