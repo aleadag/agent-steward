@@ -134,15 +134,32 @@
             --set AGENT_STEWARD_SHELL "${pkgs.runtimeShell}"
           makeWrapper "$out/lib/agent-steward/bun/bin/bun" "$out/bin/agent-steward-herdr-adapter" \
             --add-flags "$out/lib/agent-steward/dist/src/herdr-adapter/entry.js"
+          makeWrapper "$out/lib/agent-steward/bun/bin/bun" "$out/bin/steward-spawn" \
+            --add-flags "$out/lib/agent-steward/dist/src/herdr-spawn.js"
           runHook postInstall
         '';
       };
         in {
           devShell = pkgs.mkShell { packages = [ pkgs.bun pkgs.makeWrapper ]; };
-        packages = { agent-steward = package; default = package; };
+        packages = {
+          agent-steward = package;
+          default = package;
+          steward-spawn = pkgs.runCommand "steward-spawn" { } ''
+            mkdir -p "$out/bin"
+            ln -s ${package}/bin/steward-spawn "$out/bin/steward-spawn"
+          '';
+        };
         app = { type = "app"; program = "${package}/bin/agent-steward"; };
         checks = {
           build = package;
+          steward-spawn = pkgs.runCommand "steward-spawn-check" {
+            nativeBuildInputs = [ pkgs.bun pkgs.bash pkgs.coreutils ];
+          } ''
+            bun ${./tests/steward-spawn.mjs} ${package}/bin/steward-spawn \
+              ${pkgs.bash}/bin/bash \
+              ${package}/share/agent-steward/herdr-plugins/agent-steward-launcher/dispatch.sh
+            touch "$out"
+          '';
           cache-graph = pkgs.runCommand "agent-steward-cache-graph" { } ''
             mkdir -p "$TMPDIR/graph"
             cp ${./bun.lock} "$TMPDIR/graph/bun.lock"
