@@ -1,3 +1,16 @@
+# v0.1.0-alpha.5 — agent-agnostic Herdr stop adapter
+
+Release notes for x86_64-linux dogfooding. Package and Nix metadata report `0.1.0-alpha.5`. Earlier alpha tags remain unchanged.
+
+- The optional Herdr adapter watches explicitly configured pane IDs that Herdr reports as agents (a live `agent_session`), not only Pi or Codex. Ordinary terminals without a session are not watched.
+- Opaque Herdr pane IDs such as `wG:p1` are accepted. The full session tuple (`agent`, `kind`, `source`, `value`) must stay unchanged before classify or recovery prompt.
+- `stop check` `agent.tool` is any nonempty Herdr agent string. Routing's tool inventory remains `codex`, `pi`, and `agy`.
+- Approvals stay human-only. The package still does not install or activate the plugin.
+
+## Validation and release boundaries
+
+The alpha.5 preparation passed 642 source tests (17 installed-only skips), 22 installed tests, build, typecheck, lint, format and x86_64-linux Nix build/help/flake gates. Installed regression tests use a fake native executable. Independent whole-branch review of the adapter change passed. aarch64-linux and Darwin native validation remain outstanding; this alpha makes no cross-platform runtime claim. Enabling the plugin in a normal session remains a separate opt-in. Automatic permission approval is not enabled.
+
 # v0.1.0-alpha.4 — native AGY quota and bounded route history
 
 Release notes for x86_64-linux dogfooding. Package and Nix metadata report `0.1.0-alpha.4`. Earlier alpha tags remain unchanged.
