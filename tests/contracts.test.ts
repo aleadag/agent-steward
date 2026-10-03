@@ -523,6 +523,37 @@ test('live-launch errors use fixed credential-free schema-1 envelopes', () => {
   }
 });
 
+test('stop input agent.tool accepts any nonempty Herdr agent string', () => {
+  const base = {
+    schema_version: 2,
+    request_id: 'r1',
+    agent: { id: 'a', tool: 'pi', pane_id: 'w1:p2', session_id: null },
+    status: 'blocked',
+    current_episode_id: 'e1',
+    context: 'API error',
+    automatic_approval_forbidden: false,
+    retry: {
+      failure_episode_id: 'e1',
+      first_observed_at: '2026-09-29T10:00:00Z',
+      attempt_count: 0,
+      last_attempt_at: null,
+      quota_check_count: 0,
+      last_quota_check_at: null,
+    },
+  };
+  for (const tool of ['agy', 'pi', 'codex', 'claude']) {
+    assert.equal(StopInputSchema.parse({ ...base, agent: { ...base.agent, tool } }).agent.tool, tool);
+  }
+  for (const tool of ['', ' ', '\t\n']) {
+    assert.equal(StopInputSchema.safeParse({ ...base, agent: { ...base.agent, tool } }).success, false);
+  }
+});
+
+test('routing rejects arbitrary Herdr agent labels in tools and candidates', () => {
+  assert.equal(ConfigSchema.safeParse(config({ tools: ['claude'] })).success, false);
+  assert.equal(ConfigSchema.safeParse(config({ candidates: [candidate({ tool: 'claude' })] })).success, false);
+});
+
 test('version-2 stop input strictly validates adapter observations and retry/reset metadata', () => {
   const { StopInputSchema } = contractExports;
   assert.equal(typeof StopInputSchema?.parse, 'function');
@@ -572,7 +603,7 @@ test('version-2 stop input strictly validates adapter observations and retry/res
     { ...input, hidden: true },
     { ...input, schema_version: 1 },
     { ...input, status: 'stopped' },
-    { ...input, agent: { ...input.agent, tool: 'agy' } },
+    { ...input, agent: { ...input.agent, tool: '' } },
     { ...input, agent: { ...input.agent, session_id: 4 } },
     { ...input, agent: { ...input.agent, unexpected: true } },
     { ...input, pending_action: { action: 'Edit file', secret: 'bad' } },

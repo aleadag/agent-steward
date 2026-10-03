@@ -82,6 +82,10 @@ export async function deliverProposal(
     !fresh ||
     fresh.status !== 'idle' ||
     !sameEpisode(fresh, record) ||
+    fresh.agent !== observation.agent ||
+    fresh.session_kind !== observation.session_kind ||
+    fresh.session_source !== observation.session_source ||
+    fresh.session_id !== observation.session_id ||
     fresh.revision !== observation.revision ||
     fresh.state_change_seq !== observation.state_change_seq
   )
@@ -132,6 +136,10 @@ export async function deliverProposal(
     !immediatelyBefore ||
     immediatelyBefore.status !== 'idle' ||
     !sameEpisode(immediatelyBefore, record) ||
+    immediatelyBefore.agent !== fresh.agent ||
+    immediatelyBefore.session_kind !== fresh.session_kind ||
+    immediatelyBefore.session_source !== fresh.session_source ||
+    immediatelyBefore.session_id !== fresh.session_id ||
     immediatelyBefore.revision !== fresh.revision ||
     immediatelyBefore.state_change_seq !== fresh.state_change_seq
   )

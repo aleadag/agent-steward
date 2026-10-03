@@ -199,6 +199,17 @@ test('skill stop JSON example parses with the real strict schema', () => {
   assert.equal(StopInputSchema.parse(stopExample).current_episode_id, stopExample.retry.failure_episode_id);
 });
 
+test('optional adapter watches configured Herdr agent sessions not a Pi/Codex allowlist', () => {
+  const section = readme
+    .split('### Optional Herdr adapter (not activated)')[1]
+    ?.split('\n## Command preview references')[0];
+  assert.ok(section);
+  assert.match(section, /agent_session/);
+  assert.match(section, /terminal/);
+  assert.doesNotMatch(section, /only on explicitly configured Pi\/Codex pane targets/);
+  assert.match(skill, /agent_session/);
+});
+
 test('optional adapter documents incomplete shutdown and offline recovery boundaries', () => {
   const section = readme
     .split('### Optional Herdr adapter (not activated)')[1]

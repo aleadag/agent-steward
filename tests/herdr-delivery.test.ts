@@ -461,6 +461,50 @@ test('changed evidence, revision, session, blocked UI and permission UI never pr
   assert.equal(f.herdr.writes().length, 0);
 });
 
+for (const [field, value] of [
+  ['kind', 'opaque'],
+  ['source', 'other'],
+] as const) {
+  test(`session ${field}-only change before delivery's fresh decision prevents prompt`, async () => {
+    const f = await setup('agy');
+    const base = await f.herdr.get('w1:p1');
+    assert.ok(base?.agent_session);
+    f.herdr.change({ ...base, agent_session: { ...base.agent_session, [field]: value } });
+    let decisions = 0;
+    assert.equal(
+      await deliver(f, async (input) => {
+        decisions++;
+        return recovery(input);
+      }),
+      'human',
+    );
+    assert.equal(decisions, 0);
+    assert.deepEqual(f.herdr.writes(), []);
+    assert.equal((await retryEpisode(f)).attempt_count, 0);
+    assert.equal((await retryEpisode(f)).last_delivery_state, 'none');
+  });
+
+  test(`session ${field}-only change after delivery's fresh decision prevents prompt`, async () => {
+    const f = await setup('agy');
+    const base = await f.herdr.get('w1:p1');
+    assert.ok(base?.agent_session);
+    const next = { ...base, agent_session: { ...base.agent_session, [field]: value } };
+    let decisions = 0;
+    assert.equal(
+      await deliver(f, async (input) => {
+        decisions++;
+        f.herdr.change(next);
+        return recovery(input);
+      }),
+      'human',
+    );
+    assert.equal(decisions, 1);
+    assert.deepEqual(f.herdr.writes(), []);
+    assert.equal((await retryEpisode(f)).attempt_count, 0);
+    assert.equal((await retryEpisode(f)).last_delivery_state, 'none');
+  });
+}
+
 test('error changing after the fresh CLI decision cannot reach prompt', async () => {
   const f = await setup();
   let decided = false;

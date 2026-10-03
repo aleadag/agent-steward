@@ -361,6 +361,9 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       !current ||
       current.agent !== observed.agent ||
       current.agent_status !== observed.status ||
+      current.agent_session?.agent !== observed.agent ||
+      current.agent_session?.kind !== observed.session_kind ||
+      current.agent_session?.source !== observed.session_source ||
       current.agent_session?.value !== observed.session_id ||
       current.revision !== observed.revision ||
       current.state_change_seq !== observed.state_change_seq ||

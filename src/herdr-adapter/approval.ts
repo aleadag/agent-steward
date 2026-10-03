@@ -10,7 +10,7 @@ export type VerifiedRequest = {
   readonly action: string;
   readonly pane_id: string;
   readonly session_id: string;
-  readonly agent: 'pi' | 'codex';
+  readonly agent: string;
   readonly acceptance_control: string;
 };
 

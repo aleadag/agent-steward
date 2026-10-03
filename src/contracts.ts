@@ -155,7 +155,7 @@ export const ApprovalInputSchema = z.strictObject({
 
 const StopAgentSchema = z.strictObject({
   id: text,
-  tool: z.enum(['codex', 'pi']),
+  tool: text,
   pane_id: text,
   session_id: z.string().nullable(),
 });

@@ -102,6 +102,56 @@ function fixture(herdr: EventDeps['herdr'] = fakeHerdr()) {
   return { deps, calls, handoffs, records };
 }
 
+for (const paneId of ['w1:p1', 'wG:p1', 'wR:p55', 'wE:p2W', 'wR:p5A', 'wa9:pz8']) {
+  test(`observeStop accepts opaque Herdr pane ID ${paneId}`, async () => {
+    const pane = agent({ pane_id: paneId, workspace_id: paneId.split(':')[0] });
+    const read = output({ pane_id: paneId });
+    const observed = await observeStop(fakeHerdr(pane, read), paneId);
+    assert.ok(observed);
+    assert.equal(observed.pane_id, paneId);
+    assert.equal(observed.workspace_id, pane.workspace_id);
+    assert.equal(observed.session_id, 's1');
+    assert.equal(observed.context, 'Current API failure: request timed out');
+  });
+}
+
+test('observeStop rejects malformed pane IDs before querying Herdr', async () => {
+  const herdr: HerdrReader = {
+    get: async () => {
+      throw new Error('invalid pane ID must not query Herdr');
+    },
+    read: async () => {
+      throw new Error('invalid pane ID must not read Herdr');
+    },
+  };
+  for (const paneId of [
+    '',
+    '/bin/sh',
+    '../wG:p1',
+    'G:p1',
+    'wG:1',
+    'w:p1',
+    'wG:p',
+    'wG/p1',
+    'w-G:p1',
+    'wG:p_1',
+    'wG:p1\n',
+  ]) {
+    assert.equal(await observeStop(herdr, paneId), null, JSON.stringify(paneId));
+  }
+});
+
+test('opaque pane IDs without agent_session are not read or observed', async () => {
+  for (const paneId of ['wG:p1', 'wR:p55', 'wE:p2W', 'wR:p5A']) {
+    const pane = agent({ pane_id: paneId, workspace_id: paneId.split(':')[0], agent_session: undefined });
+    const herdr = fakeHerdr(pane);
+    herdr.read = async () => {
+      throw new Error('pane without agent_session must not be read');
+    };
+    assert.equal(await observeStop(herdr, paneId), null);
+  }
+});
+
 test('bounded detection snapshot is classified, but event agent mismatch rejects a replacement', async () => {
   const herdr = fakeHerdr();
   const { deps, calls, handoffs } = fixture(herdr);
@@ -476,20 +526,165 @@ test('Pi 0.9.1 excerpt rejects oversized bytes, extra actual lines, credentials 
   }
 });
 
-test('Pi 0.9.1 requires an authentic-looking native path and Codex without session remains human-only', async () => {
-  for (const pane of [
-    piAgent({ agent_session: { ...piAgent().agent_session, source: 'integration:pi' } }),
-    piAgent({ agent_session: { ...piAgent().agent_session, value: 'relative/session.jsonl' } }),
-    piAgent({ agent_session: { ...piAgent().agent_session, value: '/home/example/session.txt' } }),
-    piAgent({ agent_session: { ...piAgent().agent_session, value: '/home/example/session.jsonl\nspoof' } }),
-    piAgent({ agent: 'codex', agent_session: undefined }),
+test('agy kind:id session is observed and classified with tool agy', async () => {
+  const pane = agent({
+    agent: 'agy',
+    agent_status: 'idle',
+    agent_session: { agent: 'agy', kind: 'id', source: 'herdr:antigravity_cli', value: 'sess-agy-1' },
+  });
+  const { deps, calls, records, handoffs } = fixture(fakeHerdr(pane, output({ text: 'Error: 503 overloaded\n' })));
+  await handleEvent({ ...event, agent: 'agy', agent_status: 'idle' }, deps);
+  assert.equal(calls.length, 1);
+  assert.equal(firstCall(calls).agent.tool, 'agy');
+  assert.equal(firstCall(calls).agent.session_id, 'sess-agy-1');
+  assert.deepEqual(records, []);
+  assert.deepEqual(handoffs, ['human_review_required']);
+});
+
+test('ordinary terminal without agent_session is not watched', async () => {
+  const pane = agent({ agent: undefined, agent_session: undefined, agent_status: 'unknown' });
+  const herdr = fakeHerdr(pane, output({ text: 'sh-5.3$\n' }));
+  assert.equal(await observeStop(herdr, 'w1:p1'), null);
+  const { deps, calls, records, handoffs } = fixture(herdr);
+  await handleEvent({ ...event, agent_status: 'unknown' }, deps);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(records, []);
+  assert.deepEqual(handoffs, []);
+});
+
+test('ordinary terminal with idle status but no agent_session cannot be classified', async () => {
+  const pane = agent({ agent: undefined, agent_session: undefined, agent_status: 'idle' });
+  const herdr = fakeHerdr(pane, output({ text: 'sh-5.3$\n' }));
+  assert.equal(await observeStop(herdr, 'w1:p1'), null);
+  const { deps, calls, records, handoffs } = fixture(herdr);
+  await handleEvent({ ...event, agent_status: 'idle' }, deps);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(records, []);
+  assert.deepEqual(handoffs, ['observation_unavailable']);
+});
+
+test('Codex without session remains unwitnessed', async () => {
+  const pane = agent({ agent: 'codex', agent_session: undefined, agent_status: 'idle' });
+  const { deps, calls, handoffs } = fixture(fakeHerdr(pane, output({ text: 'error\n' })));
+  await handleEvent({ ...event, agent: 'codex', agent_status: 'idle' }, deps);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(handoffs, ['observation_unavailable']);
+});
+
+test('session tuple change or control characters fail closed', async () => {
+  const baseSession = { agent: 'agy', kind: 'id', source: 'herdr:antigravity_cli', value: 'sess-1' };
+  const base = agent({ agent: 'agy', agent_status: 'idle', agent_session: baseSession });
+  const read = output({ text: 'Error: 503\n' });
+  for (const next of [
+    agent({ ...base, agent: 'pi', agent_session: { ...baseSession, agent: 'pi' } }),
+    agent({
+      agent: 'pi',
+      agent_status: 'idle',
+      agent_session: { agent: 'pi', kind: 'path', source: 'herdr:pi', value: '/tmp/x.jsonl' },
+    }),
+    agent({ ...base, agent_session: { ...baseSession, value: 'sess-2' } }),
+    agent({ ...base, agent_session: { ...baseSession, source: 'other' } }),
+    agent({ ...base, agent_session: { ...baseSession, kind: 'opaque' } }),
+    agent({ ...base, agent_session: { ...baseSession, kind: 'id\n' } }),
+    agent({ ...base, agent_session: { ...baseSession, value: 'sess-1\x00' } }),
+    agent({ agent: 'agy', agent_status: 'idle', agent_session: { ...baseSession, agent: 'pi' } }),
   ]) {
-    const { deps, calls, records, handoffs } = fixture(fakeHerdr(pane, piRead()));
-    await handleEvent({ ...event, agent_status: 'idle' }, deps);
+    let count = 0;
+    const herdr = fakeHerdr(base, read);
+    herdr.get = async () => (++count === 1 ? base : next);
+    assert.equal(await observeStop(herdr, 'w1:p1'), null);
+  }
+});
+
+for (const [field, value] of [
+  ['kind', 'opaque'],
+  ['source', 'other'],
+] as const) {
+  test(`session ${field}-only change between stable observations changes episode identity`, async () => {
+    const session = { agent: 'agy', kind: 'id', source: 'herdr:antigravity_cli', value: 'sess-1' };
+    const base = agent({ agent: 'agy', agent_status: 'idle', agent_session: session });
+    const herdr = fakeHerdr(base);
+    const before = await observeStop(herdr, 'w1:p1');
+    assert.ok(before);
+    herdr.replace({ ...base, agent_session: { ...session, [field]: value } });
+    const after = await observeStop(herdr, 'w1:p1');
+    assert.ok(after);
+    assert.notEqual(after.current_episode_id, before.current_episode_id);
+  });
+}
+
+for (const [field, value] of [
+  ['kind', 'opaque'],
+  ['source', 'other'],
+  ['agent', 'pi'],
+] as const) {
+  test(`session ${field}-only change on entry's third get prevents classification`, async () => {
+    const session = { agent: 'agy', kind: 'id', source: 'herdr:antigravity_cli', value: 'sess-1' };
+    const base = agent({ agent: 'agy', agent_status: 'idle', agent_session: session });
+    const next = { ...base, agent_session: { ...session, [field]: value } };
+    const herdr = fakeHerdr(base);
+    let gets = 0;
+    herdr.get = async () => (++gets === 3 ? next : base);
+    const { deps, calls, records, handoffs } = fixture(herdr);
+    await handleEvent({ ...event, agent: 'agy', agent_status: 'idle' }, deps);
+    assert.equal(gets, 3);
     assert.deepEqual(calls, []);
     assert.deepEqual(records, []);
     assert.deepEqual(handoffs, ['observation_unavailable']);
+  });
+}
+
+test('unknown session kind still observes when the four fields are clean', async () => {
+  const pane = agent({
+    agent: 'claude',
+    agent_status: 'idle',
+    agent_session: { agent: 'claude', kind: 'opaque', source: 'herdr:claude', value: 'c1' },
+  });
+  const observed = await observeStop(fakeHerdr(pane, output({ text: 'Error: 503\n' })), 'w1:p1');
+  assert.ok(observed);
+  assert.equal(observed.agent, 'claude');
+  assert.equal(observed.session_id, 'c1');
+});
+
+test('Pi session source and value need no tool-specific path shape', async () => {
+  for (const session of [
+    { agent: 'pi', kind: 'path', source: 'integration:pi', value: piPath },
+    { agent: 'pi', kind: 'path', source: 'herdr:pi', value: 'relative/session.jsonl' },
+    { agent: 'pi', kind: 'path', source: 'herdr:pi', value: '/home/example/session.txt' },
+  ]) {
+    const { deps, calls, records, handoffs } = fixture(fakeHerdr(piAgent({ agent_session: session }), piRead()));
+    await handleEvent({ ...event, agent: 'pi', agent_status: 'idle' }, deps);
+    assert.equal(calls.length, 1);
+    assert.equal(firstCall(calls).agent.tool, 'pi');
+    assert.equal(firstCall(calls).agent.session_id, session.value);
+    assert.deepEqual(records, []);
+    assert.deepEqual(handoffs, ['human_review_required']);
   }
+});
+
+test('empty session fields and ASCII controls in stable snapshots are rejected', async () => {
+  const session = { agent: 'pi', kind: 'id', source: 'integration:pi', value: 's1' };
+  for (const field of ['agent', 'kind', 'source', 'value'] as const) {
+    for (const invalid of [
+      '',
+      `${session[field]}\x00`,
+      `${session[field]}\x1f`,
+      `${session[field]}\x7f`,
+      `${session[field]}\n`,
+    ]) {
+      const changed = { ...session, [field]: invalid };
+      const pane = agent({ agent: changed.agent, agent_session: changed });
+      assert.equal(await observeStop(fakeHerdr(pane), 'w1:p1'), null, `${field}: ${JSON.stringify(invalid)}`);
+    }
+  }
+});
+
+test('session agent must match the pane agent before observation', async () => {
+  const pane = agent({
+    agent: 'agy',
+    agent_session: { agent: 'pi', kind: 'id', source: 'herdr:antigravity_cli', value: 'sess-1' },
+  });
+  assert.equal(await observeStop(fakeHerdr(pane), 'w1:p1'), null);
 });
 
 test('explicit 12-line/2048-byte detection limits accept boundary without clipping', async () => {

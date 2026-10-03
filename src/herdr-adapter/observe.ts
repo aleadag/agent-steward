@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { isAbsolute } from 'node:path';
 import { assertNoCredentials } from '../privacy.ts';
 
 export type AgentSnapshot = {
@@ -25,8 +24,10 @@ export type HerdrReader = {
 export type ObservedStop = {
   pane_id: string;
   workspace_id: string;
-  agent: 'pi' | 'codex';
+  agent: string;
   session_id: string;
+  session_kind: string;
+  session_source: string;
   status: 'blocked' | 'idle';
   revision: number;
   state_change_seq: number;
@@ -35,40 +36,43 @@ export type ObservedStop = {
   error_evidence_digest: string;
 };
 
+function hasControls(value: string): boolean {
+  // eslint-disable-next-line no-control-regex -- Reject ASCII controls in session fields.
+  return /[\x00-\x1f\x7f]/.test(value);
+}
+
+function field(value: string | undefined): string | null {
+  if (typeof value !== 'string' || value.length === 0 || hasControls(value)) return null;
+  return value;
+}
+
 function identity(pane: AgentSnapshot, paneId: string): string | null {
+  const session = pane.agent_session;
   if (
     pane.pane_id !== paneId ||
-    (pane.agent !== 'pi' && pane.agent !== 'codex') ||
     (pane.agent_status !== 'blocked' && pane.agent_status !== 'idle') ||
     !Number.isSafeInteger(pane.revision) ||
     !Number.isSafeInteger(pane.state_change_seq) ||
-    pane.workspace_id !== paneId.split(':')[0] ||
-    pane.agent_session?.agent !== pane.agent ||
-    !pane.agent_session.value ||
-    !pane.agent_session.source
+    pane.workspace_id !== paneId.split(':')[0]
   )
     return null;
-  const session = pane.agent_session;
-  if (session.kind === 'path') {
-    if (
-      pane.agent !== 'pi' ||
-      session.source !== 'herdr:pi' ||
-      !isAbsolute(session.value) ||
-      !session.value.endsWith('.jsonl') ||
-      // eslint-disable-next-line no-control-regex -- Reject ASCII controls in session paths.
-      /[\x00-\x1f\x7f]/.test(session.value)
-    )
-      return null;
-  } else if (session.kind !== 'id') return null;
-  return session.value;
+  const agent = field(pane.agent ?? undefined);
+  const kind = field(session?.kind);
+  const source = field(session?.source);
+  const value = field(session?.value);
+  if (!session || !agent || session.agent !== agent || !kind || !source || !value) return null;
+  if (hasControls(session.agent)) return null;
+  return value;
 }
 
 export async function observeStop(herdr: HerdrReader, paneId: string): Promise<ObservedStop | null> {
-  if (!/^w[0-9]+:p[0-9]+$/.test(paneId)) return null;
+  if (!/^w[A-Za-z0-9]+:p[A-Za-z0-9]+$/.test(paneId)) return null;
   const before = await herdr.get(paneId);
   if (!before) return null;
   const sessionId = identity(before, paneId);
   if (!sessionId) return null;
+  const sessionKind = before.agent_session!.kind;
+  const sessionSource = before.agent_session!.source;
   const read = await herdr.read(paneId);
   const after = await herdr.get(paneId);
   if (
@@ -77,8 +81,8 @@ export async function observeStop(herdr: HerdrReader, paneId: string): Promise<O
     after.workspace_id !== before.workspace_id ||
     after.agent !== before.agent ||
     after.agent_status !== before.agent_status ||
-    after.agent_session?.kind !== before.agent_session?.kind ||
-    after.agent_session?.source !== before.agent_session?.source ||
+    after.agent_session?.kind !== sessionKind ||
+    after.agent_session?.source !== sessionSource ||
     after.revision !== before.revision ||
     after.state_change_seq !== before.state_change_seq ||
     read?.pane_id !== paneId ||
@@ -108,6 +112,8 @@ export async function observeStop(herdr: HerdrReader, paneId: string): Promise<O
         paneId,
         before.workspace_id,
         before.agent,
+        sessionKind,
+        sessionSource,
         sessionId,
         before.revision,
         before.state_change_seq,
@@ -119,8 +125,10 @@ export async function observeStop(herdr: HerdrReader, paneId: string): Promise<O
   return {
     pane_id: paneId,
     workspace_id: before.workspace_id,
-    agent: before.agent as 'pi' | 'codex',
+    agent: before.agent as string,
     session_id: sessionId,
+    session_kind: sessionKind,
+    session_source: sessionSource,
     status: before.agent_status as 'blocked' | 'idle',
     revision: before.revision,
     state_change_seq: before.state_change_seq,

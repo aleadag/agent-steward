@@ -121,6 +121,37 @@ const collect =
     values.push(value);
   };
 
+for (const paneId of ['w1:p1', 'wG:p1', 'wR:p55', 'wE:p2W', 'wR:p5A', 'wa9:pz8']) {
+  test(`EpisodeStore round-trips opaque Herdr pane ID ${paneId}`, async () => {
+    const store = await base();
+    const record = { ...episode('e1'), pane_id: paneId };
+    await store.record(paneId, record);
+    assert.deepEqual(await store.retry(paneId), record);
+    assert.deepEqual(await store.targets(), [paneId]);
+    assert.deepEqual(await store.due([paneId], now), [paneId]);
+  });
+}
+
+test('EpisodeStore rejects persisted malformed pane IDs', async () => {
+  const store = await base();
+  for (const paneId of [
+    '',
+    '/bin/sh',
+    '../wG:p1',
+    'G:p1',
+    'wG:1',
+    'w:p1',
+    'wG:p',
+    'wG/p1',
+    'w-G:p1',
+    'wG:p_1',
+    'wG:p1\n',
+  ]) {
+    await store.record(paneId, { ...episode('e1'), pane_id: paneId });
+    await assert.rejects(store.retry(paneId), { message: 'invalid episode metadata' });
+  }
+});
+
 // Catches reusing a failure ID when the same agent/session resumes and later displays identical old text.
 test('episode identity changes when the live stop sequence changes with identical excerpt', async () => {
   const before = await observe(herdr(), 'w1:p1');

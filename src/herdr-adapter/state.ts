@@ -26,7 +26,7 @@ const identifier = z
 const timestamp = z.iso.datetime({ offset: true });
 const episodeSchema = z
   .strictObject({
-    pane_id: z.string().regex(/^w[0-9]+:p[0-9]+$/),
+    pane_id: z.string().regex(/^w[A-Za-z0-9]+:p[A-Za-z0-9]+$/),
     session_id: identifier,
     failure_episode_id: identifier,
     error_evidence_digest: identifier,
