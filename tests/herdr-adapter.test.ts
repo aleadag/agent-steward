@@ -255,9 +255,15 @@ test('wrong event, stale event identity, unconfigured pane, and absent lease do 
   await handleEvent({ ...event, type: 'pane_output_changed' }, deps);
   await handleEvent({ ...event, agent: 'codex' }, deps);
   await handleEvent({ ...event, agent_status: 'idle' }, deps);
-  await handleEvent(event, { ...deps, targets: [] });
+  await handleEvent(event, { ...deps, targets: ['w2:p2'] });
   await handleEvent(event, { ...deps, store: { ...deps.store, active: async () => false } });
   assert.equal(calls.length, 0);
+});
+
+test('empty or omitted pane allowlist watches every Herdr agent pane', async () => {
+  const { deps, calls } = fixture();
+  await handleEvent(event, { ...deps, targets: 'all' });
+  assert.equal(calls.length, 1);
 });
 
 test('event hook remains inert without a scheduler lease even with explicit targets', async () => {

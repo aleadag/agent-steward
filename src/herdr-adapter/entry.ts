@@ -32,7 +32,7 @@ export type EventDeps = {
   decide: (input: StopInput) => Promise<unknown>;
   store: Store;
   clock: { now: () => Date };
-  targets: readonly string[];
+  targets: readonly string[] | 'all';
   handoff: (reason: HandoffReason) => Promise<void>;
   sessionId?: string;
   leaseToken?: string;
@@ -49,7 +49,11 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       : (trigger as Event);
   const statusEvent = event.type === 'pane_agent_status_changed' || event.type === 'pane.agent_status_changed';
   const exitEvent = event.type === 'pane_exited' || event.type === 'pane.exited';
-  if ((!statusEvent && !exitEvent) || typeof event.pane_id !== 'string' || !deps.targets.includes(event.pane_id))
+  if (
+    (!statusEvent && !exitEvent) ||
+    typeof event.pane_id !== 'string' ||
+    (deps.targets !== 'all' && !deps.targets.includes(event.pane_id))
+  )
     return;
   if (!admissionOpen()) return;
   const active = await deps.store.active(deps.sessionId);
@@ -703,8 +707,10 @@ async function visibleHandoff(env: NodeJS.ProcessEnv, reason: HandoffReason): Pr
     });
   });
 }
-async function targetsFrom(env: NodeJS.ProcessEnv): Promise<string[]> {
+async function targetsFrom(env: NodeJS.ProcessEnv): Promise<readonly string[] | 'all'> {
   const config = JSON.parse(await readFile(`${env.HERDR_PLUGIN_CONFIG_DIR}/targets.json`, 'utf8'));
+  if (!Object.hasOwn(config, 'pane_ids') || (Array.isArray(config.pane_ids) && config.pane_ids.length === 0))
+    return 'all';
   return Array.isArray(config.pane_ids) && config.pane_ids.every((id: unknown) => typeof id === 'string')
     ? config.pane_ids
     : [];
@@ -718,16 +724,20 @@ export async function runEvent(env: NodeJS.ProcessEnv, decide: EventDeps['decide
   )
     return;
   let event: EventTrigger;
-  let targets: string[];
+  let targets: readonly string[] | 'all';
   try {
     event = JSON.parse(env.HERDR_PLUGIN_EVENT_JSON);
-    targets = await targetsFrom(env);
   } catch {
     return;
   }
+  try {
+    targets = await targetsFrom(env);
+  } catch {
+    targets = 'all';
+  }
   if (!event || typeof event !== 'object') return;
   const paneId = 'data' in event ? event.data?.pane_id : event.pane_id;
-  if (!targets.includes(paneId ?? '')) return;
+  if (targets !== 'all' && !targets.includes(paneId ?? '')) return;
   const sessionId = await socketSession(env.HERDR_SOCKET_PATH);
   if (!sessionId) return;
   const store = new EpisodeStore(env.HERDR_PLUGIN_STATE_DIR);
@@ -773,12 +783,11 @@ export async function runVisibleScheduler(
     await visibleHandoff(env, 'observation_unavailable');
     return;
   }
-  let targets: string[];
+  let listed: readonly string[] | 'all';
   try {
-    targets = await targetsFrom(env);
+    listed = await targetsFrom(env);
   } catch {
-    await visibleHandoff(env, 'observation_unavailable');
-    return;
+    listed = 'all';
   }
   const abort = new AbortController();
   const stop = () => abort.abort();
@@ -789,7 +798,7 @@ export async function runVisibleScheduler(
       store: new EpisodeStore(env.HERDR_PLUGIN_STATE_DIR),
       herdr: socketControl(env.HERDR_SOCKET_PATH, env.HERDR_BIN_PATH),
       decide: decideWithCli,
-      targets,
+      targets: listed === 'all' ? undefined : listed,
       sessionId,
       signal: abort.signal,
       handoff: (reason) => visibleHandoff(env, reason),

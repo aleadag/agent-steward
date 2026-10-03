@@ -12,7 +12,7 @@ export type SchedulerOptions = {
   store: EpisodeStore;
   herdr: HerdrReader & Partial<Pick<HerdrControl, 'prompt'>>;
   decide: (input: StopInput) => Promise<unknown>;
-  targets: readonly string[];
+  targets?: readonly string[];
   sessionId: string;
   signal: AbortSignal;
   onLease?: () => void;
@@ -391,17 +391,19 @@ export async function runScheduler(options: SchedulerOptions): Promise<Scheduler
         return;
       }
       const now = options.clock?.now() ?? new Date();
+      const listed = targets ?? (await store.targets());
+      if (!admissionOpen()) return;
       try {
         if (reconnect) {
           const saved = await waitOpen(
-            reconcileSaved(store, herdr, targets, options.handoff ?? (async () => {}), ownership),
+            reconcileSaved(store, herdr, listed, options.handoff ?? (async () => {}), ownership),
           );
           if (saved.kind === 'closed' || !admissionOpen()) return;
         }
         reconnect = false;
         outageNotified = false;
         if (!admissionOpen()) return;
-        const due = await waitOpen(reconcileDue(now, store, herdr, decide, targets, options.handoff, ownership));
+        const due = await waitOpen(reconcileDue(now, store, herdr, decide, listed, options.handoff, ownership));
         if (due.kind === 'closed' || !admissionOpen()) return;
       } catch (error) {
         if (!admissionOpen()) return;
@@ -420,7 +422,7 @@ export async function runScheduler(options: SchedulerOptions): Promise<Scheduler
       let next: number | null = null;
       if (!reconnect) {
         try {
-          const scheduled = await waitOpen(store.next(targets));
+          const scheduled = await waitOpen(store.next(listed));
           if (scheduled.kind === 'closed' || !admissionOpen()) return;
           next = scheduled.value;
         } catch (error) {
