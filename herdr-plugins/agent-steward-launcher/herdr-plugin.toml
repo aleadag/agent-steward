@@ -1,9 +1,15 @@
 id = "agent-steward-launcher"
 name = "Agent Steward launcher"
-version = "1"
+version = "2"
 min_herdr_version = "0.8.2"
 description = "Argv-exec agent-steward into a new Herdr pane"
 platforms = ["linux", "macos"]
+
+[[actions]]
+id = "log-failure"
+title = "Record a safe launcher failure"
+description = "Internal diagnostic sink; accepts only request ID, reason code and credential-checked failure metadata."
+command = ["sh", "log-failure.sh"]
 
 [[panes]]
 id = "argv"

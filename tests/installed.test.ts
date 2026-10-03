@@ -85,6 +85,53 @@ test.skipIf(!pkg)('installed help needs neither checkout nor global runtimes and
   });
 });
 
+test.skipIf(!pkg)('installed launcher action renders only safe diagnostics without checkout or global runtimes', () => {
+  assert.ok(pkg);
+  withIsolatedHome(({ root, home }) => {
+    const pluginRoot = join(pkg, 'share/agent-steward/herdr-plugins/agent-steward-launcher');
+    const manifest = Bun.TOML.parse(readFileSync(join(pluginRoot, 'herdr-plugin.toml'), 'utf8')) as {
+      actions?: { id: string; command: string[] }[];
+    };
+    const action = manifest.actions?.find((entry) => entry.id === 'log-failure');
+    assert.ok(action, 'launcher must expose a logged failure action');
+    const shell = process.env.AGENT_STEWARD_SH ?? Bun.which('sh');
+    assert.ok(shell);
+    const diagnostic = {
+      request_id: 'installed-failure',
+      reason_code: 'evaluation_failed',
+      diagnostics: { stage: 'evaluation', kind: 'http', http_status: 401, duration_ms: 12 },
+    };
+    for (const payload of [diagnostic, { ...diagnostic, message: 'private-prompt' }]) {
+      const result: SpawnSyncReturns<string> = spawnSync(
+        shell,
+        action.command.slice(1).map((arg) => join(pluginRoot, arg)),
+        {
+          cwd: root,
+          env: {
+            HOME: home,
+            PATH: '',
+            HERDR_PLUGIN_ROOT: pluginRoot,
+            HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({
+              selected_text: JSON.stringify(payload),
+              workspace_label: 'private-label',
+            }),
+          },
+          encoding: 'utf8',
+        },
+      );
+      if (payload === diagnostic) {
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), diagnostic);
+        assert.equal(result.stderr, '');
+      } else {
+        assert.equal(result.status, 1);
+        assert.equal(result.stdout, '');
+        assert.equal(result.stderr, 'agent-steward-launcher: invalid_failure_diagnostic\n');
+      }
+    }
+  });
+});
+
 test.skipIf(!pkg)('installed failures stay local, structured, and credential-free', () => {
   withIsolatedHome(({ root, xdg, run }) => {
     const missing = parsed(run(['router', 'start', 'task', '--dry-run', '--json']));

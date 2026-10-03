@@ -16,6 +16,7 @@ import { collectNativeAgy, sendAgyCapture, runPreviousAgyRenderer } from './agy-
 import { fileSize, withLedgerLock } from './ledger-io.ts';
 import { launchForeground } from './process.ts';
 import type { NativeLaunch } from './launch.ts';
+import { publishLauncherFailure } from './herdr-launcher-log.ts';
 
 export const httpGet: QuotaHttpGet = async (url, headers) => {
   const original = new URL(url);
@@ -173,6 +174,12 @@ export function createRuntime(): Runtime {
     post: postHttps,
     terminal: { stdin: process.stdin.isTTY === true, stdout: process.stdout.isTTY === true },
     launch: (command: NativeLaunch) => launchForeground(command, { cwd: process.cwd(), env: process.env }),
+    ...(process.env.HERDR_ENV === '1' && process.env.HERDR_PLUGIN_ID === 'agent-steward-launcher'
+      ? {
+          logFailure: (failure: Parameters<typeof publishLauncherFailure>[1]) =>
+            publishLauncherFailure(process.env.HERDR_SOCKET_PATH ?? '', failure, process.env.TYPESAFE_API_KEY ?? ''),
+        }
+      : {}),
   };
   return runtime;
 }

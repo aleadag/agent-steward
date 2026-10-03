@@ -128,12 +128,17 @@
             "$out/share/agent-steward/herdr-plugins/agent-steward-recover/agent-steward-herdr-adapter"
           cp herdr-plugins/agent-steward-launcher/herdr-plugin.toml "$out/share/agent-steward/herdr-plugins/agent-steward-launcher/herdr-plugin.toml"
           cp herdr-plugins/agent-steward-launcher/dispatch.sh "$out/share/agent-steward/herdr-plugins/agent-steward-launcher/dispatch.sh"
+          cp herdr-plugins/agent-steward-launcher/log-failure.sh "$out/share/agent-steward/herdr-plugins/agent-steward-launcher/log-failure.sh"
+          ln -s ../../../../bin/agent-steward-launcher-log \
+            "$out/share/agent-steward/herdr-plugins/agent-steward-launcher/agent-steward-launcher-log"
           makeWrapper "$out/lib/agent-steward/bun/bin/bun" "$out/bin/agent-steward" \
             --add-flags "$out/lib/agent-steward/dist/src/main.js" \
             --set AGENT_STEWARD_COMMAND "$out/bin/agent-steward" \
             --set AGENT_STEWARD_SHELL "${pkgs.runtimeShell}"
           makeWrapper "$out/lib/agent-steward/bun/bin/bun" "$out/bin/agent-steward-herdr-adapter" \
             --add-flags "$out/lib/agent-steward/dist/src/herdr-adapter/entry.js"
+          makeWrapper "$out/lib/agent-steward/bun/bin/bun" "$out/bin/agent-steward-launcher-log" \
+            --add-flags "$out/lib/agent-steward/dist/src/herdr-launcher-log.js"
           makeWrapper "$out/lib/agent-steward/bun/bin/bun" "$out/bin/steward-spawn" \
             --add-flags "$out/lib/agent-steward/dist/src/herdr-spawn.js"
           runHook postInstall

@@ -48,6 +48,7 @@ export type Runtime = QuotaRefreshIO & {
   runAgyHook: (input: string) => Promise<AgyHookResult>;
   terminal: { stdin: boolean; stdout: boolean };
   launch: (command: NativeLaunch) => Promise<number>;
+  logFailure?: (failure: ErrorResult) => Promise<void>;
 };
 
 const HELP = `agent-steward - standalone task routing and stopped-agent decisions
@@ -350,16 +351,25 @@ function decisionExitCode(result: Result | StopResult): number {
   }
 }
 
-function emitError(
+async function logFailure(runtime: Runtime, failure: ErrorResult): Promise<void> {
+  try {
+    await runtime.logFailure?.(failure);
+  } catch {
+    runtime.stderr('agent-steward: launcher_log_unavailable\n');
+  }
+}
+
+async function emitError(
   runtime: Runtime,
   error: unknown,
   requestId: string | null,
   apiKey: string,
   humanRoute: boolean,
-): number {
+): Promise<number> {
   const result = safeError(error, requestId, apiKey);
   emitJson(runtime, result);
   if (humanRoute) runtime.stderr(`agent-steward: ${result.reason_code}\n`);
+  await logFailure(runtime, result);
   return 1;
 }
 
@@ -657,7 +667,10 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       runtime.stdout(renderDecisionCard(safeResult));
     } else {
       emitJson(runtime, safeResult);
-      if (safeResult.decision === 'error' && humanRoute) runtime.stderr(`agent-steward: ${safeResult.reason_code}\n`);
+      if (safeResult.decision === 'error') {
+        if (humanRoute) runtime.stderr(`agent-steward: ${safeResult.reason_code}\n`);
+        await logFailure(runtime, safeResult);
+      }
     }
     return decisionExitCode(safeResult);
   } catch (error) {

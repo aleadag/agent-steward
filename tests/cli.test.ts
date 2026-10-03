@@ -491,6 +491,28 @@ test('config diagnostics omit credential-bearing field names', async () => {
   );
 });
 
+test('successful routing and native nonzero exits do not publish launcher failure logs', async () => {
+  for (const dryRun of [true, false]) {
+    const { post } = fakePost(routeAnswer);
+    const logged: unknown[] = [];
+    const { io, out } = runtime({
+      env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
+      readText: async (path) => (path === CONFIG_PATH ? JSON.stringify(routeConfig()) : JSON.stringify(snapshot([]))),
+      post,
+      launch: async () => 7,
+      logFailure: async (failure) => {
+        logged.push(failure);
+      },
+    });
+    assert.equal(
+      await run(['router', 'start', 'private-task', ...(dryRun ? ['--dry-run', '--json'] : [])], io),
+      dryRun ? 0 : 7,
+    );
+    assert.deepEqual(logged, []);
+    if (!dryRun) assert.equal(out.join(''), '');
+  }
+});
+
 test('ledger write failure does not launch or mislabel a selected route as evaluation_failed', async () => {
   const { post } = fakePost(routeAnswer);
   const writes: string[] = [];

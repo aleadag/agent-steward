@@ -331,7 +331,7 @@ export const FailureDiagnosticsSchema = z.strictObject({
 });
 export type FailureDiagnostics = z.infer<typeof FailureDiagnosticsSchema>;
 
-const ErrorResultSchema = z.strictObject({
+export const ErrorResultSchema = z.strictObject({
   schema_version: z.literal(1),
   request_id: z.union([z.string(), z.null()]),
   decision: z.literal('error'),
