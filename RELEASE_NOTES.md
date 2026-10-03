@@ -1,3 +1,15 @@
+# v0.1.0-alpha.7 — Herdr recover and launcher plugins
+
+Release notes for x86_64-linux dogfooding. Package and Nix metadata report `0.1.0-alpha.7`. Earlier alpha tags remain unchanged.
+
+- Packaged Herdr plugins live under `share/agent-steward/herdr-plugins/`: `agent-steward-recover` (recovery continue and approval handoff) and `agent-steward-launcher` (pane spawn).
+- `run.sh` reads `TYPESAFE_API_KEY_FILE` and `AGENT_STEWARD_HERDR_ADAPTER` so a Nix config can inject the key path and adapter command without rebuilding the plugin.
+- Approvals stay human-only. The package still does not install or activate the plugins.
+
+## Validation and release boundaries
+
+The alpha.7 preparation passed 643 source tests (17 installed-only skips), typecheck, lint, format and x86_64-linux Nix build/help/flake gates. aarch64-linux and Darwin native validation remain outstanding. Enabling the plugins remains a separate opt-in. Automatic permission approval is not enabled.
+
 # v0.1.0-alpha.6 — watch every Herdr agent by default
 
 Release notes for x86_64-linux dogfooding. Package and Nix metadata report `0.1.0-alpha.6`. Earlier alpha tags remain unchanged.
