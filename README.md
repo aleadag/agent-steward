@@ -65,7 +65,7 @@ agent-steward --config ./config.json quota refresh --json
 agent-steward --config ./config.json stop check < stopped-state.json
 ```
 
-The first `router start` command launches the selected native agent in the foreground; the next returns a JSON route preview without launching. The `--` separator ends option parsing. The fourth command previews the literal task `--help`; text after the separator is never treated as a CLI option. For start, stop, and quota refresh, `--config <path>` can appear before or after command tokens, before the separator. List and show reject `--config`. Each route task is exactly one argument; quote multiword tasks. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
+The first `router start` command launches the selected native agent in the foreground; the next returns a JSON route preview without launching. The `--` separator ends option parsing. The fourth command previews the literal task `--help`; text after the separator is never treated as a CLI option. For start, stop, quota refresh, and quota show, `--config <path>` can appear before or after command tokens, before the separator. List and show reject `--config`. Each route task is exactly one argument; quote multiword tasks. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
 
 ### Local route history
 
@@ -108,6 +108,19 @@ Start from [`examples/config.json`](examples/config.json). It shows GPT Astra th
 For agy, configure one Gemini model with ordinary thinking levels, not a separate candidate per effort. Model IDs pass through unchanged: `gemini-3.8-flash` plus `medium` produces `--model=gemini-3.8-flash --effort=medium`. Non-default effort IDs must be `low`, `medium`, `high`, or `max`; `default` omits the effort flag. Jev, the selected result, and the native command retain the configured model and effort without model-suffix translation. Thinking levels contain only `id` and `description`, with no model overrides. AGY handles model-specific availability and effort restrictions; steward does not claim verified runtime selection.
 
 `tools` lists enabled tool IDs. Candidates using a known but disabled tool remain configured and are not considered. Candidate IDs must be unique and unknown fields are rejected. Each candidate names a `quota_bucket`: `codex` allows only `codex`, `pi` allows `pi_codex` or `pi_xai`, and `agy` allows only `antigravity`. Native Codex and Pi Codex snapshots stay separate even when the logins match. Each candidate also has a required finite `cost` greater than zero: a relative ranking hint (for example Luna `1`, Sol `2`), not a bill or live price. `quota_pool` remains a candidate field; provider account IDs, `accounts`, `account_id`, and snapshot paths are not accepted in config. The default evaluator model is `jev-1.13.0`; missing `thresholds.risky` and `thresholds.choiceConfidence` default to `0.60` and `0.45` respectively. Both are finite probabilities in `[0,1]`.
+
+## Show captured quota
+
+Run `agent-steward quota show` to inspect the latest saved snapshots for enabled, configured quota buckets without refreshing them. It reads local snapshots only: no provider calls, credential reads, or writes. Capture and reset times are relative to the current time:
+
+```text
+codex: loaded
+  account "primary": 40% captured remaining (known)
+    captured: 30 minutes ago
+    resets: in 1 hour
+```
+
+Stale measurements are labeled `historical` with a reason, such as `expired` or `reset_passed`; they are not current availability. `--json` returns `decision: "quota_show"` and a `buckets` array with exact timestamps. Each window includes `captured_remaining_percent`; its usable `remaining_percent` is null when stale. Identity fingerprints are omitted. Missing, unreadable, malformed, or identity-mismatched snapshots are reported per bucket and exit 1. Successfully reading every snapshot exits 0, even if measurements are stale or the inventory is empty.
 
 ## Refresh quota snapshots
 

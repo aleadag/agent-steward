@@ -38,6 +38,7 @@ function parseUsageForm(line: string): Invocation {
   form = form.replace('router show <request-id> [--json]', 'router show "generated-id" --json');
   form = form.replace('stop check < stopped-state.json', 'stop check');
   form = form.replace('quota refresh [--json]', 'quota refresh --json');
+  form = form.replace('quota show [--json]', 'quota show --json');
   return parseArgs(shellWords(form));
 }
 
@@ -129,6 +130,7 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
       'list',
       'show',
       'quota-refresh',
+      'quota-show',
       'quota-setup-agy',
       'quota-hook-agy',
       'stop',

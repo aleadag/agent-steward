@@ -5,7 +5,7 @@ import type { Runtime } from '../src/cli.ts';
 import type { Config, Evaluation, SelectedResult, StopInput } from '../src/contracts.ts';
 import type { HttpPost, Questions } from '../src/jev.ts';
 import type { NativeLaunch } from '../src/launch.ts';
-import { config, candidate, choiceAnswer, jevResponse, snapshot } from './helpers.ts';
+import { config, candidate, choiceAnswer, jevResponse, snapshot, windowFact } from './helpers.ts';
 
 type JevWire = { model: string; state: unknown; questions: Questions };
 type PostAnswer = (wire: JevWire, index: number) => unknown;
@@ -192,6 +192,175 @@ function stopAnswer(wire: JevWire, waitingFor = 'recoverable_api_error', risk = 
     risky: { type: 'noul', noul: risk },
   });
 }
+
+test('quota show parses config, JSON and help but rejects extra arguments', () => {
+  assert.deepEqual(parseArgs(['quota', 'show']), { kind: 'quota-show', json: false });
+  assert.deepEqual(parseArgs(['quota', 'show', '--json', '--config', 'custom.json']), {
+    kind: 'quota-show',
+    json: true,
+    config: 'custom.json',
+  });
+  assert.deepEqual(parseArgs(['quota', 'show', '--help']), { kind: 'help' });
+  for (const tail of [['extra'], ['--json', '--json'], ['--'], ['--dry-run']])
+    assert.throws(() => parseArgs(['quota', 'show', ...tail]), { code: 'invalid_input' });
+});
+
+test('quota show is read-only and displays every bucket window once with relative times', async () => {
+  const cfg = config({
+    candidates: [
+      candidate(),
+      candidate({ id: 'duplicate' }),
+      candidate({ id: 'disabled', tool: 'pi', quota_bucket: 'pi_xai' }),
+    ],
+    tools: ['codex'],
+  });
+  const reads: string[] = [];
+  const forbidden = async () => {
+    throw new Error('quota show must be offline and read-only');
+  };
+  const { io, out, err } = runtime({
+    terminal: { stdin: false, stdout: false },
+    readText: async (path) => {
+      reads.push(path);
+      if (path === CONFIG_PATH) return JSON.stringify(cfg);
+      assert.equal(path, SNAPSHOT_PATH);
+      return JSON.stringify(
+        snapshot([
+          windowFact({ type: 'account' }, { id: 'primary', remaining_percent: 0 }),
+          windowFact({ type: 'pool', pool_id: 'unconfigured' }, { id: 'weekly', cadence: 'weekly' }),
+        ]),
+      );
+    },
+    httpGet: forbidden,
+    post: forbidden,
+    collectAgy: forbidden,
+    readStdin: forbidden,
+    writeText: forbidden,
+    mkdirp: forbidden,
+    chmod: forbidden,
+    rename: forbidden,
+    unlink: forbidden,
+    appendText: forbidden,
+  });
+  assert.equal(await run(['quota', 'show'], io), 0);
+  assert.deepEqual(reads, [CONFIG_PATH, SNAPSHOT_PATH]);
+  assert.deepEqual(err, []);
+  assert.match(out.join(''), /primary.*0%.*known/);
+  assert.match(out.join(''), /captured: 30 minutes ago/);
+  assert.match(out.join(''), /resets: in 1 hour/);
+  assert.match(out.join(''), /unconfigured/);
+  assert.doesNotMatch(out.join(''), /2026-|identity_fingerprint/);
+});
+
+test('quota show JSON separates historical measurements from stale usable capacity', async () => {
+  const { io, out } = runtime({
+    readText: async (path) =>
+      path === CONFIG_PATH
+        ? JSON.stringify(config())
+        : JSON.stringify(snapshot([windowFact({ type: 'account' }, { valid_until: NOW.toISOString() })])),
+  });
+  assert.equal(await run(['quota', 'show', '--json'], io), 0);
+  const shown = JSON.parse(out.join(''));
+  assert.equal(shown.decision, 'quota_show');
+  assert.deepEqual(shown.buckets, [
+    {
+      bucket: 'codex',
+      status: 'loaded',
+      windows: [
+        {
+          scope: { type: 'account' },
+          status: 'unknown',
+          reason: 'expired',
+          remaining_percent: null,
+          captured_remaining_percent: 40,
+          observed_at: '2026-09-28T10:00:00Z',
+          reset_at: '2026-09-28T12:00:00Z',
+          valid_until: '2026-09-28T10:30:00.000Z',
+        },
+      ],
+    },
+  ]);
+  assert.doesNotMatch(out.join(''), /identity_fingerprint/);
+});
+
+test('quota show relative times handle seconds, days, future captures and past resets', async () => {
+  for (const [observed_at, reset_at, capture, reset, reason] of [
+    ['2026-09-28T10:29:59Z', '2026-09-28T10:30:01Z', '1 second ago', 'in 1 second', 'known'],
+    ['2026-09-28T10:30:00Z', '2026-09-30T10:30:00Z', 'now', 'in 2 days', 'known'],
+    ['2026-09-28T10:31:00Z', '2026-09-28T12:00:00Z', 'in 1 minute', 'in 1 hour', 'future_observation'],
+    ['2026-09-26T10:30:00Z', '2026-09-28T08:30:00Z', '2 days ago', '2 hours ago', 'reset_passed'],
+  ]) {
+    const { io, out } = runtime({
+      readText: async (path) =>
+        path === CONFIG_PATH
+          ? JSON.stringify(config())
+          : JSON.stringify(
+              snapshot([
+                windowFact(
+                  { type: 'account' },
+                  {
+                    observed_at,
+                    reset_at,
+                    valid_until: reset_at,
+                  },
+                ),
+              ]),
+            ),
+    });
+    assert.equal(await run(['quota', 'show'], io), 0);
+    const text = out.join('');
+    assert.ok(text.includes(`captured: ${capture}`), text);
+    assert.ok(text.includes(`resets: ${reset}`), text);
+    assert.ok(text.includes(reason!), text);
+    if (reason !== 'known') assert.match(text, /historical/);
+  }
+});
+
+test('quota show reports missing and invalid snapshots without leaking data', async () => {
+  for (const [input, status] of [
+    [null, 'missing'],
+    ['{broken', 'malformed'],
+    [JSON.stringify(snapshot([], { source: 'pi_xai' })), 'identity_mismatch'],
+    [new Error('private read error'), 'unreadable'],
+  ] as const) {
+    const { io, out, err } = runtime({
+      readText: async (path) => {
+        if (path === CONFIG_PATH) return JSON.stringify(config());
+        if (input === null) throw Object.assign(new Error('private missing'), { code: 'ENOENT' });
+        if (input instanceof Error) throw input;
+        return input;
+      },
+    });
+    assert.equal(await run(['quota', 'show', '--json'], io), 1);
+    assert.deepEqual(JSON.parse(out.join('')).buckets, [{ bucket: 'codex', status, windows: [] }]);
+    assert.deepEqual(err, [`agent-steward: quota_${status}\n`]);
+    assert.doesNotMatch(out.join('') + err.join(''), /private|broken/);
+  }
+});
+
+test('quota show blocks credential-shaped snapshot labels and handles empty inventory', async () => {
+  const { io, out } = runtime({
+    readText: async (path) =>
+      path === CONFIG_PATH
+        ? JSON.stringify(config())
+        : JSON.stringify(
+            snapshot([
+              windowFact(
+                { type: 'account' },
+                {
+                  id: 'sk-' + 'x'.repeat(30),
+                },
+              ),
+            ]),
+          ),
+  });
+  assert.equal(await run(['quota', 'show', '--json'], io), 1);
+  assert.equal(JSON.parse(out.join('')).reason_code, 'credential_detected');
+  assert.doesNotMatch(out.join(''), /sk-/);
+  const empty = runtime();
+  assert.equal(await run(['quota', 'show', '--json'], empty.io), 0);
+  assert.deepEqual(JSON.parse(empty.out.join('')).buckets, []);
+});
 
 test('quota refresh parses only config, json and help options', () => {
   assert.deepEqual(parseArgs(['quota', 'refresh']), { kind: 'quota-refresh', json: false });

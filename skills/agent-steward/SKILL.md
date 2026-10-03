@@ -1,6 +1,6 @@
 ---
 name: agent-steward
-description: Use to route and launch a task with agent-steward, refresh local quota snapshots, or assess a stopped agent. Session inspection and effort adjustment are not supported.
+description: Use to route and launch a task with agent-steward, inspect or refresh local quota snapshots, or assess a stopped agent. Session inspection and effort adjustment are not supported.
 ---
 
 # Agent Steward
@@ -20,6 +20,7 @@ agent-steward router list
 agent-steward router list --json
 agent-steward router show "generated-id" --json
 agent-steward --config ./config.json quota refresh --json
+agent-steward --config ./config.json quota show --json
 agent-steward quota setup agy
 agent-steward quota hook agy
 agent-steward --config ./config.json stop check < stopped-state.json
@@ -32,6 +33,10 @@ The `--` separator ends option parsing. Everything after it is one task argument
 `router list` and `router show` read local history without config, credentials, or Jev. List defaults to 20 folded records; `--limit <n>` changes display only. The ledger ID is Jev's `request_id`, not a workflow or native session ID. `exited` means the native process returned, not that the assigned job succeeded. Missing history yields an empty list; an unknown ID yields `agent-steward: not_found` and exit 2.
 
 Events are stored in `$XDG_STATE_HOME/agent-steward/router.jsonl`, falling back to `$HOME/.local/state/agent-steward/router.jsonl`, with directory mode `0700` and file mode `0600`. History stores credential-checked decision fields and evaluator usage, never tasks/prompts, keys, pane IDs, PIDs, or planned-command displays.
+
+## Show captured quota
+
+Use `quota show [--json]` to inspect saved snapshots for enabled, configured buckets without refreshing. Human output shows each measured window's captured remaining percentage, relative capture/reset times, and freshness. Historical values are labeled with their stale reason and are not current capacity. JSON uses `decision: "quota_show"`, exact timestamps, and `captured_remaining_percent`; stale usable `remaining_percent` is null. Fingerprints are omitted. No auth reads, provider calls, writes, Jev key, or TTY are needed. Missing or invalid snapshots report per-bucket statuses and exit 1; loaded snapshots, including stale or empty ones, and empty inventories exit 0.
 
 ## Refresh quota
 

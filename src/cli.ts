@@ -4,7 +4,7 @@ import { loadConfig } from './config.ts';
 import { validateCandidateSyntax, shellQuote } from './commands.ts';
 import { agyPaths } from './agy-setup.ts';
 import { assertByteLength, assertJsonDepth } from './limits.ts';
-import { loadQuota } from './quota.ts';
+import { inspectQuota, loadQuota } from './quota.ts';
 import { refreshQuota } from './quota-refresh.ts';
 import type { QuotaRefreshIO } from './quota-refresh.ts';
 import { assertNoCredentials } from './privacy.ts';
@@ -26,7 +26,8 @@ export type Invocation =
   | { kind: 'list'; limit: number; json: boolean }
   | { kind: 'show'; requestId: string; json: boolean }
   | { kind: 'stop'; config?: string }
-  | { kind: 'quota-refresh'; config?: string; json: boolean };
+  | { kind: 'quota-refresh'; config?: string; json: boolean }
+  | { kind: 'quota-show'; config?: string; json: boolean };
 
 export type Runtime = QuotaRefreshIO & {
   env: QuotaRefreshIO['env'] & { XDG_CONFIG_HOME?: string; TYPESAFE_API_KEY?: string };
@@ -62,6 +63,7 @@ Usage:
   agent-steward router list --json
   agent-steward router show <request-id> [--json]
   agent-steward [--config <path>] quota refresh [--json]
+  agent-steward [--config <path>] quota show [--json]
   agent-steward quota setup agy
   agent-steward quota hook agy
   agent-steward [--config <path>] stop check < stopped-state.json
@@ -75,7 +77,8 @@ Router list/show read local request history only, without config or Jev. List de
 History never stores task text; exited means native-process return, not job success.
 Quota refresh collects Codex/Pi/AGY quota into $XDG_STATE_HOME/agent-steward/quota/ (default ~/.local/state/agent-steward/quota/).
 AGY requires explicit hook setup and native trust of its dedicated workdir; missing quota remains unknown.
-Routing reads snapshots only. Refresh/setup/hook need no Jev key or caller terminal.
+Quota show reads saved snapshots only, with relative capture/reset times; stale percentages are historical.
+Routing reads snapshots only. Show/refresh/setup/hook need no Jev key or caller terminal.
 Stop check reads JSON from stdin and writes a version-2 JSON result.
 `;
 
@@ -157,12 +160,15 @@ export function parseArgs(argv: readonly string[]): Invocation {
     return { kind: commandTokens[1] === 'setup' ? 'quota-setup-agy' : 'quota-hook-agy' };
   }
 
-  if (commandTokens[0] === 'quota' && commandTokens[1] === 'refresh') {
+  if (commandTokens[0] === 'quota' && (commandTokens[1] === 'refresh' || commandTokens[1] === 'show')) {
     if (separator >= 0) invalidInput();
     const flags = commandTokens.slice(2);
     if (flags.length > 1 || flags.some((flag) => flag !== '--json')) invalidInput();
     if (help) return { kind: 'help' };
-    const invocation: Invocation = { kind: 'quota-refresh', json: flags.length === 1 };
+    const invocation: Extract<Invocation, { kind: 'quota-refresh' | 'quota-show' }> = {
+      kind: commandTokens[1] === 'refresh' ? 'quota-refresh' : 'quota-show',
+      json: flags.length === 1,
+    };
     return config === undefined ? invocation : { ...invocation, config };
   }
 
@@ -418,6 +424,43 @@ function assertRoutePreflight(config: Awaited<ReturnType<typeof loadConfig>>): v
   for (const candidate of candidates) validateCandidateSyntax(candidate);
 }
 
+function relativeTime(timestamp: string, now: Date): string {
+  const seconds = (Date.parse(timestamp) - now.getTime()) / 1000;
+  if (Math.abs(seconds) < 1) return 'now';
+  for (const [unit, size] of [
+    ['day', 86400],
+    ['hour', 3600],
+    ['minute', 60],
+    ['second', 1],
+  ] as const) {
+    if (Math.abs(seconds) < size) continue;
+    const count = Math.floor(Math.abs(seconds) / size);
+    const duration = `${count} ${unit}${count === 1 ? '' : 's'}`;
+    return seconds > 0 ? `in ${duration}` : `${duration} ago`;
+  }
+  return 'now';
+}
+
+function renderQuota(buckets: Awaited<ReturnType<typeof inspectQuota>>, now: Date): string {
+  const lines: string[] = [];
+  for (const { bucket, status, windows } of buckets) {
+    lines.push(`${bucket}: ${status}`);
+    for (const window of windows) {
+      const scope = window.scope.type === 'account' ? 'account' : `pool ${jsonValue(window.scope.pool_id)}`;
+      const label = window.id === undefined ? '' : ` ${jsonValue(window.id)}`;
+      const cadence = window.cadence === undefined ? '' : ` (${window.cadence})`;
+      const freshness = window.status === 'known' ? 'known' : `historical, ${window.reason}`;
+      lines.push(
+        `  ${scope}${label}${cadence}: ${window.captured_remaining_percent}% captured remaining (${freshness})`,
+        `    captured: ${relativeTime(window.observed_at, now)}`,
+        `    resets: ${relativeTime(window.reset_at, now)}`,
+      );
+    }
+    if (status === 'loaded' && windows.length === 0) lines.push('  no measured windows');
+  }
+  return lines.length === 0 ? 'No enabled quota buckets.\n' : `${lines.join('\n')}\n`;
+}
+
 export async function run(argv: readonly string[], runtime: Runtime): Promise<number> {
   let invocation: Invocation;
   try {
@@ -473,6 +516,27 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     } catch {
       runtime.stderr(`${DIAGNOSTICS.quota_malformed}\n`);
       return 1;
+    }
+  }
+  if (invocation.kind === 'quota-show') {
+    try {
+      requestId = safeRequestId(runtime.newRequestId(), apiKey);
+      if (requestId === null) throw new StewardError('credential_detected');
+      const config = await loadConfig(invocation.config, runtime);
+      const now = runtime.now();
+      const buckets = await inspectQuota(config, {
+        env: runtime.env,
+        readText: runtime.readText,
+        now,
+        diagnostic: (code) => runtime.stderr(`${DIAGNOSTICS[code]}\n`),
+      });
+      const result = { schema_version: 1, request_id: requestId, decision: 'quota_show', buckets };
+      assertNoCredentials(result, apiKey);
+      if (invocation.json) runtime.stdout(`${JSON.stringify(result)}\n`);
+      else runtime.stdout(renderQuota(buckets, now));
+      return buckets.every(({ status }) => status === 'loaded') ? 0 : 1;
+    } catch (error) {
+      return emitError(runtime, error, requestId, apiKey, !invocation.json);
     }
   }
   if (invocation.kind === 'quota-refresh') {

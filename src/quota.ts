@@ -107,6 +107,31 @@ function summaryStatus(windows: readonly QuotaWindowFact[]): 'known' | 'unknown'
   return windows.length > 0 && windows.every((window) => window.status === 'known') ? 'known' : 'unknown';
 }
 
+export async function inspectQuota(
+  config: Config,
+  io: { env: QuotaEnv; readText: ReadText; now: Date; diagnostic: Diagnostic },
+) {
+  if (!Number.isFinite(io.now.getTime())) throw new StewardError('invalid_input');
+  const now = io.now.toISOString();
+  const enabled = new Set(config.tools);
+  const buckets = new Set(
+    config.candidates.filter((candidate) => enabled.has(candidate.tool)).map((candidate) => candidate.quota_bucket),
+  );
+  const result = [];
+  for (const bucket of buckets) {
+    const loaded = await readSnapshot(bucket, io.env, io.readText, io.diagnostic);
+    const windows =
+      loaded.status === 'loaded'
+        ? loaded.snapshot.windows.map((window) => ({
+            ...classifyWindow(window, now),
+            captured_remaining_percent: window.remaining_percent,
+          }))
+        : [];
+    result.push({ bucket, status: loaded.status, windows });
+  }
+  return result;
+}
+
 export async function loadQuota(
   config: Config,
   io: {
