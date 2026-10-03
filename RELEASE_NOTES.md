@@ -1,3 +1,14 @@
+# v0.1.0-alpha.6 — watch every Herdr agent by default
+
+Release notes for x86_64-linux dogfooding. Package and Nix metadata report `0.1.0-alpha.6`. Earlier alpha tags remain unchanged.
+
+- The optional Herdr adapter watches every pane Herdr reports as an agent (`agent_session`). Ordinary terminals are not watched. You do not need to list pane IDs. An optional `targets.json` `pane_ids` list still restricts watching if present and nonempty.
+- Same agent-agnostic session identity and opaque pane IDs as alpha.5. Approvals stay human-only. The package still does not install or activate the plugin.
+
+## Validation and release boundaries
+
+The alpha.6 preparation passed 643 source tests (17 installed-only skips), typecheck, lint, format and x86_64-linux Nix build/help/flake gates. aarch64-linux and Darwin native validation remain outstanding. Enabling the plugin remains a separate opt-in. Automatic permission approval is not enabled.
+
 # v0.1.0-alpha.5 — agent-agnostic Herdr stop adapter
 
 Release notes for x86_64-linux dogfooding. Package and Nix metadata report `0.1.0-alpha.5`. Earlier alpha tags remain unchanged.
