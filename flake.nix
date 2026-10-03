@@ -63,7 +63,7 @@
       };
       package = pkgs.stdenv.mkDerivation {
         pname = "agent-steward";
-        version = "0.1.0-alpha.7";
+        version = "0.1.0-alpha.8";
         src = source;
         nativeBuildInputs = [ pkgs.bun pkgs.bash pkgs.coreutils pkgs.makeWrapper ];
         doCheck = true;

@@ -1,3 +1,16 @@
+# v0.1.0-alpha.8 — TypeScript Herdr pane launcher
+
+Release notes for x86_64-linux dogfooding. Package and Nix metadata report `0.1.0-alpha.8`. Earlier alpha tags remain unchanged.
+
+- `bin/steward-spawn` now ships with agent-steward. Pane layout selection, Herdr calls and private launch-file creation use TypeScript rather than Bash and embedded Python.
+- The CLI preserves literal task argv, credential stripping before Herdr calls, private temporary-file permissions and largest-pane split geometry. It resolves the configured `agent-steward` command on PATH.
+- The `steward-spawn` Nix package exposes only the helper, avoiding collisions with a configured `agent-steward` wrapper. Installed security/argv tests now live in this repository.
+- Neither Herdr plugin is automatically installed or activated. Approvals stay human-only.
+
+## Validation and release boundaries
+
+The alpha.8 preparation passed 643 source tests (17 installed-only skips), typecheck, lint, format and x86_64-linux Nix build/help/flake gates, including installed spawn checks. aarch64-linux and Darwin native validation remain outstanding. Live plugin activation requires separate opt-in.
+
 # v0.1.0-alpha.7 — Herdr recover and launcher plugins
 
 Release notes for x86_64-linux dogfooding. Package and Nix metadata report `0.1.0-alpha.7`. Earlier alpha tags remain unchanged.
