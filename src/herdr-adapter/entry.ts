@@ -10,7 +10,7 @@ import { StopInputSchema, StopResultSchema } from '../contracts.ts';
 import { assertNoCredentials } from '../privacy.ts';
 import { observeStop } from './observe.ts';
 import { deliverProposal } from './deliver.ts';
-import { handleBestEffortApproval } from './best-effort-approval.ts';
+import { approvalMenu, handleBestEffortApproval } from './best-effort-approval.ts';
 import { runScheduler, type SchedulerResult } from './scheduler.ts';
 import type { HerdrControl } from './deliver.ts';
 import type { HerdrReader, AgentSnapshot, ReadSnapshot } from './observe.ts';
@@ -79,8 +79,11 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
   };
   const assess = async () => {
     if (!admissionOpen()) return;
-    if (exitEvent || (event.agent_status !== 'blocked' && event.agent_status !== 'idle')) {
-      if (!exitEvent && !['working', 'done', 'unknown'].includes(event.agent_status ?? '')) return;
+    if (
+      exitEvent ||
+      (event.agent_status !== 'blocked' && event.agent_status !== 'idle' && event.agent_status !== 'done')
+    ) {
+      if (!exitEvent && !['working', 'unknown'].includes(event.agent_status ?? '')) return;
       if (!admissionOpen()) return;
       const owns = await stillOwner();
       if (!admissionOpen() || !owns) return;
@@ -306,6 +309,20 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       return;
     }
     if (history && (history as Episode).last_delivery_state !== 'none') return;
+    if (observed.status === 'done' && !deps.autoApprove && approvalMenu(observed.context)) {
+      if (history) {
+        const stillOwned = await stillOwner();
+        if (!admissionOpen()) return;
+        if (!stillOwned) {
+          await notify('human_review_required');
+          return;
+        }
+        await deps.store.record(observed.pane_id, { ...history, next_check_at: null, last_delivery_state: 'human' });
+        if (!admissionOpen()) return;
+      }
+      await notify('human_review_required');
+      return;
+    }
     if (
       history &&
       (history as Episode).next_check_at &&

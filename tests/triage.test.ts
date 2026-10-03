@@ -125,7 +125,7 @@ test('unknown adapter state never produces an actionable proposal', async () => 
   }
 });
 
-test('idle permits only current-episode recovery with current error evidence', async () => {
+test('idle permits current-episode recovery with current error evidence', async () => {
   const recover = await assess('recoverable_api_error', { status: 'idle' });
   assert.equal(recover.proposed_action.kind, 'send_recovery_instruction');
 
@@ -138,12 +138,31 @@ test('idle permits only current-episode recovery with current error evidence', a
   const noCurrentError = input({ status: 'idle', context: null, pending_action: null });
   assert.deepEqual(retryProposal(noCurrentError, 'recoverable_api_error', now), { kind: 'manual_review' });
 
-  for (const waitingFor of ['approve_edit', 'quota_limit'] as const) {
+  for (const waitingFor of ['approve_edit'] as const) {
     const result = await assess(waitingFor, {
       status: 'idle',
       pending_action: { action: 'Current pending edit', target: 'draft.md' },
     });
     assert.equal(result.proposed_action.kind, 'manual_review');
+  }
+});
+
+test('ready idle and done errors retain recovery and quota deadlines without approving', async () => {
+  for (const status of ['idle', 'done'] as const) {
+    const recover = await assess('recoverable_api_error', { status });
+    assert.equal(recover.proposed_action.kind, 'send_recovery_instruction');
+    if (recover.proposed_action.kind === 'send_recovery_instruction')
+      assert.equal(recover.proposed_action.not_before, '2026-09-29T10:00:30.000Z');
+    const quota = await assess('quota_limit', { status });
+    assert.deepEqual(quota.proposed_action, { kind: 'wait_for_quota', not_before: '2026-09-29T10:05:00.000Z' });
+    for (const waitingFor of ['approve_command', 'approve_edit', 'answer_question'] as const) {
+      const result = await assess(waitingFor, { status, pending_action: { action: 'Edit', target: 'draft.md' } });
+      assert.equal(result.proposed_action.kind, 'manual_review');
+    }
+    for (const waitingFor of ['recoverable_api_error', 'quota_limit'] as const) {
+      const foreign = await assess(waitingFor, { status, current_episode_id: 'different' });
+      assert.equal(foreign.proposed_action.kind, 'manual_review');
+    }
   }
 });
 

@@ -29,7 +29,7 @@ export type ObservedStop = {
   session_id: string;
   session_kind: string;
   session_source: string;
-  status: 'blocked' | 'idle';
+  status: 'blocked' | 'idle' | 'done';
   revision: number;
   state_change_seq: number;
   context: string;
@@ -51,7 +51,7 @@ function identity(pane: AgentSnapshot, paneId: string): string | null {
   const session = pane.agent_session;
   if (
     pane.pane_id !== paneId ||
-    (pane.agent_status !== 'blocked' && pane.agent_status !== 'idle') ||
+    (pane.agent_status !== 'blocked' && pane.agent_status !== 'idle' && pane.agent_status !== 'done') ||
     !Number.isSafeInteger(pane.revision) ||
     !Number.isSafeInteger(pane.state_change_seq) ||
     pane.workspace_id !== paneId.split(':')[0]
@@ -130,7 +130,7 @@ export async function observeStop(herdr: HerdrReader, paneId: string): Promise<O
     session_id: sessionId,
     session_kind: sessionKind,
     session_source: sessionSource,
-    status: before.agent_status as 'blocked' | 'idle',
+    status: before.agent_status as 'blocked' | 'idle' | 'done',
     revision: before.revision,
     state_change_seq: before.state_change_seq,
     context: read.text,

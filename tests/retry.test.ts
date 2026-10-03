@@ -104,6 +104,26 @@ test('recovery deliveries use episode-anchored 30s, 2m, and 8m deadlines then es
   assert.deepEqual(retryProposal(exhausted, 'recoverable_api_error', now), { kind: 'manual_review' });
 });
 
+test('ready done and idle errors preserve bounded recovery and quota proposals', () => {
+  for (const status of ['done', 'idle'] as const) {
+    assert.deepEqual(retryProposal(input({ status }), 'recoverable_api_error', now), {
+      kind: 'send_recovery_instruction',
+      not_before: '2026-09-29T10:00:30.000Z',
+      instruction:
+        'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.',
+    });
+    assert.deepEqual(retryProposal(input({ status }), 'quota_limit', now), {
+      kind: 'wait_for_quota',
+      not_before: '2026-09-29T10:05:00.000Z',
+    });
+    const exhausted = input({ status, retry: { ...input().retry, attempt_count: 3, last_attempt_at: first } });
+    assert.deepEqual(retryProposal(exhausted, 'recoverable_api_error', now), { kind: 'manual_review' });
+    assert.deepEqual(retryProposal(input({ status }), 'quota_limit', new Date('2026-09-30T10:00:00Z')), {
+      kind: 'manual_review',
+    });
+  }
+});
+
 test('invalid recovery episode chronology fails closed', () => {
   const cases = [
     input({
@@ -295,8 +315,7 @@ test('foreign episode history and non-actionable statuses fail closed', () => {
   assert.deepEqual(retryProposal(input({ status: 'unknown' }), 'recoverable_api_error', now), {
     kind: 'manual_review',
   });
-  assert.deepEqual(retryProposal(input({ status: 'done' }), 'quota_limit', now), { kind: 'manual_review' });
-  assert.deepEqual(retryProposal(input({ status: 'idle' }), 'quota_limit', now), { kind: 'manual_review' });
+  assert.deepEqual(retryProposal(input({ status: 'unknown' }), 'quota_limit', now), { kind: 'manual_review' });
 });
 
 test('quota history must be chronological and hands off after 24 hours', () => {

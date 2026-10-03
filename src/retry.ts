@@ -42,7 +42,7 @@ function manual(): Proposal {
 function recovery(input: StopInput, now: string): Proposal {
   const retry = input.retry;
   if (!contextPresent(input) || retry.failure_episode_id !== input.current_episode_id) return manual();
-  if (input.status !== 'blocked' && input.status !== 'idle') return manual();
+  if (input.status !== 'blocked' && input.status !== 'idle' && input.status !== 'done') return manual();
   if (!validHistory(retry.first_observed_at, retry.attempt_count, retry.last_attempt_at, now)) return manual();
   const delays = [30_000, 2 * minute, 8 * minute];
   const delay = delays[retry.attempt_count];
@@ -56,7 +56,11 @@ function recovery(input: StopInput, now: string): Proposal {
 
 function quota(input: StopInput, now: string): Proposal {
   const retry = input.retry;
-  if (!contextPresent(input) || retry.failure_episode_id !== input.current_episode_id || input.status !== 'blocked')
+  if (
+    !contextPresent(input) ||
+    retry.failure_episode_id !== input.current_episode_id ||
+    (input.status !== 'blocked' && input.status !== 'idle' && input.status !== 'done')
+  )
     return manual();
   if (!validHistory(retry.first_observed_at, retry.quota_check_count, retry.last_quota_check_at, now)) return manual();
   const deadline = addMilliseconds(retry.first_observed_at, 24 * 60 * minute);

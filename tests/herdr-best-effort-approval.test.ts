@@ -14,7 +14,7 @@ import {
 import { runScheduler, type SchedulerOptions } from '../src/herdr-adapter/scheduler.ts';
 import { EpisodeStore } from '../src/herdr-adapter/state.ts';
 import { assessStop } from '../src/triage.ts';
-import type { AgentSnapshot } from '../src/herdr-adapter/observe.ts';
+import { observeStop, type AgentSnapshot } from '../src/herdr-adapter/observe.ts';
 import type { Evaluation, StopInput } from '../src/contracts.ts';
 
 const at = '2026-10-03T12:00:00Z';
@@ -173,6 +173,78 @@ test('global best-effort mode assesses idle permission UI and sends only one key
     f.changeText(dialog('printf next-probe'));
     await f.run();
     assert.equal(f.keys.length, 2);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('recognized permission reported done is approved only in global approval mode', async () => {
+  const f = await fixture();
+  try {
+    f.changePane({ agent_status: 'done' });
+    assert.equal((await observeStop(f.herdr, 'w1:p1'))?.status, 'done');
+    await f.run();
+    assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+    assert.equal(f.inputs.length, 2);
+    assert.ok(f.inputs.every((input) => input.status === 'blocked'));
+    await f.run();
+    assert.equal(f.keys.length, 1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('done permission menus remain default-off', async () => {
+  const f = await fixture(false);
+  try {
+    f.changePane({ agent_status: 'done' });
+    await f.run();
+    assert.deepEqual(f.keys, []);
+    assert.deepEqual(f.inputs, []);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('done permission menus still require the existing risk policy', async () => {
+  const f = await fixture();
+  try {
+    f.changePane({ agent_status: 'done' });
+    f.setRisk(0.6);
+    await f.run();
+    assert.equal(f.inputs.length, 1);
+    assert.deepEqual(f.keys, []);
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'human');
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('done with error text retains recovery quarantine even with approval enabled', async () => {
+  const f = await fixture();
+  try {
+    await f.store.record('w1:p1', {
+      pane_id: 'w1:p1',
+      session_id: 's1',
+      failure_episode_id: 'old-error',
+      error_evidence_digest: 'old-digest',
+      first_observed_at: at,
+      attempt_count: 2,
+      last_attempt_at: at,
+      quota_check_count: 0,
+      last_quota_check_at: null,
+      next_check_at: at,
+      last_delivery_state: 'none',
+    });
+    f.changePane({ agent_status: 'done' });
+    f.changeText('API Error: connection timed out');
+    await f.run();
+    assert.deepEqual(f.keys, []);
+    assert.deepEqual(f.inputs, []);
+    const history = await f.store.retry('w1:p1');
+    assert.equal(history?.attempt_count, 2);
+    assert.equal(history?.last_delivery_state, 'human');
+    assert.equal(history?.next_check_at, null);
   } finally {
     await f.cleanup();
   }
@@ -381,36 +453,39 @@ test('approval requires an episode lock', async () => {
 });
 
 // Catches requiring preexisting saved targets instead of discovering all current/new agent panels.
-test('global scheduler discovers a permission pane with no saved episode', async () => {
-  const f = await fixture();
-  const abort = new AbortController();
-  try {
-    await f.store.release(f.deps.leaseToken!);
-    const send = f.herdr.sendKeys;
-    f.herdr.sendKeys = async (pane, keys) => {
-      await send(pane, keys);
-      abort.abort();
-    };
-    const options: SchedulerOptions & { autoApprove: boolean } = {
-      store: f.store,
-      herdr: f.herdr,
-      decide: f.deps.decide,
-      sessionId: 'server-1',
-      signal: abort.signal,
-      autoApprove: true,
-      clock: f.deps.clock,
-    };
-    const deadline = setTimeout(() => abort.abort(), 2000);
+for (const status of ['idle', 'done'] as const) {
+  test(`global scheduler discovers a ${status} permission pane with no saved episode`, async () => {
+    const f = await fixture();
+    const abort = new AbortController();
     try {
-      assert.equal(await runScheduler(options), 'stopped');
+      f.changePane({ agent_status: status });
+      await f.store.release(f.deps.leaseToken!);
+      const send = f.herdr.sendKeys;
+      f.herdr.sendKeys = async (pane, keys) => {
+        await send(pane, keys);
+        abort.abort();
+      };
+      const options: SchedulerOptions & { autoApprove: boolean } = {
+        store: f.store,
+        herdr: f.herdr,
+        decide: f.deps.decide,
+        sessionId: 'server-1',
+        signal: abort.signal,
+        autoApprove: true,
+        clock: f.deps.clock,
+      };
+      const deadline = setTimeout(() => abort.abort(), 2000);
+      try {
+        assert.equal(await runScheduler(options), 'stopped');
+      } finally {
+        clearTimeout(deadline);
+      }
+      assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
     } finally {
-      clearTimeout(deadline);
+      await f.cleanup();
     }
-    assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
-  } finally {
-    await f.cleanup();
-  }
-});
+  });
+}
 
 // Catches failing to pass the global setting through the real config entrypoint.
 test('one adapter setting enables all panels without pane_ids; malformed enable values stay off', async () => {

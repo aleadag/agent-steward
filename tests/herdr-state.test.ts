@@ -198,6 +198,43 @@ test('due check re-observes and advances quota history, never recovery attempts'
   await store.release(lease);
 });
 
+test('done quota episode survives scheduler restart and advances only due check history', async () => {
+  const store = await base();
+  const reader = { ...herdr(), get: async () => pane({ agent_status: 'done' }) };
+  const observed = await observe(reader, 'w1:p1');
+  const record = { ...episode(observed.current_episode_id), error_evidence_digest: observed.error_evidence_digest };
+  await store.record('w1:p1', record);
+  const ctrl = new AbortController();
+  const handoffs: HandoffReason[] = [];
+  const calls: StopInput[] = [];
+  const deadline = setTimeout(() => ctrl.abort(), 100);
+  try {
+    await runScheduler({
+      store,
+      herdr: reader,
+      decide: async (input) => {
+        calls.push(input);
+        return decision(input);
+      },
+      targets: ['w1:p1'],
+      sessionId: 'server-1',
+      signal: ctrl.signal,
+      clock: { now: () => now },
+      handoff: collect(handoffs),
+    });
+    assert.deepEqual(handoffs, []);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.status, 'done');
+    const saved = await requireEpisode(store);
+    assert.equal(saved.quota_check_count, 1);
+    assert.equal(saved.attempt_count, 0);
+    assert.equal(saved.next_check_at, '2026-09-29T10:20:00.000Z');
+  } finally {
+    clearTimeout(deadline);
+    ctrl.abort();
+  }
+});
+
 // A failed due decision must not trigger another CLI call on each 100ms scheduler wake.
 test('failed due CLI quarantines the episode across repeated scheduler wakes', async () => {
   const store = await base();

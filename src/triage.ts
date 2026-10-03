@@ -187,16 +187,11 @@ export async function assessStop(
     }
     return decisionResult({ requestId, action: { kind: 'no_action' }, reason: 'completed', waitingFor, ...evidence });
   }
-  if (validInput.status === 'done') {
-    return decisionResult({
-      requestId,
-      action: { kind: 'manual_review' },
-      reason: 'unclear_waiting_state',
-      waitingFor,
-      ...evidence,
-    });
-  }
-  if (validInput.status === 'idle' && waitingFor !== 'recoverable_api_error') {
+  if (
+    (validInput.status === 'idle' || validInput.status === 'done') &&
+    waitingFor !== 'recoverable_api_error' &&
+    waitingFor !== 'quota_limit'
+  ) {
     return decisionResult({
       requestId,
       action: { kind: 'manual_review' },

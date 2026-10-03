@@ -74,7 +74,8 @@ async function reconcileSaved(
           await handoff('observation_unavailable');
           return;
         }
-        const stopped = current?.agent_status === 'blocked' || current?.agent_status === 'idle';
+        const stopped =
+          current?.agent_status === 'blocked' || current?.agent_status === 'idle' || current?.agent_status === 'done';
         if (!ownership.admissionOpen()) return;
         const observed = stopped ? await observeStop(herdr, pane) : null;
         if (!ownership.admissionOpen()) return;
@@ -143,7 +144,10 @@ export async function reconcileDue(
         if (!admissionOpen()) return null;
         const live = await herdr.get(pane);
         if (!admissionOpen()) return null;
-        if (!live || (live.agent_status !== 'blocked' && live.agent_status !== 'idle')) {
+        if (
+          !live ||
+          (live.agent_status !== 'blocked' && live.agent_status !== 'idle' && live.agent_status !== 'done')
+        ) {
           if (ownership) {
             const allowed = await owns(store, ownership);
             if (!admissionOpen()) return null;

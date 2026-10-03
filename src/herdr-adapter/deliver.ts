@@ -83,7 +83,7 @@ export async function deliverProposal(
   if (!admissionOpen()) return 'human';
   if (
     !fresh ||
-    fresh.status !== 'idle' ||
+    (fresh.status !== 'idle' && fresh.status !== 'done') ||
     !sameEpisode(fresh, record) ||
     fresh.agent !== observation.agent ||
     fresh.session_kind !== observation.session_kind ||
@@ -137,7 +137,7 @@ export async function deliverProposal(
   if (!admissionOpen()) return 'human';
   if (
     !immediatelyBefore ||
-    immediatelyBefore.status !== 'idle' ||
+    (immediatelyBefore.status !== 'idle' && immediatelyBefore.status !== 'done') ||
     !sameEpisode(immediatelyBefore, record) ||
     immediatelyBefore.agent !== fresh.agent ||
     immediatelyBefore.session_kind !== fresh.session_kind ||
