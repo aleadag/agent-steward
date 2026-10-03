@@ -322,6 +322,15 @@ const LocalApprovalResultSchema = z.strictObject({
   risk_probability: z.null(),
   evaluation: z.null(),
 });
+export const FailureDiagnosticsSchema = z.strictObject({
+  stage: z.enum(['input', 'config', 'preflight', 'quota', 'credentials', 'evaluation', 'response', 'launch']),
+  kind: z.enum(['read', 'json', 'schema', 'http', 'network', 'timeout']).optional(),
+  config_fields: z.array(z.string().min(1).max(256)).max(16).optional(),
+  http_status: z.number().int().min(100).max(599).optional(),
+  duration_ms: z.number().int().nonnegative().optional(),
+});
+export type FailureDiagnostics = z.infer<typeof FailureDiagnosticsSchema>;
+
 const ErrorResultSchema = z.strictObject({
   schema_version: z.literal(1),
   request_id: z.union([z.string(), z.null()]),
@@ -337,6 +346,7 @@ const ErrorResultSchema = z.strictObject({
     'launch_failed',
   ]),
   message: z.string(),
+  diagnostics: FailureDiagnosticsSchema.optional(),
 });
 const StopRecoveryInstructionSchema = z.literal(
   'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.',
@@ -531,11 +541,14 @@ export type QuotaSource = z.infer<typeof QuotaSourceSchema>;
 
 export type ReadText = (path: string) => Promise<string>;
 export type Diagnostic = (code: string) => void;
-export type ConfigEnv = { HOME?: string; XDG_CONFIG_HOME?: string };
+export type ConfigEnv = { HOME?: string; XDG_CONFIG_HOME?: string; TYPESAFE_API_KEY?: string };
 export type ErrorCode = ErrorResult['reason_code'];
 
 export class StewardError extends Error {
-  constructor(public readonly code: ErrorCode) {
+  constructor(
+    public readonly code: ErrorCode,
+    public readonly diagnostics?: FailureDiagnostics,
+  ) {
     super(code);
     this.name = 'StewardError';
   }
@@ -561,5 +574,6 @@ export function errorResult(error: unknown, requestId: string | null): ErrorResu
     decision: 'error',
     reason_code: code,
     message: ERROR_MESSAGES[code],
+    ...(error instanceof StewardError && error.diagnostics !== undefined ? { diagnostics: error.diagnostics } : {}),
   };
 }

@@ -136,6 +136,34 @@ test('malformed or oversized JSON is rejected without echoing its contents', asy
   }
 });
 
+test('config diagnostics distinguish read, JSON and nested schema failures without values', async () => {
+  for (const [kind, readText, fields] of [
+    [
+      'read',
+      async () => {
+        throw new Error('private-file-path');
+      },
+      undefined,
+    ],
+    ['json', async () => '{private-content', undefined],
+    [
+      'schema',
+      jsonReader(config({ candidates: [{ ...config().candidates[0], cost: 'private-value' }] })),
+      ['candidates.0.cost'],
+    ],
+  ] as const) {
+    await assert.rejects(loadConfig(undefined, { env: { HOME: '/isolated/home' }, cwd, readText }), (error) => {
+      if (!(error instanceof StewardError)) return false;
+      assert.equal(error.code, 'invalid_config');
+      assert.equal(error.diagnostics?.stage, 'config');
+      assert.equal(error.diagnostics?.kind, kind);
+      assert.deepEqual(error.diagnostics?.config_fields, fields);
+      assert.doesNotMatch(JSON.stringify(error), /private-/);
+      return true;
+    });
+  }
+});
+
 test('unknown fields, credential fields, and prototype keys fail without mutation', async () => {
   const raw: Record<string, unknown> = { ...config(), api_key: 'not-a-real-secret' };
   await rejectsConfig(jsonReader(raw));

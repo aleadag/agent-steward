@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { z } from 'zod';
-import { StewardError } from './contracts.ts';
+import { FailureDiagnosticsSchema, StewardError } from './contracts.ts';
 import { assertNoCredentials } from './privacy.ts';
 
 const EventSchema = z
@@ -21,6 +21,19 @@ const EventSchema = z
       .optional(),
     usage: z.object({ input_tokens: z.number().optional(), output_tokens: z.number().optional() }).strict().optional(),
     exit_code: z.number().int().optional(),
+    reason_code: z
+      .enum([
+        'invalid_input',
+        'invalid_config',
+        'missing_credentials',
+        'credential_detected',
+        'invalid_response',
+        'evaluation_failed',
+        'interactive_terminal_required',
+        'launch_failed',
+      ])
+      .optional(),
+    diagnostics: FailureDiagnosticsSchema.optional(),
   })
   .strict();
 

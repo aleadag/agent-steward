@@ -461,7 +461,10 @@ test('fake post observes the 30-second deadline abort and exposes no request or 
       hasCode(error, 'evaluation_failed') &&
       !error.message.includes(upstreamSecret) &&
       !error.message.includes(bodyMarker) &&
-      !error.message.includes('unit-key-not-live'),
+      !error.message.includes('unit-key-not-live') &&
+      error.diagnostics?.stage === 'evaluation' &&
+      error.diagnostics.kind === 'timeout' &&
+      Number.isInteger(error.diagnostics.duration_ms),
   );
   assert.deepEqual(deadlines, [30_000]);
 });
@@ -516,6 +519,24 @@ test('transport exceptions and non-success statuses are safe and never retried',
     );
   }
   assert.equal(calls, 6);
+});
+
+test('invalid response diagnostics preserve safe status and timing only', async () => {
+  for (const body of ['private-response-body', JSON.stringify({ private: 'unit-key-not-live' })]) {
+    const evaluate = makeEvaluator({
+      model: 'jev-1.13.0',
+      apiKey: 'unit-key-not-live',
+      post: async () => ({ status: 200, body }),
+    });
+    await assert.rejects(evaluate({}, requestedQuestions()), (error) => {
+      if (!hasCode(error, 'invalid_response')) return false;
+      assert.equal(error.diagnostics?.stage, 'response');
+      assert.equal(error.diagnostics?.http_status, 200);
+      assert.ok(Number.isInteger(error.diagnostics?.duration_ms));
+      assert.doesNotMatch(JSON.stringify(error), /private-response-body|unit-key-not-live/);
+      return true;
+    });
+  }
 });
 
 test('malformed, oversized, and deeply nested fake-post responses fail as invalid_response', async () => {

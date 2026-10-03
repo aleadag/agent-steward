@@ -192,7 +192,7 @@ function mapInputError(error: unknown): never {
 
 export function makeEvaluator(options: { model: string; apiKey: string; post: HttpPost }): Evaluate {
   if (typeof options.apiKey !== 'string' || options.apiKey.trim().length === 0)
-    throw new StewardError('missing_credentials');
+    throw new StewardError('missing_credentials', { stage: 'credentials' });
 
   return async (state, questions) => {
     let body: string;
@@ -211,31 +211,44 @@ export function makeEvaluator(options: { model: string; apiKey: string; post: Ht
       mapInputError(error);
     }
 
+    const started = performance.now();
+    const signal = AbortSignal.timeout(30_000);
+    const duration = (): number => Math.max(0, Math.round(performance.now() - started));
     let response: { status: number; body: string };
     try {
       response = await options.post({
         url: 'https://api.typesafe.ai/v1/systemone',
         headers: { authorization: `Bearer ${options.apiKey}`, 'content-type': 'application/json' },
         body,
-        signal: AbortSignal.timeout(30_000),
+        signal,
       });
     } catch (error) {
-      if (error instanceof StewardError && error.code === 'invalid_response') throw error;
-      throw new StewardError('evaluation_failed');
+      const invalid = error instanceof StewardError && error.code === 'invalid_response';
+      throw new StewardError(invalid ? 'invalid_response' : 'evaluation_failed', {
+        stage: invalid ? 'response' : 'evaluation',
+        ...(!invalid ? ({ kind: signal.aborted ? 'timeout' : 'network' } as const) : {}),
+        duration_ms: duration(),
+      });
     }
 
-    if (response.status < 200 || response.status >= 300) throw new StewardError('evaluation_failed');
-    if (typeof response.body !== 'string') throw invalidResponse();
+    const timing = {
+      duration_ms: duration(),
+      ...(Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+        ? { http_status: response.status }
+        : {}),
+    };
+    if (response.status < 200 || response.status >= 300)
+      throw new StewardError('evaluation_failed', { stage: 'evaluation', kind: 'http', ...timing });
 
-    let parsed: unknown;
     try {
+      if (typeof response.body !== 'string') throw invalidResponse();
       assertByteLength(response.body);
-      parsed = JSON.parse(response.body);
+      const parsed: unknown = JSON.parse(response.body);
       assertJsonDepth(parsed);
+      return validateEvaluation(parsed, questions);
     } catch {
-      throw invalidResponse();
+      throw new StewardError('invalid_response', { stage: 'response', ...timing });
     }
-    return validateEvaluation(parsed, questions);
   };
 }
 

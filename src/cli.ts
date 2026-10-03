@@ -1,5 +1,5 @@
 import { StopInputSchema, StopResultSchema, StewardError, errorResult } from './contracts.ts';
-import type { ErrorResult, Result, SelectedResult, StopInput, StopResult } from './contracts.ts';
+import type { ErrorResult, FailureDiagnostics, Result, SelectedResult, StopInput, StopResult } from './contracts.ts';
 import { loadConfig } from './config.ts';
 import { validateCandidateSyntax, shellQuote } from './commands.ts';
 import { agyPaths } from './agy-setup.ts';
@@ -506,7 +506,12 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     }
   }
 
-  const recordEvent = async (event: LedgerEventKind, selected?: SelectedResult, exitCode?: number): Promise<void> => {
+  const recordEvent = async (
+    event: LedgerEventKind,
+    selected?: SelectedResult,
+    exitCode?: number,
+    failure?: ErrorResult,
+  ): Promise<void> => {
     if (requestId === null) return;
     await appendEvent(runtime, {
       schema_version: 1,
@@ -526,10 +531,17 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
             usage: selected.evaluations.pair.usage,
           }),
       ...(exitCode === undefined ? {} : { exit_code: exitCode }),
+      ...(failure === undefined
+        ? {}
+        : {
+            reason_code: failure.reason_code,
+            ...(failure.diagnostics === undefined ? {} : { diagnostics: failure.diagnostics }),
+          }),
     });
   };
   let routeDecisionKnown = false;
   const humanRoute = invocation.kind === 'route' && !invocation.json;
+  let stage: FailureDiagnostics['stage'] = 'input';
   try {
     let stopInput: StopInput | undefined;
     if (invocation.kind === 'stop') {
@@ -542,6 +554,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       );
     }
 
+    stage = 'config';
     const config = await loadConfig(invocation.config, {
       env: runtime.env,
       cwd: runtime.cwd,
@@ -550,7 +563,9 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
 
     let quota: Awaited<ReturnType<typeof loadQuota>> | undefined;
     if (invocation.kind === 'route') {
+      stage = 'preflight';
       assertRoutePreflight(config);
+      stage = 'quota';
       quota = await loadQuota(config, {
         env: runtime.env,
         readText: runtime.readText,
@@ -562,12 +577,13 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     let evaluator: ReturnType<typeof makeEvaluator> | undefined;
     const evaluate: Evaluate = async (state: unknown, questions: Questions) => {
       if (evaluator === undefined) {
-        if (apiKey.trim().length === 0) throw new StewardError('missing_credentials');
+        if (apiKey.trim().length === 0) throw new StewardError('missing_credentials', { stage: 'credentials' });
         evaluator = makeEvaluator({ model: config.jev.model, apiKey, post: runtime.post });
       }
       return evaluator(state, questions);
     };
 
+    stage = 'evaluation';
     let result: Result | StopResult;
     if (invocation.kind === 'route') {
       result = await route({ task: invocation.task, requestId: requestId!, config, quota: quota!, evaluate });
@@ -575,6 +591,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       result = await assessStop(stopInput!, { thresholds: config.thresholds, evaluate, now: runtime.now() });
     }
 
+    stage = 'response';
     if (invocation.kind === 'stop') {
       let safeResult: StopResult;
       try {
@@ -608,6 +625,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
 
     routeDecisionKnown = true;
     if (!invocation.dryRun && safeResult.decision === 'selected') {
+      stage = 'launch';
       const command = buildNativeLaunch(safeResult.planned_command, invocation.task);
       const summary =
         `agent-steward: requested tool=${jsonValue(safeResult.selected.tool)}; ` +
@@ -622,14 +640,19 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       try {
         exitCode = await runtime.launch(command);
       } catch {
-        await recordEvent('launch-failed');
-        return emitError(runtime, new StewardError('launch_failed'), requestId, apiKey, true);
+        const failure = new StewardError('launch_failed', { stage: 'launch' });
+        await recordEvent('launch-failed', undefined, undefined, safeError(failure, requestId, apiKey));
+        return emitError(runtime, failure, requestId, apiKey, true);
       }
       await recordEvent('exited', undefined, exitCode);
       return exitCode;
     }
     if (safeResult.decision === 'selected') await recordEvent('dry-run', safeResult);
-    else if (safeResult.decision === 'error') await recordEvent('evaluation_failed');
+    else if (safeResult.decision === 'error') {
+      safeResult = { ...safeResult, diagnostics: { stage } };
+      safeResult = safeError(new StewardError(safeResult.reason_code, safeResult.diagnostics), requestId, apiKey);
+      await recordEvent('evaluation_failed', undefined, undefined, safeResult);
+    }
     if (safeResult.decision === 'selected' && !invocation.json) {
       runtime.stdout(renderDecisionCard(safeResult));
     } else {
@@ -638,15 +661,20 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     }
     return decisionExitCode(safeResult);
   } catch (error) {
+    const failure = new StewardError(
+      errorResult(error, requestId).reason_code,
+      error instanceof StewardError && error.diagnostics !== undefined ? error.diagnostics : { stage },
+    );
     if (invocation.kind === 'stop') {
-      emitJson(runtime, safeStopError(error, requestId, apiKey));
+      emitJson(runtime, safeStopError(failure, requestId, apiKey));
       return 1;
     }
     try {
-      if (!routeDecisionKnown) await recordEvent('evaluation_failed');
+      if (!routeDecisionKnown)
+        await recordEvent('evaluation_failed', undefined, undefined, safeError(failure, requestId, apiKey));
     } catch (ledgerError) {
       return emitError(runtime, ledgerError, requestId, apiKey, humanRoute);
     }
-    return emitError(runtime, error, requestId, apiKey, humanRoute);
+    return emitError(runtime, failure, requestId, apiKey, humanRoute);
   }
 }

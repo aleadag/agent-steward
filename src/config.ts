@@ -2,6 +2,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { ConfigSchema, StewardError } from './contracts.ts';
 import type { Config, ConfigEnv, ReadText } from './contracts.ts';
 import { assertByteLength, assertJsonDepth } from './limits.ts';
+import { assertNoCredentials } from './privacy.ts';
 
 export async function loadConfig(
   override: string | undefined,
@@ -11,6 +12,7 @@ export async function loadConfig(
     readText: ReadText;
   },
 ): Promise<Config> {
+  let kind: 'read' | 'json' | 'schema' = 'read';
   try {
     let configPath: string;
     if (override !== undefined) {
@@ -30,10 +32,43 @@ export async function loadConfig(
 
     const contents = await io.readText(configPath);
     assertByteLength(contents);
+    kind = 'json';
     const parsed: unknown = JSON.parse(contents);
     assertJsonDepth(parsed);
-    return ConfigSchema.parse(parsed);
-  } catch {
-    throw new StewardError('invalid_config');
+    kind = 'schema';
+    const result = ConfigSchema.safeParse(parsed);
+    if (!result.success) {
+      const fields = result.error.issues
+        .flatMap((issue) =>
+          issue.code === 'unrecognized_keys' ? issue.keys.map((key) => [...issue.path, key]) : [issue.path],
+        )
+        .filter(
+          (parts) =>
+            parts.length > 0 &&
+            parts.every(
+              (part) =>
+                typeof part === 'number' || (typeof part === 'string' && /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(part)),
+            ),
+        )
+        .map((parts) => parts.join('.'))
+        .filter((field) => {
+          if (field.length > 256) return false;
+          try {
+            assertNoCredentials(field, io.env.TYPESAFE_API_KEY ?? '');
+            return true;
+          } catch {
+            return false;
+          }
+        });
+      throw new StewardError('invalid_config', {
+        stage: 'config',
+        kind,
+        config_fields: [...new Set(fields)].slice(0, 16),
+      });
+    }
+    return result.data;
+  } catch (error) {
+    if (error instanceof StewardError && error.code === 'invalid_config') throw error;
+    throw new StewardError('invalid_config', { stage: 'config', kind });
   }
 }

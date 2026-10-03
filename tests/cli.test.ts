@@ -427,6 +427,70 @@ test('route history records dry-run, native exit, launch failure and evaluation 
   }
 });
 
+test('failure diagnostics survive router show without leaking config values or HTTP bodies', async () => {
+  for (const mode of ['config', 'credentials', 'http', 'network']) {
+    const { io, out, files } = runtime({
+      env: {
+        HOME: '/isolated/home',
+        XDG_CONFIG_HOME: '/isolated/xdg',
+        ...(mode === 'credentials' ? {} : { TYPESAFE_API_KEY: 'Synthetic-Key-333' }),
+      },
+      readText: async (path) =>
+        path === CONFIG_PATH
+          ? JSON.stringify(
+              mode === 'config' ? { ...routeConfig(), auto_approve: 'private-config-value' } : routeConfig(),
+            )
+          : JSON.stringify(snapshot([])),
+      post: async () => {
+        if (mode === 'network') throw new Error('private-network-details Synthetic-Key-333');
+        return { status: 401, body: 'private-http-body Synthetic-Key-333' };
+      },
+    });
+    assert.equal(await run(['router', 'start', 'private-task', '--dry-run', '--json'], io), 1);
+    const failure = result(out);
+    assert.equal(
+      failure.reason_code,
+      mode === 'config' ? 'invalid_config' : mode === 'credentials' ? 'missing_credentials' : 'evaluation_failed',
+    );
+    assert.equal(
+      failure.diagnostics.stage,
+      mode === 'credentials' ? 'credentials' : mode === 'config' ? 'config' : 'evaluation',
+    );
+    if (mode === 'config') assert.deepEqual(failure.diagnostics.config_fields, ['auto_approve']);
+    if (mode === 'http') assert.equal(failure.diagnostics.http_status, 401);
+    if (mode === 'http' || mode === 'network') {
+      assert.equal(failure.diagnostics.kind, mode);
+      assert.ok(Number.isInteger(failure.diagnostics.duration_ms) && failure.diagnostics.duration_ms >= 0);
+    }
+    out.length = 0;
+    assert.equal(await run(['router', 'show', 'generated-1', '--json'], io), 0);
+    const shown = JSON.parse(out.join(''));
+    assert.equal(shown.reason_code, failure.reason_code);
+    assert.deepEqual(shown.diagnostics, failure.diagnostics);
+    assert.doesNotMatch([...files.values()].join('') + out.join(''), /private-|Synthetic-Key-333/);
+  }
+});
+
+test('config diagnostics omit credential-bearing field names', async () => {
+  const { io, out, files } = runtime({
+    env: { HOME: '/isolated/home', TYPESAFE_API_KEY: 'SyntheticKey333' },
+    readText: async () =>
+      JSON.stringify({
+        ...routeConfig(),
+        SyntheticKey333: true,
+        github_pat_abcdefghijklmnopqrstuvwxyz: true,
+        auto_approve: true,
+      }),
+  });
+  assert.equal(await run(['router', 'start', 'task', '--dry-run', '--json'], io), 1);
+  assert.equal(result(out).reason_code, 'invalid_config');
+  assert.deepEqual(result(out).diagnostics.config_fields, ['auto_approve']);
+  assert.doesNotMatch(
+    out.join('') + [...files.values()].join(''),
+    /SyntheticKey333|github_pat_abcdefghijklmnopqrstuvwxyz/,
+  );
+});
+
 test('ledger write failure does not launch or mislabel a selected route as evaluation_failed', async () => {
   const { post } = fakePost(routeAnswer);
   const writes: string[] = [];
