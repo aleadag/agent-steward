@@ -245,11 +245,119 @@ test('quota show is read-only and displays every bucket window once with relativ
   assert.equal(await run(['quota', 'show'], io), 0);
   assert.deepEqual(reads, [CONFIG_PATH, SNAPSHOT_PATH]);
   assert.deepEqual(err, []);
-  assert.match(out.join(''), /primary.*0%.*known/);
-  assert.match(out.join(''), /captured: 30 minutes ago/);
-  assert.match(out.join(''), /resets: in 1 hour/);
+  assert.match(out.join(''), /primary.*░{20}\s+0%/);
+  assert.match(out.join(''), /all captured 30m ago/);
+  assert.match(out.join(''), /resets in 1h/);
   assert.match(out.join(''), /unconfigured/);
   assert.doesNotMatch(out.join(''), /2026-|identity_fingerprint/);
+});
+
+test('quota show renders aligned bars and rounds only the displayed percentage', async () => {
+  const { io, out } = runtime({
+    terminal: { stdin: false, stdout: false },
+    readText: async (path) =>
+      path === CONFIG_PATH
+        ? JSON.stringify(config())
+        : JSON.stringify(
+            snapshot([
+              windowFact({ type: 'account' }, { id: 'primary', cadence: 'weekly', remaining_percent: 86 }),
+              windowFact({ type: 'account' }, { id: 'credits', cadence: 'weekly', remaining_percent: 63 }),
+              windowFact({ type: 'account' }, { id: 'reserve', cadence: 'weekly', remaining_percent: 100 }),
+              windowFact({ type: 'pool', pool_id: 'gemini' }, { id: '5h', remaining_percent: 99.19171 }),
+              windowFact({ type: 'pool', pool_id: 'gemini' }, { id: 'weekly', remaining_percent: 87.33336 }),
+            ]),
+          ),
+  });
+  assert.equal(await run(['quota', 'show'], io), 0);
+  const text = out.join('');
+  assert.match(text, /^codex · loaded\n/);
+  assert.match(text, /primary\s+weekly\s+█████████████████░░░\s+86%\s+resets in 1h/);
+  assert.match(text, /credits\s+weekly\s+█████████████░░░░░░░\s+63%/);
+  assert.match(text, /reserve\s+weekly\s+████████████████████\s+100%/);
+  assert.match(text, /gemini\s+5h\s+████████████████████\s+99\.2%/);
+  assert.match(text, /gemini\s+weekly\s+█████████████████░░░\s+87\.3%/);
+  const rows = text.split('\n').filter((line) => line.includes('█'));
+  assert.equal(new Set(rows.map((line) => line.indexOf('█'))).size, 1);
+  assert.match(text, /\n\nCaptured remaining · all captured 30m ago\n$/);
+  assert.equal(text.match(/captured/g)?.length, 1);
+  assert.ok(!text.includes('\u001b'));
+  assert.doesNotMatch(text, /99\.19171|87\.33336/);
+  out.length = 0;
+  assert.equal(await run(['quota', 'show', '--json'], io), 0);
+  const windows = JSON.parse(out.join('')).buckets[0].windows;
+  assert.equal(windows[3].captured_remaining_percent, 99.19171);
+  assert.equal(windows[4].captured_remaining_percent, 87.33336);
+});
+
+test('quota show keeps individual capture times and historical warnings when captures differ', async () => {
+  const { io, out } = runtime({
+    readText: async (path) =>
+      path === CONFIG_PATH
+        ? JSON.stringify(config())
+        : JSON.stringify(
+            snapshot([
+              windowFact({ type: 'account' }, { id: 'fresh' }),
+              windowFact(
+                { type: 'account' },
+                {
+                  id: 'old',
+                  observed_at: '2026-09-28T09:30:00Z',
+                  valid_until: NOW.toISOString(),
+                },
+              ),
+            ]),
+          ),
+  });
+  assert.equal(await run(['quota', 'show'], io), 0);
+  const text = out.join('');
+  assert.match(text, /fresh.*captured 30m ago/);
+  assert.match(text, /old.*captured 1h ago.*historical, expired/);
+  assert.match(text, /Captured remaining\n$/);
+  assert.doesNotMatch(text, /all captured/);
+});
+
+test('quota show escapes unsafe display labels and handles text empty inventory', async () => {
+  const { io, out } = runtime({
+    readText: async (path) =>
+      path === CONFIG_PATH
+        ? JSON.stringify(config())
+        : JSON.stringify(snapshot([windowFact({ type: 'account' }, { id: 'line\n\u001b[31m' })])),
+  });
+  assert.equal(await run(['quota', 'show'], io), 0);
+  assert.ok(out.join('').includes('"line\\n\\u001b[31m"'));
+  assert.ok(!out.join('').includes('\u001b'));
+  const empty = runtime();
+  assert.equal(await run(['quota', 'show'], empty.io), 0);
+  assert.equal(empty.out.join(''), 'No enabled quota buckets.\n');
+});
+
+test('quota show groups providers and shares equivalent capture timestamps across buckets', async () => {
+  const cfg = config({ candidates: [candidate(), candidate({ id: 'pi', tool: 'pi', quota_bucket: 'pi_codex' })] });
+  const { io, out } = runtime({
+    readText: async (path) => {
+      if (path === CONFIG_PATH) return JSON.stringify(cfg);
+      const source = path === SNAPSHOT_PATH ? 'codex' : 'pi_codex';
+      return JSON.stringify(
+        snapshot(
+          [
+            windowFact(
+              { type: 'account' },
+              {
+                id: source === 'codex' ? 'primary' : 'reserve',
+                observed_at: source === 'codex' ? '2026-09-28T10:00:00Z' : '2026-09-28T10:00:00.000Z',
+              },
+            ),
+          ],
+          { source },
+        ),
+      );
+    },
+  });
+  assert.equal(await run(['quota', 'show'], io), 0);
+  const text = out.join('');
+  assert.match(text, /^codex · loaded\n  primary/);
+  assert.match(text, /\n\npi_codex · loaded\n  reserve/);
+  assert.equal(text.match(/all captured 30m ago/g)?.length, 1);
 });
 
 test('quota show JSON separates historical measurements from stale usable capacity', async () => {
@@ -285,10 +393,10 @@ test('quota show JSON separates historical measurements from stale usable capaci
 
 test('quota show relative times handle seconds, days, future captures and past resets', async () => {
   for (const [observed_at, reset_at, capture, reset, reason] of [
-    ['2026-09-28T10:29:59Z', '2026-09-28T10:30:01Z', '1 second ago', 'in 1 second', 'known'],
-    ['2026-09-28T10:30:00Z', '2026-09-30T10:30:00Z', 'now', 'in 2 days', 'known'],
-    ['2026-09-28T10:31:00Z', '2026-09-28T12:00:00Z', 'in 1 minute', 'in 1 hour', 'future_observation'],
-    ['2026-09-26T10:30:00Z', '2026-09-28T08:30:00Z', '2 days ago', '2 hours ago', 'reset_passed'],
+    ['2026-09-28T10:29:59Z', '2026-09-28T10:30:01Z', '1s ago', 'in 1s', 'known'],
+    ['2026-09-28T10:30:00Z', '2026-09-30T10:30:00Z', 'now', 'in 2d', 'known'],
+    ['2026-09-28T10:31:00Z', '2026-09-28T12:00:00Z', 'in 1m', 'in 1h', 'future_observation'],
+    ['2026-09-26T10:30:00Z', '2026-09-28T08:30:00Z', '2d ago', '2h ago', 'reset_passed'],
   ]) {
     const { io, out } = runtime({
       readText: async (path) =>
@@ -309,10 +417,9 @@ test('quota show relative times handle seconds, days, future captures and past r
     });
     assert.equal(await run(['quota', 'show'], io), 0);
     const text = out.join('');
-    assert.ok(text.includes(`captured: ${capture}`), text);
-    assert.ok(text.includes(`resets: ${reset}`), text);
-    assert.ok(text.includes(reason!), text);
-    if (reason !== 'known') assert.match(text, /historical/);
+    assert.ok(text.includes(`all captured ${capture}`), text);
+    assert.ok(text.includes(`resets ${reset}`), text);
+    if (reason !== 'known') assert.ok(text.includes(`historical, ${reason}`), text);
   }
 });
 

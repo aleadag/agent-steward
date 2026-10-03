@@ -428,37 +428,60 @@ function relativeTime(timestamp: string, now: Date): string {
   const seconds = (Date.parse(timestamp) - now.getTime()) / 1000;
   if (Math.abs(seconds) < 1) return 'now';
   for (const [unit, size] of [
-    ['day', 86400],
-    ['hour', 3600],
-    ['minute', 60],
-    ['second', 1],
+    ['d', 86400],
+    ['h', 3600],
+    ['m', 60],
+    ['s', 1],
   ] as const) {
     if (Math.abs(seconds) < size) continue;
     const count = Math.floor(Math.abs(seconds) / size);
-    const duration = `${count} ${unit}${count === 1 ? '' : 's'}`;
+    const duration = `${count}${unit}`;
     return seconds > 0 ? `in ${duration}` : `${duration} ago`;
   }
   return 'now';
 }
 
 function renderQuota(buckets: Awaited<ReturnType<typeof inspectQuota>>, now: Date): string {
+  if (buckets.length === 0) return 'No enabled quota buckets.\n';
+  const displayLabel = (value: string): string => (/^[\w.-]+$/.test(value) ? value : jsonValue(value));
+  const groups = buckets.map(({ bucket, status, windows }) => ({
+    bucket,
+    status,
+    rows: windows.map((window) => ({
+      window,
+      label: displayLabel(window.scope.type === 'account' ? (window.id ?? 'account') : window.scope.pool_id),
+      period: displayLabel(
+        window.scope.type === 'account' ? (window.cadence ?? '—') : (window.id ?? window.cadence ?? '—'),
+      ),
+    })),
+  }));
+  const rows = groups.flatMap((group) => group.rows);
+  const labelWidth = Math.max(0, ...rows.map((row) => row.label.length));
+  const periodWidth = Math.max(0, ...rows.map((row) => row.period.length));
+  const captureTimes = new Set(rows.map(({ window }) => Date.parse(window.observed_at)));
+  const sharedCapture = captureTimes.size === 1;
   const lines: string[] = [];
-  for (const { bucket, status, windows } of buckets) {
-    lines.push(`${bucket}: ${status}`);
-    for (const window of windows) {
-      const scope = window.scope.type === 'account' ? 'account' : `pool ${jsonValue(window.scope.pool_id)}`;
-      const label = window.id === undefined ? '' : ` ${jsonValue(window.id)}`;
-      const cadence = window.cadence === undefined ? '' : ` (${window.cadence})`;
-      const freshness = window.status === 'known' ? 'known' : `historical, ${window.reason}`;
+  for (const { bucket, status, rows } of groups) {
+    if (lines.length > 0) lines.push('');
+    lines.push(`${bucket} · ${status}`);
+    for (const { window, label, period } of rows) {
+      const percent = window.captured_remaining_percent;
+      const filled = Math.round(percent / 5);
+      const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
+      const percentage = `${Math.round(percent * 10) / 10}%`.padStart(6);
+      const captured = sharedCapture ? '' : `   captured ${relativeTime(window.observed_at, now)}`;
+      const warning = window.status === 'known' ? '' : `   (historical, ${window.reason})`;
       lines.push(
-        `  ${scope}${label}${cadence}: ${window.captured_remaining_percent}% captured remaining (${freshness})`,
-        `    captured: ${relativeTime(window.observed_at, now)}`,
-        `    resets: ${relativeTime(window.reset_at, now)}`,
+        `  ${label.padEnd(labelWidth)}   ${period.padEnd(periodWidth)}  ${bar} ${percentage}   resets ${relativeTime(window.reset_at, now)}${captured}${warning}`,
       );
     }
-    if (status === 'loaded' && windows.length === 0) lines.push('  no measured windows');
+    if (status === 'loaded' && rows.length === 0) lines.push('  no measured windows');
   }
-  return lines.length === 0 ? 'No enabled quota buckets.\n' : `${lines.join('\n')}\n`;
+  if (rows.length > 0) {
+    const captured = sharedCapture ? ` · all captured ${relativeTime(rows[0]!.window.observed_at, now)}` : '';
+    lines.push('', `Captured remaining${captured}`);
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 export async function run(argv: readonly string[], runtime: Runtime): Promise<number> {

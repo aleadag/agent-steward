@@ -111,14 +111,16 @@ For agy, configure one Gemini model with ordinary thinking levels, not a separat
 
 ## Show captured quota
 
-Run `agent-steward quota show` to inspect the latest saved snapshots for enabled, configured quota buckets without refreshing them. It reads local snapshots only: no provider calls, credential reads, or writes. Capture and reset times are relative to the current time:
+Run `agent-steward quota show` to inspect the latest saved snapshots for enabled, configured quota buckets without refreshing them. It reads local snapshots only: no provider calls, credential reads, or writes. The text display groups windows by provider, with 20-character remaining-percentage bars and percentages rounded to one decimal place. Capture and reset times are relative to the current time:
 
 ```text
-codex: loaded
-  account "primary": 40% captured remaining (known)
-    captured: 30 minutes ago
-    resets: in 1 hour
+codex · loaded
+  primary   weekly  ████████░░░░░░░░░░░░    40%   resets in 1h
+
+Captured remaining · all captured 30m ago
 ```
+
+When capture timestamps differ, each row shows its own capture time instead of a shared footer. `--json` preserves full percentage precision.
 
 Stale measurements are labeled `historical` with a reason, such as `expired` or `reset_passed`; they are not current availability. `--json` returns `decision: "quota_show"` and a `buckets` array with exact timestamps. Each window includes `captured_remaining_percent`; its usable `remaining_percent` is null when stale. Identity fingerprints are omitted. Missing, unreadable, malformed, or identity-mismatched snapshots are reported per bucket and exit 1. Successfully reading every snapshot exits 0, even if measurements are stale or the inventory is empty.
 
