@@ -10,6 +10,7 @@ import { StopInputSchema, StopResultSchema } from '../contracts.ts';
 import { assertNoCredentials } from '../privacy.ts';
 import { observeStop } from './observe.ts';
 import { deliverProposal } from './deliver.ts';
+import { handleBestEffortApproval } from './best-effort-approval.ts';
 import { runScheduler, type SchedulerResult } from './scheduler.ts';
 import type { HerdrControl } from './deliver.ts';
 import type { HerdrReader, AgentSnapshot, ReadSnapshot } from './observe.ts';
@@ -24,11 +25,14 @@ type Store = {
   retry: (paneId: string) => Promise<Episode | null>;
   record: (paneId: string, retry: Episode) => Promise<void>;
   clear?: (paneId: string) => Promise<void>;
+  approval?: EpisodeStore['approval'];
+  recordApproval?: EpisodeStore['recordApproval'];
   withEpisodeLock?: <T>(paneId: string, action: () => Promise<T>) => Promise<T | null>;
 };
 type HandoffReason = 'observation_unavailable' | 'decision_failed' | 'human_review_required';
 export type EventDeps = {
-  herdr: HerdrReader & Partial<Pick<HerdrControl, 'prompt'>>;
+  herdr: HerdrReader & Partial<Pick<HerdrControl, 'prompt' | 'sendKeys'>>;
+  autoApprove?: boolean;
   decide: (input: StopInput) => Promise<unknown>;
   store: Store;
   clock: { now: () => Date };
@@ -240,6 +244,8 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       await notify('observation_unavailable');
       return;
     }
+    if (await handleBestEffortApproval(observed, deps, stillOwner)) return;
+    if (!admissionOpen()) return;
     const history = existing;
     const quarantine = async (reason: HandoffReason) => {
       if (!admissionOpen()) return;
@@ -534,7 +540,11 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
 }
 
 // Herdr 0.9.1 newline-delimited socket protocol for bounded observation.
-async function request(socketPath: string, method: 'agent.get' | 'agent.read', params: object): Promise<unknown> {
+async function request(
+  socketPath: string,
+  method: 'agent.get' | 'agent.read' | 'agent.list',
+  params: object,
+): Promise<unknown> {
   return await new Promise((resolve, reject) => {
     const socket = connect(socketPath);
     const id = randomUUID();
@@ -569,6 +579,11 @@ async function request(socketPath: string, method: 'agent.get' | 'agent.read', p
 
 export function socketReader(path: string): HerdrReader {
   return {
+    list: async () => {
+      const result = (await request(path, 'agent.list', {})) as { type?: string; agents?: AgentSnapshot[] };
+      if (result.type !== 'agent_list' || !Array.isArray(result.agents)) throw new Error('Invalid Herdr agent list');
+      return result.agents;
+    },
     get: async (paneId) => {
       const result = (await request(path, 'agent.get', { target: paneId })) as { type?: string; agent?: AgentSnapshot };
       return result.type === 'agent_info' ? (result.agent ?? null) : null;
@@ -589,11 +604,32 @@ export function socketReader(path: string): HerdrReader {
 // Use Herdr's agent prompt command: it enforces blocked-dialog permission controls.
 // An exit, signal, or timeout after invocation is ambiguous; the episode was already
 // marked uncertain before spawn and must never be automatically retried.
-function socketControl(path: string, binary: string | undefined): HerdrReader & Partial<Pick<HerdrControl, 'prompt'>> {
+function socketControl(
+  path: string,
+  binary: string | undefined,
+): HerdrReader & Partial<Pick<HerdrControl, 'prompt' | 'sendKeys'>> {
   const reader = socketReader(path);
   if (!binary || !isAbsolute(binary)) return reader;
+  const invoke = async (args: string[]) =>
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(binary, args, { stdio: 'ignore', env: { ...process.env, HERDR_SOCKET_PATH: path } });
+      const timer = setTimeout(() => child.kill('SIGKILL'), 8_000);
+      child.once('error', () => {
+        clearTimeout(timer);
+        reject(new Error('Herdr key outcome unknown'));
+      });
+      child.once('close', (code) => {
+        clearTimeout(timer);
+        if (code !== 0) reject(new Error('Herdr key outcome unknown'));
+        else resolve();
+      });
+    });
   return {
     ...reader,
+    sendKeys: async (paneId, keys) => {
+      if (keys.length !== 1 || keys[0] !== '1') throw new Error('Invalid approval input');
+      await invoke(['agent', 'send-keys', paneId, '1']);
+    },
     prompt: async (paneId, instruction) =>
       await new Promise<void>((resolve, reject) => {
         const child = spawn(binary, ['agent', 'prompt', paneId, instruction], {
@@ -707,13 +743,17 @@ async function visibleHandoff(env: NodeJS.ProcessEnv, reason: HandoffReason): Pr
     });
   });
 }
-async function targetsFrom(env: NodeJS.ProcessEnv): Promise<readonly string[] | 'all'> {
+async function adapterConfigFrom(
+  env: NodeJS.ProcessEnv,
+): Promise<{ targets: readonly string[] | 'all'; autoApprove: boolean }> {
   const config = JSON.parse(await readFile(`${env.HERDR_PLUGIN_CONFIG_DIR}/targets.json`, 'utf8'));
-  if (!Object.hasOwn(config, 'pane_ids') || (Array.isArray(config.pane_ids) && config.pane_ids.length === 0))
-    return 'all';
-  return Array.isArray(config.pane_ids) && config.pane_ids.every((id: unknown) => typeof id === 'string')
-    ? config.pane_ids
-    : [];
+  const targets =
+    !Object.hasOwn(config, 'pane_ids') || (Array.isArray(config.pane_ids) && config.pane_ids.length === 0)
+      ? 'all'
+      : Array.isArray(config.pane_ids) && config.pane_ids.every((id: unknown) => typeof id === 'string')
+        ? config.pane_ids
+        : [];
+  return { targets, autoApprove: config.auto_approve === true };
 }
 export async function runEvent(env: NodeJS.ProcessEnv, decide: EventDeps['decide'] = decideWithCli): Promise<void> {
   if (
@@ -725,13 +765,14 @@ export async function runEvent(env: NodeJS.ProcessEnv, decide: EventDeps['decide
     return;
   let event: EventTrigger;
   let targets: readonly string[] | 'all';
+  let autoApprove = false;
   try {
     event = JSON.parse(env.HERDR_PLUGIN_EVENT_JSON);
   } catch {
     return;
   }
   try {
-    targets = await targetsFrom(env);
+    ({ targets, autoApprove } = await adapterConfigFrom(env));
   } catch {
     targets = 'all';
   }
@@ -751,6 +792,7 @@ export async function runEvent(env: NodeJS.ProcessEnv, decide: EventDeps['decide
     leaseToken,
     clock: { now: () => new Date() },
     targets,
+    autoApprove,
     handoff: (reason) => visibleHandoff(env, reason),
     sessionValid: async () => (await socketSession(env.HERDR_SOCKET_PATH!)) === sessionId,
   });
@@ -784,8 +826,11 @@ export async function runVisibleScheduler(
     return;
   }
   let listed: readonly string[] | 'all';
+  let autoApprove = false;
   try {
-    listed = await targetsFrom(env);
+    const config = await adapterConfigFrom(env);
+    listed = config.targets;
+    autoApprove = config.autoApprove;
   } catch {
     listed = 'all';
   }
@@ -799,6 +844,7 @@ export async function runVisibleScheduler(
       herdr: socketControl(env.HERDR_SOCKET_PATH, env.HERDR_BIN_PATH),
       decide: decideWithCli,
       targets: listed === 'all' ? undefined : listed,
+      autoApprove,
       sessionId,
       signal: abort.signal,
       handoff: (reason) => visibleHandoff(env, reason),

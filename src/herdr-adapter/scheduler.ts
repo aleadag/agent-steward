@@ -1,4 +1,5 @@
 import { handleEvent } from './entry.ts';
+import { approvalMenu } from './best-effort-approval.ts';
 import { CorruptEpisodeError, EpisodeStore, type Episode } from './state.ts';
 import { observeStop } from './observe.ts';
 import type { HerdrReader } from './observe.ts';
@@ -10,7 +11,8 @@ export type SchedulerResult = 'already_owned' | 'stopped' | 'shutdown_incomplete
 
 export type SchedulerOptions = {
   store: EpisodeStore;
-  herdr: HerdrReader & Partial<Pick<HerdrControl, 'prompt'>>;
+  herdr: HerdrReader & Partial<Pick<HerdrControl, 'prompt' | 'sendKeys'>>;
+  autoApprove?: boolean;
   decide: (input: StopInput) => Promise<unknown>;
   targets?: readonly string[];
   sessionId: string;
@@ -402,6 +404,44 @@ export async function runScheduler(options: SchedulerOptions): Promise<Scheduler
         }
         reconnect = false;
         outageNotified = false;
+        if (options.autoApprove) {
+          // Discover current panes on every bounded wake, including panels opened
+          // after startup and approval UI misreported as idle by Herdr.
+          const polled = await waitOpen(
+            (async () => {
+              const panes = targets ?? ((await herdr.list?.()) ?? []).map((pane) => pane.pane_id);
+              for (const pane of panes) {
+                if (!admissionOpen()) return;
+                const observed = await observeStop(herdr, pane);
+                if (!admissionOpen()) return;
+                if (!observed || !approvalMenu(observed.context)) continue;
+                await handleEvent(
+                  {
+                    type: 'pane.agent_status_changed',
+                    pane_id: pane,
+                    workspace_id: observed.workspace_id,
+                    agent: observed.agent,
+                    agent_status: observed.status,
+                  },
+                  {
+                    herdr,
+                    decide,
+                    store,
+                    autoApprove: true,
+                    clock: options.clock ?? { now: () => new Date() },
+                    targets: targets ?? 'all',
+                    handoff: options.handoff ?? (async () => {}),
+                    sessionId,
+                    leaseToken: lease,
+                    sessionValid: options.sessionValid,
+                    admissionOpen,
+                  },
+                );
+              }
+            })(),
+          );
+          if (polled.kind === 'closed' || !admissionOpen()) return;
+        }
         if (!admissionOpen()) return;
         const due = await waitOpen(reconcileDue(now, store, herdr, decide, listed, options.handoff, ownership));
         if (due.kind === 'closed' || !admissionOpen()) return;

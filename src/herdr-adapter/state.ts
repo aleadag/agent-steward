@@ -63,6 +63,23 @@ const episodeSchema = z
       issues.addIssue({ code: 'custom', message: 'Invalid episode schedule' });
     }
   });
+export type ApprovalAttempt = {
+  pane_id: string;
+  agent: string;
+  session_id: string;
+  digest: string;
+  state: 'human' | 'uncertain' | 'delivered';
+  recorded_at: string;
+};
+const approvalSchema = z.strictObject({
+  pane_id: z.string().regex(/^w[A-Za-z0-9]+:p[A-Za-z0-9]+$/),
+  agent: identifier,
+  session_id: identifier,
+  digest: z.string().regex(/^[0-9a-f]{64}$/),
+  state: z.enum(['human', 'uncertain', 'delivered']),
+  recorded_at: timestamp,
+});
+
 export class CorruptEpisodeError extends Error {
   constructor() {
     super('invalid episode metadata');
@@ -109,6 +126,12 @@ async function owner(path: string): Promise<Owner | null> {
 }
 function filename(pane: string): string {
   return createHash('sha256').update(pane).digest('hex') + '.json';
+}
+
+function approvalFilename(agent: string, session: string): string {
+  return `approval-${createHash('sha256')
+    .update(JSON.stringify([agent, session]))
+    .digest('hex')}.json`;
 }
 
 export class EpisodeStore {
@@ -193,6 +216,28 @@ export class EpisodeStore {
     if (episode.pane_id !== pane) throw new Error('episode pane mismatch');
     const metadata = Object.fromEntries(fields.map((field) => [field, episode[field]]));
     await this.atomic(join(this.directory, filename(pane)), metadata);
+  }
+  async approval(agent: string, session: string): Promise<ApprovalAttempt | null> {
+    let raw: string;
+    try {
+      raw = await readFile(join(this.directory, approvalFilename(agent, session)), 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+    try {
+      const parsed = approvalSchema.parse(JSON.parse(raw));
+      if (parsed.agent !== agent || parsed.session_id !== session) throw new CorruptEpisodeError();
+      return parsed;
+    } catch {
+      throw new CorruptEpisodeError();
+    }
+  }
+  async recordApproval(pane: string, attempt: ApprovalAttempt): Promise<void> {
+    await this.prepare();
+    const parsed = approvalSchema.parse(attempt);
+    if (parsed.pane_id !== pane) throw new Error('approval pane mismatch');
+    await this.atomic(join(this.directory, approvalFilename(parsed.agent, parsed.session_id)), parsed);
   }
   async clear(pane: string): Promise<void> {
     await rm(join(this.directory, filename(pane)), { force: true });

@@ -18,6 +18,7 @@ export type ReadSnapshot = {
   truncated: boolean;
 };
 export type HerdrReader = {
+  list?: () => Promise<AgentSnapshot[]>;
   get: (paneId: string) => Promise<AgentSnapshot | null>;
   read: (paneId: string) => Promise<ReadSnapshot | null>;
 };

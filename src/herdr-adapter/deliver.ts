@@ -5,7 +5,10 @@ import { observeStop } from './observe.ts';
 import type { HerdrReader, ObservedStop } from './observe.ts';
 import type { Episode, EpisodeStore } from './state.ts';
 
-export type HerdrControl = HerdrReader & { prompt: (paneId: string, text: string) => Promise<void> };
+export type HerdrControl = HerdrReader & {
+  prompt: (paneId: string, text: string) => Promise<void>;
+  sendKeys?: (paneId: string, keys: string[]) => Promise<void>;
+};
 export type Clock = { now: () => Date };
 export type DeliveryOutcome = 'delivered' | 'wait' | 'human' | 'uncertain';
 
