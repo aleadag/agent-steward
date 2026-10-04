@@ -208,7 +208,11 @@ async function orderedDirectory(path: string, names: string[]) {
   let index = 0;
   return new Proxy(directory, {
     get(target, key) {
-      if (key === 'read') return async () => entries.find((entry) => entry.name === names[index++]) ?? null;
+      if (key === 'read')
+        return async () => {
+          const name = names[index++];
+          return entries.find((entry) => entry.name === name) ?? null;
+        };
       const value = Reflect.get(target, key, target) as unknown;
       return typeof value === 'function' ? value.bind(target) : value;
     },
@@ -246,12 +250,33 @@ test('cleanup stops inspection after 128 entries without assuming fair directory
   const names = Array.from({ length: 128 }, (_, i) => `unknown-${i}`);
   for (const name of names) await mkdir(join(generations, name), { mode: 0o700 });
   names.push(f.candidateToken);
+  let handle: Awaited<ReturnType<LeaseIO['opendir']>> | undefined;
+  const inspected: string[] = [];
   const token = await storeFor(f, {
     io: {
-      opendir: async (path, options) => (path === generations ? orderedDirectory(path, names) : opendir(path, options)),
+      opendir: async (path, options) => {
+        if (path !== generations) return opendir(path, options);
+        const directory = await orderedDirectory(path, names);
+        handle = directory;
+        return new Proxy(directory, {
+          get(target, key) {
+            if (key === 'read')
+              return async () => {
+                const entry = await target.read();
+                if (entry !== null) inspected.push(entry.name);
+                return entry;
+              };
+            const value = Reflect.get(target, key, target) as unknown;
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
     },
   }).acquire('server-1');
   assert.ok(token);
+  assert.deepEqual(inspected, names.slice(0, 128));
+  assert.ok(handle);
+  await assert.rejects(handle.close(), { code: 'ERR_DIR_CLOSED' });
   await lstat(f.candidate);
 });
 
