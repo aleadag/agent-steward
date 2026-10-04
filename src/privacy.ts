@@ -10,11 +10,18 @@ const patterns = [
 ];
 const credentialKey = /^(api[_-]?key|access[_-]?token|client[_-]?secret|password)$/i;
 
-function recognizable(value: string, apiKey: string): boolean {
-  return (apiKey.length > 0 && value.includes(apiKey)) || patterns.some((pattern) => pattern.test(value));
+export type CredentialKeys = string | readonly string[];
+
+export function configuredApiKeys(env: { TYPESAFE_API_KEY?: string; OPENROUTER_API_KEY?: string }): string[] {
+  return [env.TYPESAFE_API_KEY ?? '', env.OPENROUTER_API_KEY ?? ''];
 }
 
-export function assertNoCredentials(content: unknown, apiKey: string): string | undefined {
+function recognizable(value: string, apiKey: CredentialKeys): boolean {
+  const keys = typeof apiKey === 'string' ? [apiKey] : apiKey;
+  return keys.some((key) => key.length > 0 && value.includes(key)) || patterns.some((pattern) => pattern.test(value));
+}
+
+export function assertNoCredentials(content: unknown, apiKey: CredentialKeys): string | undefined {
   assertJsonDepth(content);
 
   const stack: unknown[] = [content];

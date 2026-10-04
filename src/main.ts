@@ -85,6 +85,9 @@ export function createRuntime(): Runtime {
       get TYPESAFE_API_KEY() {
         return process.env.TYPESAFE_API_KEY;
       },
+      get OPENROUTER_API_KEY() {
+        return process.env.OPENROUTER_API_KEY;
+      },
       get CODEX_HOME() {
         return process.env.CODEX_HOME;
       },

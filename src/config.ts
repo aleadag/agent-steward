@@ -2,7 +2,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { ConfigSchema, StewardError } from './contracts.ts';
 import type { Config, ConfigEnv, ReadText } from './contracts.ts';
 import { assertByteLength, assertJsonDepth } from './limits.ts';
-import { assertNoCredentials } from './privacy.ts';
+import { assertNoCredentials, configuredApiKeys } from './privacy.ts';
 
 export async function loadConfig(
   override: string | undefined,
@@ -54,7 +54,7 @@ export async function loadConfig(
         .filter((field) => {
           if (field.length > 256) return false;
           try {
-            assertNoCredentials(field, io.env.TYPESAFE_API_KEY ?? '');
+            assertNoCredentials(field, configuredApiKeys(io.env));
             return true;
           } catch {
             return false;

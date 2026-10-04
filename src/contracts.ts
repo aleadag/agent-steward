@@ -63,6 +63,17 @@ const CandidateSchema = z.strictObject({
     }),
 });
 
+export const EvaluatorConfigSchema = z
+  .strictObject({
+    type: z.literal('jev'),
+    provider: z.enum(['typesafe', 'openrouter']),
+    model: text.optional(),
+  })
+  .transform((value) => ({
+    ...value,
+    model: value.model ?? (value.provider === 'openrouter' ? '~typesafe/jev-latest' : 'jev-1.13.0'),
+  }));
+
 export const ConfigSchema = z
   .strictObject({
     tools: z.array(ToolSchema).refine((tools) => new Set(tools).size === tools.length),
@@ -71,7 +82,8 @@ export const ConfigSchema = z
       .strictObject({
         model: text.default('jev-1.13.0'),
       })
-      .default({ model: 'jev-1.13.0' }),
+      .optional(),
+    evaluator: EvaluatorConfigSchema.optional(),
     thresholds: z
       .strictObject({
         risky: probability.default(0.6),
@@ -80,6 +92,8 @@ export const ConfigSchema = z
       .default({ risky: 0.6, choiceConfidence: 0.45 }),
   })
   .superRefine((config, context) => {
+    if (config.jev !== undefined && config.evaluator !== undefined)
+      context.addIssue({ code: 'custom', path: ['evaluator'], message: 'Use evaluator or legacy jev, not both' });
     const candidateIds = new Set<string>();
     config.candidates.forEach((candidate, index) => {
       if (candidateIds.has(candidate.id))
@@ -98,7 +112,11 @@ export const ConfigSchema = z
           message: 'Invalid tool/bucket pairing',
         });
     });
-  });
+  })
+  .transform(({ jev, evaluator, ...config }) => ({
+    ...config,
+    evaluator: evaluator ?? { type: 'jev' as const, provider: 'typesafe' as const, model: jev?.model ?? 'jev-1.13.0' },
+  }));
 
 const AccountScopeSchema = z.strictObject({ type: z.literal('account') });
 const PoolScopeSchema = z.strictObject({ type: z.literal('pool'), pool_id: text });
@@ -541,7 +559,12 @@ export type QuotaSource = z.infer<typeof QuotaSourceSchema>;
 
 export type ReadText = (path: string) => Promise<string>;
 export type Diagnostic = (code: string) => void;
-export type ConfigEnv = { HOME?: string; XDG_CONFIG_HOME?: string; TYPESAFE_API_KEY?: string };
+export type ConfigEnv = {
+  HOME?: string;
+  XDG_CONFIG_HOME?: string;
+  TYPESAFE_API_KEY?: string;
+  OPENROUTER_API_KEY?: string;
+};
 export type ErrorCode = ErrorResult['reason_code'];
 
 export class StewardError extends Error {

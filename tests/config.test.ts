@@ -23,7 +23,7 @@ async function rejectsConfig(
 }
 
 test('XDG config and nested defaults without snapshot path configuration', async () => {
-  const { jev: _jev, ...rawWithoutJev } = config();
+  const { evaluator: _evaluator, ...rawWithoutJev } = config();
   const raw = {
     ...rawWithoutJev,
     thresholds: { risky: 0.7 },
@@ -40,7 +40,7 @@ test('XDG config and nested defaults without snapshot path configuration', async
   assert.deepEqual(reads, ['/isolated/xdg/agent-steward/config.json']);
   assert.deepEqual(result.candidates, raw.candidates);
   assert.equal('accounts' in result, false);
-  assert.equal(result.jev.model, 'jev-1.13.0');
+  assert.equal(result.evaluator.model, 'jev-1.13.0');
   assert.deepEqual(result.thresholds, { risky: 0.7, choiceConfidence: 0.45 });
 });
 

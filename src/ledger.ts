@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { z } from 'zod';
 import { FailureDiagnosticsSchema, StewardError } from './contracts.ts';
-import { assertNoCredentials } from './privacy.ts';
+import { assertNoCredentials, configuredApiKeys } from './privacy.ts';
 
 const EventSchema = z
   .object({
@@ -42,7 +42,7 @@ export type LedgerEventKind = LedgerEvent['event'];
 const MAX_LEDGER_BYTES = 5 * 1024 * 1024;
 
 export type LedgerRuntime = {
-  env: { XDG_STATE_HOME?: string; HOME?: string; TYPESAFE_API_KEY?: string };
+  env: { XDG_STATE_HOME?: string; HOME?: string; TYPESAFE_API_KEY?: string; OPENROUTER_API_KEY?: string };
   appendText: (path: string, text: string) => Promise<void>;
   readTextIfPresent: (path: string) => Promise<string | null>;
   mkdirp: (path: string, mode: number) => Promise<void>;
@@ -60,7 +60,7 @@ export function ledgerFile(env: { XDG_STATE_HOME?: string; HOME?: string }): str
 
 export async function appendEvent(runtime: LedgerRuntime, event: LedgerEvent): Promise<void> {
   const text = JSON.stringify(event);
-  assertNoCredentials(text, runtime.env.TYPESAFE_API_KEY ?? '');
+  assertNoCredentials(text, configuredApiKeys(runtime.env));
   if (!EventSchema.safeParse(event).success) throw new StewardError('invalid_input');
   const line = `${text}\n`;
   const bytes = Buffer.byteLength(line, 'utf8');
@@ -99,7 +99,7 @@ export async function readLedger(runtime: LedgerRuntime): Promise<LedgerRecord[]
     await runtime.readTextIfPresent(file),
   ]);
   for (const text of texts) {
-    if (text !== null) assertNoCredentials(text, runtime.env.TYPESAFE_API_KEY ?? '');
+    if (text !== null) assertNoCredentials(text, configuredApiKeys(runtime.env));
   }
   const text = texts.filter((text) => text !== null).join('\n');
   const folded = new Map<string, LedgerRecord>();

@@ -4,7 +4,18 @@ import type { Evaluation } from './contracts.ts';
 import { EvaluationSchema, StewardError } from './contracts.ts';
 import { assertByteLength, assertJsonDepth, LimitError } from './limits.ts';
 import { readBoundedUtf8 } from './io.ts';
+import { z } from 'zod';
 import { assertNoCredentials } from './privacy.ts';
+import type { CredentialKeys } from './privacy.ts';
+
+const OpenRouterEvaluationSchema = EvaluationSchema.extend({
+  id: z.string().optional(),
+  provider: z.string().optional(),
+  usage: EvaluationSchema.shape.usage.extend({ cost: z.number().finite().min(0).optional() }),
+}).transform(({ id: _id, provider: _provider, usage: { cost: _cost, ...usage }, ...evaluation }) => ({
+  ...evaluation,
+  usage,
+}));
 
 export type ChoiceQuestion = {
   type: 'choice';
@@ -190,7 +201,13 @@ function mapInputError(error: unknown): never {
   throw new StewardError('invalid_input');
 }
 
-export function makeEvaluator(options: { model: string; apiKey: string; post: HttpPost }): Evaluate {
+export function makeEvaluator(options: {
+  model: string;
+  provider?: 'typesafe' | 'openrouter';
+  apiKey: string;
+  credentialKeys?: CredentialKeys;
+  post: HttpPost;
+}): Evaluate {
   if (typeof options.apiKey !== 'string' || options.apiKey.trim().length === 0)
     throw new StewardError('missing_credentials', { stage: 'credentials' });
 
@@ -201,7 +218,7 @@ export function makeEvaluator(options: { model: string; apiKey: string; post: Ht
       assertJsonDepth(wire);
       assertJsonValue(wire);
       assertQuestions(questions);
-      assertNoCredentials(wire, options.apiKey);
+      assertNoCredentials(wire, options.credentialKeys ?? options.apiKey);
       const serialized = JSON.stringify(wire);
       if (serialized === undefined) throw new StewardError('invalid_input');
       assertByteLength(serialized);
@@ -217,7 +234,10 @@ export function makeEvaluator(options: { model: string; apiKey: string; post: Ht
     let response: { status: number; body: string };
     try {
       response = await options.post({
-        url: 'https://api.typesafe.ai/v1/systemone',
+        url:
+          options.provider === 'openrouter'
+            ? 'https://openrouter.ai/api/v1/systemone'
+            : 'https://api.typesafe.ai/v1/systemone',
         headers: { authorization: `Bearer ${options.apiKey}`, 'content-type': 'application/json' },
         body,
         signal,
@@ -245,8 +265,14 @@ export function makeEvaluator(options: { model: string; apiKey: string; post: Ht
       assertByteLength(response.body);
       const parsed: unknown = JSON.parse(response.body);
       assertJsonDepth(parsed);
-      return validateEvaluation(parsed, questions);
-    } catch {
+      const evaluation = validateEvaluation(
+        options.provider === 'openrouter' ? OpenRouterEvaluationSchema.parse(parsed) : parsed,
+        questions,
+      );
+      assertNoCredentials(parsed, options.credentialKeys ?? options.apiKey);
+      return evaluation;
+    } catch (error) {
+      if (error instanceof StewardError && error.code === 'credential_detected') throw error;
       throw new StewardError('invalid_response', { stage: 'response', ...timing });
     }
   };

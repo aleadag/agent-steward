@@ -15,7 +15,7 @@ export function config(overrides: Partial<Config> | Record<string, unknown> = {}
   return {
     tools: ['codex', 'pi', 'agy'],
     candidates: [candidate()],
-    jev: { model: 'jev-1.13.0' },
+    evaluator: { type: 'jev', provider: 'typesafe', model: 'jev-1.13.0' },
     thresholds: { risky: 0.6, choiceConfidence: 0.45 },
     ...overrides,
   } as Config;

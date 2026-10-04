@@ -79,6 +79,56 @@ function runtime(overrides: Partial<Runtime> = {}) {
   return { out, err, reads, launches, io, files };
 }
 
+test('OpenRouter routing uses only its selected credential and records normalized Jev answers', async () => {
+  const cfg = routeConfig();
+  cfg.evaluator = { type: 'jev', provider: 'openrouter', model: '~typesafe/jev-latest' };
+  const { post, requests } = fakePost((wire, index) => ({
+    ...(routeAnswer(wire, index) as Evaluation),
+    id: 'gen-example',
+    provider: 'TypeSafe',
+    usage: { input_tokens: 12, output_tokens: 3, cost: 0.0001 },
+  }));
+  const { io, out } = runtime({
+    env: { HOME: '/isolated/home', OPENROUTER_API_KEY: 'opaque-openrouter-value', TYPESAFE_API_KEY: 'other-key' },
+    readText: async () => JSON.stringify(cfg),
+    post,
+  });
+  assert.equal(await run(['router', 'start', 'task', '--dry-run', '--json'], io), 0);
+  assert.equal(result(out).decision, 'selected');
+  assert.equal(requests[0]?.url, 'https://openrouter.ai/api/v1/systemone');
+  assert.equal(requests[0]?.headers.authorization, 'Bearer opaque-openrouter-value');
+  assert.doesNotMatch(out.join(''), /opaque-openrouter-value|other-key/);
+});
+
+test('OpenRouter has no credential fallback and empty stop context remains local', async () => {
+  const cfg = config({ evaluator: { type: 'jev', provider: 'openrouter', model: '~typesafe/jev-latest' } });
+  const { io, out } = runtime({
+    env: { HOME: '/isolated/home', TYPESAFE_API_KEY: 'other-key' },
+    readText: async () => JSON.stringify(cfg),
+  });
+  assert.equal(await run(['stop', 'check'], io), 1);
+  assert.equal(result(out).reason_code, 'missing_credentials');
+  out.length = 0;
+  io.readStdin = async () => JSON.stringify(stopInput({ context: null }));
+  assert.equal(await run(['stop', 'check'], io), 2);
+  assert.equal(result(out).reason_code, 'insufficient_context');
+});
+
+test('OpenRouter optional key protects local IDs and config diagnostics before evaluation', async () => {
+  const secret = 'OpaqueOpenrouterValue';
+  const { io, out } = runtime({
+    env: { HOME: '/isolated/home', OPENROUTER_API_KEY: secret },
+    readStdin: async () => JSON.stringify(stopInput({ request_id: `prefix-${secret}`, context: null })),
+  });
+  assert.equal(await run(['stop', 'check'], io), 1);
+  assert.doesNotMatch(out.join(''), /OpaqueOpenrouterValue/);
+  out.length = 0;
+  io.readStdin = async () => JSON.stringify(stopInput());
+  io.readText = async () => JSON.stringify({ ...config(), [secret]: 'private' });
+  assert.equal(await run(['stop', 'check'], io), 1);
+  assert.doesNotMatch(out.join(''), /OpaqueOpenrouterValue|private/);
+});
+
 test('exact quota setup/hook parsing rejects config, JSON flags and extra arguments', () => {
   assert.deepEqual(parseArgs(['quota', 'setup', 'agy']), { kind: 'quota-setup-agy' });
   assert.deepEqual(parseArgs(['quota', 'hook', 'agy']), { kind: 'quota-hook-agy' });

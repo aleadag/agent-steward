@@ -7,7 +7,8 @@ import { assertByteLength, assertJsonDepth } from './limits.ts';
 import { inspectQuota, loadQuota } from './quota.ts';
 import { refreshQuota } from './quota-refresh.ts';
 import type { QuotaRefreshIO } from './quota-refresh.ts';
-import { assertNoCredentials } from './privacy.ts';
+import { assertNoCredentials, configuredApiKeys } from './privacy.ts';
+import type { CredentialKeys } from './privacy.ts';
 import { makeEvaluator } from './jev.ts';
 import type { Evaluate, HttpPost, Questions } from './jev.ts';
 import { route } from './routing.ts';
@@ -30,7 +31,7 @@ export type Invocation =
   | { kind: 'quota-show'; config?: string; json: boolean };
 
 export type Runtime = QuotaRefreshIO & {
-  env: QuotaRefreshIO['env'] & { XDG_CONFIG_HOME?: string; TYPESAFE_API_KEY?: string };
+  env: QuotaRefreshIO['env'] & { XDG_CONFIG_HOME?: string; TYPESAFE_API_KEY?: string; OPENROUTER_API_KEY?: string };
   appendText: (path: string, text: string) => Promise<void>;
   readTextIfPresent: (path: string) => Promise<string | null>;
   mkdirp: (path: string, mode: number) => Promise<void>;
@@ -218,12 +219,11 @@ export function parseArgs(argv: readonly string[]): Invocation {
   return config === undefined ? invocation : { ...invocation, config };
 }
 
-function readOptionalApiKey(runtime: Runtime): string {
-  const value = runtime.env.TYPESAFE_API_KEY;
-  return typeof value === 'string' ? value : '';
+function readOptionalApiKey(runtime: Runtime): CredentialKeys {
+  return configuredApiKeys(runtime.env);
 }
 
-function safeRequestId(requestId: string | null, apiKey: string): string | null {
+function safeRequestId(requestId: string | null, apiKey: CredentialKeys): string | null {
   if (requestId === null) return null;
   try {
     assertNoCredentials(requestId, apiKey);
@@ -233,7 +233,7 @@ function safeRequestId(requestId: string | null, apiKey: string): string | null 
   }
 }
 
-function safeError(error: unknown, requestId: string | null, apiKey: string): ErrorResult {
+function safeError(error: unknown, requestId: string | null, apiKey: CredentialKeys): ErrorResult {
   const id = safeRequestId(requestId, apiKey);
   try {
     const result = errorResult(error, id);
@@ -244,7 +244,7 @@ function safeError(error: unknown, requestId: string | null, apiKey: string): Er
   }
 }
 
-function safeStopError(error: unknown, requestId: string | null, apiKey: string): StopResult {
+function safeStopError(error: unknown, requestId: string | null, apiKey: CredentialKeys): StopResult {
   const id = safeRequestId(requestId, apiKey);
   let result = { ...errorResult(error, id), schema_version: 2 as const };
   try {
@@ -369,7 +369,7 @@ async function emitError(
   runtime: Runtime,
   error: unknown,
   requestId: string | null,
-  apiKey: string,
+  apiKey: CredentialKeys,
   humanRoute: boolean,
 ): Promise<number> {
   const result = safeError(error, requestId, apiKey);
@@ -382,7 +382,7 @@ async function emitError(
 async function readStopInput(
   runtime: Runtime,
   onRequestId: (id: string | null) => void,
-  apiKey: string,
+  apiKey: CredentialKeys,
 ): Promise<StopInput> {
   let contents: string;
   try {
@@ -674,8 +674,14 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     let evaluator: ReturnType<typeof makeEvaluator> | undefined;
     const evaluate: Evaluate = async (state: unknown, questions: Questions) => {
       if (evaluator === undefined) {
-        if (apiKey.trim().length === 0) throw new StewardError('missing_credentials', { stage: 'credentials' });
-        evaluator = makeEvaluator({ model: config.jev.model, apiKey, post: runtime.post });
+        const key =
+          config.evaluator.provider === 'openrouter' ? runtime.env.OPENROUTER_API_KEY : runtime.env.TYPESAFE_API_KEY;
+        evaluator = makeEvaluator({
+          ...config.evaluator,
+          apiKey: key ?? '',
+          credentialKeys: apiKey,
+          post: runtime.post,
+        });
       }
       return evaluator(state, questions);
     };
