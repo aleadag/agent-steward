@@ -988,7 +988,8 @@ test('takeover requires release or expired heartbeat and proven death', async ()
     if (row.take) {
       assert.ok(next, row.name);
       assert.notEqual(next, f.identity.token, row.name);
-      if (!row.released) assert.equal((await lstat(join(f.generation, 'released'))).isDirectory(), true, row.name);
+      if (row.alive === false) await assert.rejects(lstat(f.generation), { code: 'ENOENT' }, row.name);
+      else assert.equal((await lstat(join(f.generation, 'released'))).isDirectory(), true, row.name);
       await store.release(next);
     }
   }
@@ -1265,11 +1266,11 @@ test('transient guard path failure retries only against the opened fd identity',
   assert.ok(token);
   assert.ok(guardHandle);
   assert.ok(fdIdentity);
-  assert.equal(pathStats.length, 2);
-  assert.equal(pathStats[0]?.dev, fdIdentity.dev);
-  assert.equal(pathStats[0]?.ino, fdIdentity.ino);
-  assert.equal(pathStats[1]?.dev, fdIdentity.dev);
-  assert.equal(pathStats[1]?.ino, fdIdentity.ino);
+  assert.ok(pathStats.length >= 2);
+  for (const info of pathStats) {
+    assert.equal(info.dev, fdIdentity.dev);
+    assert.equal(info.ino, fdIdentity.ino);
+  }
   assert.equal(guardUnlinks, 1);
   await assert.rejects(lstat(guard), { code: 'ENOENT' });
   await assert.rejects(guardHandle.stat(), { code: 'EBADF' });

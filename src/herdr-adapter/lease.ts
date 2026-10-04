@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import type { Stats } from 'node:fs';
-import { lstat, open, mkdir, rename, rm, readdir, chmod, unlink } from 'node:fs/promises';
+import { lstat, open, mkdir, rename, rm, readdir, chmod, unlink, opendir, rmdir } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { z } from 'zod';
+import { collectDeadGenerations } from './lease-cleanup.ts';
 
 export type LeaseIdentity = { protocol: 2; token: string; pid: number; session: string };
 export type LeaseHeartbeat = { protocol: 2; token: string; heartbeat: number };
@@ -20,6 +21,8 @@ export type LeaseIO = {
   unlink: (path: string) => Promise<void>;
   readdir: (path: string) => Promise<string[]>;
   chmod: (path: string, mode: number) => Promise<void>;
+  opendir: typeof opendir;
+  rmdir: typeof rmdir;
 };
 export type LeaseOptions = { io?: Partial<LeaseIO>; alive?: (pid: number) => boolean | null };
 export type LeaseAttempt = {
@@ -87,7 +90,7 @@ export class SchedulerLeaseStore {
     private readonly now: () => number,
     options: LeaseOptions = {},
   ) {
-    this.io = { lstat, open, mkdir, rename, rm, unlink, readdir, chmod, ...options.io };
+    this.io = { lstat, open, mkdir, rename, rm, unlink, readdir, chmod, opendir, rmdir, ...options.io };
     this.alive = options.alive ?? aliveByDefault;
   }
 
@@ -302,6 +305,26 @@ export class SchedulerLeaseStore {
         await guardHandle.chmod(0o600);
         guardIdentity = this.guardFileIdentity(await guardHandle.stat());
         result = await this.publishUnderGuard(local);
+        if (result !== null && !local.closing) {
+          await collectDeadGenerations({
+            generations: this.generationsPath(),
+            selected: local.identity,
+            io: this.io,
+            alive: this.alive,
+            isOpen: () => !local.closing,
+            readOwner: async (path) => identitySchema.parse(await this.readJson(path)),
+            assertShared: async () => {
+              await this.leaseDirectoriesSafe();
+              await this.checkGuardPath(guardPath, guardIdentity!);
+              const selected = await this.inspect();
+              if (selected.kind !== 'selected' || !sameIdentity(selected.identity, local.identity))
+                throw errorForState();
+            },
+          });
+          if (!local.closing && !(await this.leaseMatches(local.identity.token, local.identity.session))) {
+            throw errorForState();
+          }
+        }
       }
     } catch (error) {
       failure = error;

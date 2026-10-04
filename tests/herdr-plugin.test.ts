@@ -580,7 +580,7 @@ test.skipIf(!pkg)(
         for (let attempt = 0; attempt < 120; attempt++) {
           if (child.pid === undefined) throw new Error('packaged supervisor did not receive a PID');
           const ready = installedLeaseReady(state, child.pid, session);
-          if (ready) return ready;
+          if (ready && !existsSync(join(state, 'takeover-guard'))) return ready;
           if (child.exitCode !== null) break;
           await new Promise((resolve) => setTimeout(resolve, 25));
         }
@@ -681,7 +681,7 @@ test.skipIf(!pkg)(
       assert.notEqual(generationH.token, generationG.token);
       assertInstalledProcess(schedulerPidH, runtime, entry);
       assert.equal(installedLeaseReady(state, schedulerPidH, session)?.token, generationH.token);
-      assert.equal(lstatSync(markerG).isDirectory(), true);
+      assert.equal(existsSync(generationGPath), false, 'dead unselected G must be collected after H acquisition');
       const generationHPath = generationPath(generationH.token);
       const ownerH = JSON.parse(readFileSync(join(generationHPath, 'owner.json'), 'utf8'));
       const heartbeatH = JSON.parse(readFileSync(join(generationHPath, 'heartbeat.json'), 'utf8'));
