@@ -1,5 +1,7 @@
 # Unreleased
 
+- The optional Herdr adapter can check quota-blocked agents sooner when a configured model name appears in its screen excerpt and fresh cached quota supplies a reset time. These best-effort hints never delay ordinary polling or authorize input; see the [adapter assumptions and safeguards](README.md#optional-herdr-adapter-not-activated).
+
 - The optional Herdr adapter now automatically reclaims unselected lease generations whose owners are proven dead, reducing retained scheduler history without deleting live or uncertain state. Cleanup runs during acquisition with processing budgets; unverifiable remnants still need [offline review](README.md#optional-herdr-adapter-not-activated).
 
 # v0.1.0-alpha.8 — TypeScript Herdr pane launcher
