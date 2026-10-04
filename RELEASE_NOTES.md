@@ -1,3 +1,7 @@
+# Unreleased
+
+- The optional Herdr adapter now automatically reclaims unselected lease generations whose owners are proven dead, reducing retained scheduler history without deleting live or uncertain state. Cleanup runs during acquisition with processing budgets; unverifiable remnants still need [offline review](README.md#optional-herdr-adapter-not-activated).
+
 # v0.1.0-alpha.8 — TypeScript Herdr pane launcher
 
 Release notes for x86_64-linux dogfooding. Package and Nix metadata report `0.1.0-alpha.8`. Earlier alpha tags remain unchanged.
