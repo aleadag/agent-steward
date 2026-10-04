@@ -123,8 +123,25 @@ function assertQuestions(value: unknown): asserts value is Questions {
   }
 }
 
-function invalidResponse(kind: FailureDiagnostics['kind'] = 'schema'): StewardError {
-  return new StewardError('invalid_response', { stage: 'response', kind });
+function invalidResponse(
+  kind: FailureDiagnostics['kind'] = 'schema',
+  details?: FailureDiagnostics['details'],
+): StewardError {
+  return new StewardError('invalid_response', {
+    stage: 'response',
+    kind,
+    ...(details === undefined ? {} : { details }),
+  });
+}
+
+function keyMismatchDetails(value: Record<string, unknown>, expected: readonly string[]) {
+  const keys = Object.keys(value);
+  return {
+    expected: expected.length,
+    actual: keys.length,
+    missing_count: expected.filter((key) => !Object.hasOwn(value, key)).length,
+    extra_count: keys.filter((key) => !expected.includes(key)).length,
+  };
 }
 
 function decimalParts(value: number): { coefficient: bigint; scale: number } {
@@ -134,14 +151,18 @@ function decimalParts(value: number): { coefficient: bigint; scale: number } {
   return { coefficient: BigInt(`${whole}${fraction}`), scale: fraction.length - exponent };
 }
 
-function choiceSumWithinTolerance(values: readonly number[]): boolean {
+function choiceSumSummary(values: readonly number[]) {
   // Sum canonical decimal spellings exactly, keeping decimal boundary values inside the specified tolerance.
   const parts = values.map(decimalParts);
   const scale = Math.max(0, ...parts.map((part) => part.scale));
   const total = parts.reduce((sum, part) => sum + part.coefficient * 10n ** BigInt(scale - part.scale), 0n);
   const unit = 10n ** BigInt(scale);
   const difference = total >= unit ? total - unit : unit - total;
-  return difference * 1_000_000n <= unit;
+  return {
+    withinTolerance: difference * 1_000_000n <= unit,
+    total: Number(`${total}e-${scale}`),
+    deviation: Number(`${total - unit}e-${scale}`),
+  };
 }
 
 export function validateEvaluation(raw: unknown, questions: Questions): Evaluation {
@@ -156,25 +177,45 @@ export function validateEvaluation(raw: unknown, questions: Questions): Evaluati
   if (!parsed.success) throw invalidResponse();
 
   const expectedAnswers = Object.keys(questions);
-  if (!exactKeys(parsed.data.answers, expectedAnswers)) throw invalidResponse('answer_ids');
+  if (!exactKeys(parsed.data.answers, expectedAnswers))
+    throw invalidResponse('answer_ids', keyMismatchDetails(parsed.data.answers, expectedAnswers));
 
-  for (const id of expectedAnswers) {
+  for (const [questionIndex, id] of expectedAnswers.entries()) {
     const question = questions[id];
     const answer = parsed.data.answers[id];
     if (question === undefined || answer === undefined) throw invalidResponse('answer_ids');
+    const context = { question_index: questionIndex };
     if (question.type === 'noul') {
-      if (answer.type !== 'noul') throw invalidResponse('answer_type');
+      if (answer.type !== 'noul') throw invalidResponse('answer_type', { ...context, expected: false, actual: true });
       continue;
     }
-    if (answer.type !== 'choice') throw invalidResponse('answer_type');
+    if (answer.type !== 'choice') throw invalidResponse('answer_type', { ...context, expected: true, actual: false });
 
     const options = Object.keys(question.criteria);
-    if (!exactKeys(answer.probabilities, options)) throw invalidResponse('choice_options');
+    if (!exactKeys(answer.probabilities, options))
+      throw invalidResponse('choice_options', { ...context, ...keyMismatchDetails(answer.probabilities, options) });
     const probabilities = Object.values(answer.probabilities);
-    if (!choiceSumWithinTolerance(probabilities)) throw invalidResponse('probability_sum');
+    const sum = choiceSumSummary(probabilities);
+    if (!sum.withinTolerance)
+      throw invalidResponse('probability_sum', {
+        ...context,
+        expected: 1,
+        actual: sum.total,
+        tolerance: 0.000001,
+        deviation: sum.deviation,
+        option_count: options.length,
+      });
     const maximum = Math.max(...probabilities);
-    if (!Object.hasOwn(answer.probabilities, answer.choice) || answer.probabilities[answer.choice] !== maximum) {
-      throw invalidResponse('choice_mismatch');
+    const choicePresent = Object.hasOwn(answer.probabilities, answer.choice);
+    if (!choicePresent || answer.probabilities[answer.choice] !== maximum) {
+      throw invalidResponse('choice_mismatch', {
+        ...context,
+        expected: maximum,
+        actual: choicePresent ? answer.probabilities[answer.choice]! : null,
+        choice_present: choicePresent,
+        option_count: options.length,
+        maximum_count: probabilities.filter((value) => value === maximum).length,
+      });
     }
   }
   return parsed.data;
@@ -211,6 +252,7 @@ export function makeEvaluator(options: {
   if (typeof options.apiKey !== 'string' || options.apiKey.trim().length === 0)
     throw new StewardError('missing_credentials', { stage: 'credentials' });
 
+  let evaluationIndex = 0;
   return async (state, questions) => {
     let body: string;
     const wire = { model: options.model, state, questions };
@@ -228,6 +270,7 @@ export function makeEvaluator(options: {
       mapInputError(error);
     }
 
+    const index = evaluationIndex++;
     const started = performance.now();
     const signal = AbortSignal.timeout(30_000);
     const duration = (): number => Math.max(0, Math.round(performance.now() - started));
@@ -248,6 +291,7 @@ export function makeEvaluator(options: {
         stage: invalid ? 'response' : 'evaluation',
         ...(invalid ? error.diagnostics : {}),
         ...(!invalid ? ({ kind: signal.aborted ? 'timeout' : 'network' } as const) : {}),
+        details: { ...(invalid ? error.diagnostics?.details : {}), evaluation_index: index },
         duration_ms: duration(),
       });
     }
@@ -259,7 +303,12 @@ export function makeEvaluator(options: {
         : {}),
     };
     if (response.status < 200 || response.status >= 300)
-      throw new StewardError('evaluation_failed', { stage: 'evaluation', kind: 'http', ...timing });
+      throw new StewardError('evaluation_failed', {
+        stage: 'evaluation',
+        kind: 'http',
+        details: { evaluation_index: index },
+        ...timing,
+      });
 
     let kind: FailureDiagnostics['kind'] = 'schema';
     try {
@@ -283,6 +332,10 @@ export function makeEvaluator(options: {
         stage: 'response',
         kind:
           error instanceof StewardError && error.code === 'invalid_response' ? (error.diagnostics?.kind ?? kind) : kind,
+        details: {
+          ...(error instanceof StewardError && error.code === 'invalid_response' ? error.diagnostics?.details : {}),
+          evaluation_index: index,
+        },
         ...timing,
       });
     }

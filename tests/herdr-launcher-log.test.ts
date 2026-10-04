@@ -196,6 +196,57 @@ test('logged action preserves fixed response validation categories', async () =>
   }
 });
 
+test('logged action preserves bounded generic numeric details', async () => {
+  const diagnostic = {
+    request_id: 'response-failure',
+    reason_code: 'invalid_response',
+    diagnostics: {
+      stage: 'response',
+      kind: 'choice_mismatch',
+      details: {
+        evaluation_index: 1,
+        question_index: 0,
+        expected: 0.75,
+        actual: null,
+        choice_present: false,
+        option_count: 2,
+        maximum_count: 1,
+        future_metric: 3,
+      },
+    },
+  };
+  const result = await execute(renderer, [], {
+    HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({ selected_text: JSON.stringify(diagnostic) }),
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), diagnostic);
+});
+
+test('logged action rejects raw or malicious details without echo', async () => {
+  for (const details of [
+    { actual: 'private response body' },
+    { actual: { private: 1 } },
+    { actual: [1, 2] },
+    { 'private task text': 1 },
+    { synthetic_secret_marker: 1 },
+    { github_pat_abcdefghijklmnopqrstuvwxyz: 1 },
+    Object.fromEntries(Array.from({ length: 17 }, (_, index) => [`metric_${index}`, index])),
+  ]) {
+    const diagnostic = {
+      request_id: 'safe-id',
+      reason_code: 'invalid_response',
+      diagnostics: { stage: 'response', details },
+    };
+    const result = await execute(renderer, [], {
+      TYPESAFE_API_KEY: 'synthetic_secret_marker',
+      HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({ selected_text: JSON.stringify(diagnostic) }),
+    });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, 'agent-steward-launcher: invalid_failure_diagnostic\n');
+  }
+});
+
 test('logged action rejects malformed, oversized and credential-bearing input without echo', async () => {
   for (const context of [
     '{private-invalid-json',

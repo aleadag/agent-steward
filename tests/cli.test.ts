@@ -917,6 +917,85 @@ test('failure diagnostics survive router show without leaking config values or H
   }
 });
 
+test('numeric response details survive route failures, history and launcher reporting', async () => {
+  const cfg = routeConfig([
+    candidate({
+      id: 'private_first',
+      thinking_levels: [
+        { id: 'private_low', description: 'Low' },
+        { id: 'private_high', description: 'High' },
+      ],
+    }),
+    candidate({ id: 'private_second' }),
+  ]);
+  for (const [failureCall, kind, absent] of [
+    [1, 'probability_sum', false],
+    [2, 'probability_sum', false],
+    [2, 'choice_mismatch', false],
+    [2, 'choice_mismatch', true],
+  ] as const) {
+    const logged: unknown[] = [];
+    const { post, requests } = fakePost((wire, index) => {
+      const id = index === 1 ? 'pair' : 'effort';
+      const question = wire.questions[id];
+      assert.ok(question?.type === 'choice');
+      const [first, second] = Object.keys(question.criteria);
+      assert.ok(first !== undefined && second !== undefined);
+      const failing = index === failureCall;
+      return jevResponse({
+        [id]: choiceAnswer(
+          { [first]: 0.75, [second]: failing && kind === 'probability_sum' ? 0.15 : 0.25 },
+          0.9,
+          failing && kind === 'choice_mismatch' ? (absent ? 'private_missing' : second) : first,
+        ),
+      });
+    });
+    const { io, out, files } = runtime({
+      env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'Synthetic-Key-333' },
+      readText: async (path) => (path === CONFIG_PATH ? JSON.stringify(cfg) : JSON.stringify(snapshot([]))),
+      post,
+      logFailure: async (failure) => {
+        logged.push(failure);
+      },
+    });
+    assert.equal(await run(['router', 'start', 'private-task', '--dry-run', '--json'], io), 1);
+    assert.equal(requests.length, failureCall);
+    const failure = result(out);
+    assert.equal(failure.reason_code, 'invalid_response');
+    assert.equal(failure.diagnostics.kind, kind);
+    assert.deepEqual(
+      failure.diagnostics.details,
+      kind === 'probability_sum'
+        ? {
+            evaluation_index: failureCall - 1,
+            question_index: 0,
+            expected: 1,
+            actual: 0.9,
+            tolerance: 0.000001,
+            deviation: -0.1,
+            option_count: 2,
+          }
+        : {
+            evaluation_index: failureCall - 1,
+            question_index: 0,
+            expected: 0.75,
+            actual: absent ? null : 0.25,
+            choice_present: !absent,
+            option_count: 2,
+            maximum_count: 1,
+          },
+    );
+    assert.deepEqual(logged, [failure]);
+    out.length = 0;
+    assert.equal(await run(['router', 'show', 'generated-1', '--json'], io), 0);
+    assert.deepEqual(result(out).diagnostics, failure.diagnostics);
+    assert.doesNotMatch(
+      out.join('') + [...files.values()].join('') + JSON.stringify(logged),
+      /private|Synthetic-Key-333/,
+    );
+  }
+});
+
 test('config diagnostics omit credential-bearing field names', async () => {
   const { io, out, files } = runtime({
     env: { HOME: '/isolated/home', TYPESAFE_API_KEY: 'SyntheticKey333' },

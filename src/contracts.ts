@@ -298,6 +298,15 @@ export const FailureDiagnosticsSchema = z.strictObject({
       'choice_mismatch',
     ])
     .optional(),
+  details: z
+    .custom<Record<string, unknown>>(isRecord)
+    .refine(
+      (details) =>
+        Object.keys(details).length <= 16 && Object.keys(details).every((key) => /^[a-z][a-z0-9_]{0,63}$/.test(key)),
+      'Invalid diagnostic metric names or count',
+    )
+    .pipe(z.record(z.string(), z.union([z.number().finite(), z.boolean(), z.null()])))
+    .optional(),
   config_fields: z.array(z.string().min(1).max(256)).max(16).optional(),
   http_status: z.number().int().min(100).max(599).optional(),
   duration_ms: z.number().int().nonnegative().optional(),
