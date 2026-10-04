@@ -260,9 +260,122 @@ test('over-budget candidate children are all preserved before deletion begins', 
   for (let i = 0; i < 63; i++)
     await writeFile(join(f.candidate, `heartbeat.json.${randomUUID()}.tmp`), 'temp', { mode: 0o600 });
   const before = await readdir(f.candidate);
-  const token = await storeFor(f).acquire('server-1');
+  let handle: Awaited<ReturnType<LeaseIO['opendir']>> | undefined;
+  const token = await storeFor(f, {
+    io: {
+      opendir: async (path, options) => {
+        const directory = await opendir(path, options);
+        if (path === f.candidate) handle = directory;
+        return directory;
+      },
+    },
+  }).acquire('server-1');
   assert.ok(token);
   assert.deepEqual(await readdir(f.candidate), before);
+  assert.ok(handle);
+  await assert.rejects(handle.read(), { code: 'ERR_DIR_CLOSED' });
+});
+
+test('cleanup closes a candidate iterator failing after successful reads without removing any children', async () => {
+  const f = await fixture();
+  const before = await readdir(f.candidate);
+  let handle: Awaited<ReturnType<LeaseIO['opendir']>> | undefined;
+  let reads = 0;
+  const removals: string[] = [];
+  const token = await storeFor(f, {
+    io: {
+      opendir: async (path, options) => {
+        if (path !== f.candidate) return opendir(path, options);
+        const directory = await opendir(path, options);
+        handle = directory;
+        return new Proxy(directory, {
+          get(target, key) {
+            if (key === 'read')
+              return async () => {
+                if (++reads === 3) throw new Error('injected midway read failure');
+                return target.read();
+              };
+            const value = Reflect.get(target, key, target) as unknown;
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+      unlink: async (path) => {
+        if (path.startsWith(`${f.candidate}/`)) removals.push(path);
+        await unlink(path);
+      },
+      rmdir: async (path, options) => {
+        if (String(path).startsWith(f.candidate)) removals.push(String(path));
+        await rmdir(path, options);
+      },
+    },
+  }).acquire('server-1');
+  assert.ok(token);
+  assert.equal(reads, 3);
+  assert.deepEqual(removals, []);
+  assert.deepEqual(await readdir(f.candidate), before);
+  assert.ok(handle);
+  await assert.rejects(handle.read(), { code: 'ERR_DIR_CLOSED' });
+  assert.equal(await storeFor(f).leaseMatches(token, 'server-1'), true);
+});
+
+test('cleanup retains owner and successor authority when a validated child disappears before unlink', async () => {
+  const f = await fixture();
+  const heartbeat = join(f.candidate, 'heartbeat.json');
+  const ownerBefore = await readFile(join(f.candidate, 'owner.json'), 'utf8');
+  let selectorBefore: string | undefined;
+  let disappeared = false;
+  const token = await storeFor(f, {
+    io: {
+      unlink: async (path) => {
+        if (path === heartbeat) {
+          selectorBefore = await readFile(join(f.root, 'active.json'), 'utf8');
+          await unlink(path);
+          disappeared = true;
+        }
+        await unlink(path);
+      },
+    },
+  }).acquire('server-1');
+  assert.ok(token);
+  assert.equal(disappeared, true);
+  await assert.rejects(lstat(heartbeat), { code: 'ENOENT' });
+  assert.equal(await readFile(join(f.candidate, 'owner.json'), 'utf8'), ownerBefore);
+  assert.equal(await readFile(join(f.root, 'active.json'), 'utf8'), selectorBefore);
+  assert.equal(await storeFor(f).leaseMatches(token, 'server-1'), true);
+});
+
+test('cleanup rejects a replacement guard even when candidate iteration also fails', async () => {
+  const f = await fixture();
+  const guard = join(f.directory, 'takeover-guard');
+  const before = await readdir(f.candidate);
+  let interrupted = false;
+  const store = storeFor(f, {
+    io: {
+      opendir: async (path, options) => {
+        const directory = await opendir(path, options);
+        if (path !== f.candidate) return directory;
+        return new Proxy(directory, {
+          get(target, key) {
+            if (key === 'read')
+              return async () => {
+                await rename(guard, `${guard}.saved`);
+                await writeFile(guard, 'replacement', { mode: 0o600 });
+                interrupted = true;
+                throw new Error('injected candidate read failure');
+              };
+            const value = Reflect.get(target, key, target) as unknown;
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+    },
+  });
+  await assert.rejects(store.acquire('server-1'), LeaseStateError);
+  assert.equal(interrupted, true);
+  assert.equal(await readFile(guard, 'utf8'), 'replacement');
+  assert.deepEqual(await readdir(f.candidate), before);
+  assert.equal(await store.active('server-1'), false);
 });
 
 for (const point of ['heartbeat.json', 'released', 'owner.json', 'generation'] as const) {
