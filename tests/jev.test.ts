@@ -5,7 +5,7 @@ import type { ClientRequest, IncomingMessage, RequestOptions } from 'node:http';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import type { ChoiceAnswer, Evaluation, NoulAnswer } from '../src/contracts.ts';
-import { ResultSchema, StewardError } from '../src/contracts.ts';
+import { EvaluationSchema, StewardError } from '../src/contracts.ts';
 import { MAX_JSON_BYTES } from '../src/limits.ts';
 import { choiceWinner, makeEvaluator, postHttps, validateEvaluation } from '../src/jev.ts';
 import type { HttpPost, Questions } from '../src/jev.ts';
@@ -330,7 +330,7 @@ test('choice ties use supplied order even when integer-like keys enumerate diffe
   assert.deepEqual(choiceWinner(choiceAnswer({ 2: 0.8, 10: 0.2 }), ['10', '2']), { winner: '2', tied: false });
 });
 
-test('prototype-like question and option IDs survive API and ResultSchema record parsing', () => {
+test('prototype-like question and option IDs survive API and evaluation contract parsing', () => {
   const ids = ['__proto__', 'constructor'];
   const criteria = Object.fromEntries(ids.map((id) => [id, `Option ${id}`]));
   const questions: Questions = Object.fromEntries([
@@ -349,20 +349,10 @@ test('prototype-like question and option IDs survive API and ResultSchema record
     assert.equal(Object.hasOwn(prototypeChoice.probabilities, key), true);
     assert.equal(prototypeChoice.probabilities[key], 0.5);
   }
-  const result = ResultSchema.parse({
-    schema_version: 1,
-    request_id: 'request-1',
-    decision: 'manual_review',
-    reason_code: 'unclear_waiting_state',
-    waiting_for: 'other',
-    waiting_confidence: 0.9,
-    risk_probability: 0.2,
-    evaluation,
-  });
-  if (!('evaluation' in result) || result.evaluation === null) throw new Error('expected evaluated approval result');
-  const resultChoice = choiceIn(result.evaluation, '__proto__');
+  const result = EvaluationSchema.parse(evaluation);
+  const resultChoice = choiceIn(result, '__proto__');
   for (const key of ids) {
-    assert.equal(Object.hasOwn(result.evaluation.answers, key), true);
+    assert.equal(Object.hasOwn(result.answers, key), true);
     assert.equal(Object.hasOwn(resultChoice.probabilities, key), true);
     assert.equal(resultChoice.probabilities[key], 0.5);
   }

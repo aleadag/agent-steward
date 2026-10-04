@@ -1,5 +1,5 @@
 import type {
-  ApprovalInput,
+  StopInput,
   Candidate,
   ChoiceAnswer,
   Config,
@@ -110,16 +110,26 @@ export function windowFact(
   } as QuotaWindow;
 }
 
-export function approval(overrides: Partial<ApprovalInput> | Record<string, unknown> = {}): ApprovalInput {
+export function stopInput(overrides: Partial<StopInput> | Record<string, unknown> = {}): StopInput {
   return {
-    schema_version: 1,
+    schema_version: 2,
     request_id: 'request-1',
-    agent: { id: 'agent-1', tool: 'codex' },
-    status: 'stopped',
+    agent: { id: 'agent-1', tool: 'codex', pane_id: 'w1:p1', session_id: null },
+    status: 'blocked',
+    current_episode_id: 'episode-1',
     context: 'Current prompt asks permission to update a local draft.',
+    pending_action: { action: 'Edit the local draft' },
     automatic_approval_forbidden: false,
+    retry: {
+      failure_episode_id: 'episode-1',
+      first_observed_at: '2026-09-29T10:00:00Z',
+      attempt_count: 0,
+      last_attempt_at: null,
+      quota_check_count: 0,
+      last_quota_check_at: null,
+    },
     ...overrides,
-  } as ApprovalInput;
+  } as StopInput;
 }
 
 export async function runSubcase(label: string, run: () => Promise<void>): Promise<void> {

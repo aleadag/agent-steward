@@ -366,12 +366,7 @@ function decisionExitCode(result: Result | StopResult): number {
   }
   switch (result.decision) {
     case 'selected':
-    case 'approve':
       return 0;
-    case 'manual_review':
-      return 2;
-    case 'no_action':
-      return 3;
     case 'error':
       return 1;
   }

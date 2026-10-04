@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import type { ErrorCode, StopResult } from '../src/contracts.ts';
 import {
-  ApprovalInputSchema,
   ConfigSchema,
   ResultSchema,
   SnapshotSchema,
@@ -12,7 +11,7 @@ import {
   errorResult,
 } from '../src/contracts.ts';
 import * as contractExports from '../src/contracts.ts';
-import { approval, candidate, config, evaluation, snapshot, windowFact } from './helpers.ts';
+import { stopInput, candidate, config, evaluation, snapshot, windowFact } from './helpers.ts';
 
 type StopDecision = Extract<StopResult, { decision: 'stop_decision' }>;
 
@@ -270,33 +269,38 @@ test('snapshot ordering preserves sub-millisecond RFC 3339 precision and offset 
   for (const window of invalidWindows) assert.equal(SnapshotSchema.safeParse(snapshot([window])).success, false);
 });
 
-test('approval input keeps context and action optional, permits arbitrary agent labels, and defaults restriction false', () => {
-  const { automatic_approval_forbidden: _restriction, context: _context, ...bare } = approval();
-  const parsed = ApprovalInputSchema.parse(bare);
+test('stop input keeps context and action optional, permits arbitrary agent labels, and defaults restriction false', () => {
+  const {
+    automatic_approval_forbidden: _restriction,
+    context: _context,
+    pending_action: _action,
+    ...bare
+  } = stopInput();
+  const parsed = StopInputSchema.parse(bare);
   assert.equal(parsed.automatic_approval_forbidden, false);
   assert.equal(parsed.context, undefined);
   assert.equal(
-    ApprovalInputSchema.safeParse({ ...approval(), agent: { id: 'agent', tool: 'an-unlisted-tool' } }).success,
+    StopInputSchema.safeParse({ ...stopInput(), agent: { ...stopInput().agent, tool: 'an-unlisted-tool' } }).success,
     true,
   );
-  assert.equal(ApprovalInputSchema.safeParse({ ...approval(), schema_version: 2 }).success, false);
-  assert.equal(ApprovalInputSchema.safeParse({ ...approval(), unexpected: true }).success, false);
+  assert.equal(StopInputSchema.safeParse({ ...stopInput(), schema_version: 1 }).success, false);
+  assert.equal(StopInputSchema.safeParse({ ...stopInput(), unexpected: true }).success, false);
   assert.equal(
-    ApprovalInputSchema.safeParse({ ...approval(), pending_action: { action: null, secret: 'bad' } }).success,
+    StopInputSchema.safeParse({ ...stopInput(), pending_action: { action: null, secret: 'bad' } }).success,
     false,
   );
   assert.equal(
-    ApprovalInputSchema.safeParse({ ...approval(), context: { terminal: 'output', custom: true } }).success,
+    StopInputSchema.safeParse({ ...stopInput(), context: { terminal: 'output', custom: true } }).success,
     true,
   );
 });
 
-test('approval context preserves own __proto__ keys at the top level and in nested objects', () => {
+test('stop context preserves own __proto__ keys at the top level and in nested objects', () => {
   const context = JSON.parse(
     '{"__proto__":"top-level restriction","terminal":"approve","nested":{"__proto__":"nested restriction","constructor":"nested evidence"}}',
   );
   const before = Object.getOwnPropertyDescriptor(Object.prototype, 'polluted');
-  const parsed = ApprovalInputSchema.safeParse(approval({ context }));
+  const parsed = StopInputSchema.safeParse(stopInput({ context }));
   assert.equal(parsed.success, true);
   if (!parsed.success) return;
   const parsedContext = parsed.data.context;
@@ -314,10 +318,10 @@ test('approval context preserves own __proto__ keys at the top level and in nest
   assert.deepEqual(Object.getOwnPropertyDescriptor(Object.prototype, 'polluted'), before);
 });
 
-test('approval context accepts and preserves an own constructor key', () => {
+test('stop context accepts and preserves an own constructor key', () => {
   const context = JSON.parse('{"constructor":"approval restriction","nested":{"constructor":"nested restriction"}}');
   const before = Object.getOwnPropertyDescriptor(Object.prototype, 'polluted');
-  const parsed = ApprovalInputSchema.safeParse(approval({ context }));
+  const parsed = StopInputSchema.safeParse(stopInput({ context }));
   assert.equal(parsed.success, true);
   if (!parsed.success) return;
   const parsedContext = parsed.data.context;
@@ -344,12 +348,7 @@ test('stop example parses as a version-2 observation with episode-matched retry 
   assert.equal(parsed.automatic_approval_forbidden, false);
 });
 
-test('result contract accepts the shared selected, evaluated approval, local approval, and error envelopes', () => {
-  const evalResult = evaluation({
-    waiting_for: { type: 'choice', choice: 'approve_command', probabilities: { approve_command: 1 }, confidence: 0.9 },
-    risky: { type: 'noul', noul: 0.2 },
-  });
-  const common = { schema_version: 1, request_id: 'request-1', evaluation: evalResult };
+test('result contract accepts selected and error envelopes, but rejects retired approval envelopes', () => {
   const selected = {
     schema_version: 1,
     request_id: 'route-1',
@@ -410,7 +409,9 @@ test('result contract accepts the shared selected, evaluated approval, local app
     true,
   );
   const approvalResult = {
-    ...common,
+    schema_version: 1,
+    request_id: 'request-1',
+    evaluation: evaluation({}),
     decision: 'approve',
     reason_code: 'low_risk',
     waiting_for: 'approve_command',
@@ -434,16 +435,14 @@ test('result contract accepts the shared selected, evaluated approval, local app
     reason_code: 'invalid_config',
     message: 'Configuration is invalid.',
   };
-  for (const value of [selected, approvalResult, local, error])
-    assert.equal(ResultSchema.safeParse(value).success, true);
+  for (const value of [selected, error]) assert.equal(ResultSchema.safeParse(value).success, true);
+  for (const value of [approvalResult, local]) assert.equal(ResultSchema.safeParse(value).success, false);
   assert.equal(ResultSchema.safeParse({ ...local, risk_probability: 0 }).success, false);
   assert.equal(ResultSchema.safeParse({ ...approvalResult, unknown: true }).success, false);
   assert.equal(ResultSchema.safeParse({ ...error, reason_code: 'made_up' }).success, false);
 
   const missingRequiredFields = [
     (({ planned_command: _plannedCommand, ...value }) => value)(selected),
-    (({ evaluation: _evaluation, ...value }) => value)(approvalResult),
-    (({ risk_probability: _riskProbability, ...value }) => value)(local),
     (({ message: _message, ...value }) => value)(error),
   ];
   for (const value of missingRequiredFields) assert.equal(ResultSchema.safeParse(value).success, false);
@@ -451,44 +450,6 @@ test('result contract accepts the shared selected, evaluated approval, local app
   for (const value of [selected, approvalResult, local, error]) {
     assert.equal(ResultSchema.safeParse({ ...value, schema_version: 2 }).success, false);
   }
-});
-
-test('evaluated approval result decision and reason codes must agree', () => {
-  const valid = {
-    schema_version: 1,
-    request_id: 'request-1',
-    decision: 'approve',
-    reason_code: 'low_risk',
-    waiting_for: 'approve_command',
-    waiting_confidence: 0.9,
-    risk_probability: 0.1,
-    evaluation: evaluation({
-      waiting_for: {
-        type: 'choice',
-        choice: 'approve_command',
-        probabilities: {
-          approve_command: 1,
-          approve_edit: 0,
-          answer_question: 0,
-          credentials: 0,
-          error_help: 0,
-          other: 0,
-        },
-        confidence: 0.9,
-      },
-      risky: { type: 'noul', noul: 0.1 },
-    }),
-  };
-  assert.equal(ResultSchema.safeParse(valid).success, true);
-  for (const value of [
-    { ...valid, decision: 'approve', reason_code: 'high_risk' },
-    { ...valid, decision: 'no_action', reason_code: 'low_risk' },
-    { ...valid, decision: 'no_action', reason_code: 'not_approval' },
-    { ...valid, decision: 'approve', reason_code: 'not_approval', waiting_for: 'answer_question' },
-    { ...valid, decision: 'manual_review', reason_code: 'explicit_restriction', waiting_for: 'answer_question' },
-    { ...valid, decision: 'manual_review', reason_code: 'high_risk', waiting_for: 'other' },
-  ])
-    assert.equal(ResultSchema.safeParse(value).success, false);
 });
 
 test('error envelopes expose only catalogued messages and safe codes', () => {
@@ -797,6 +758,6 @@ test('version-2 stop results enforce action, reason, classification, and metric 
     risk_probability: 0.1,
     evaluation: evaluation({}),
   };
-  assert.equal(ResultSchema.safeParse(version1Approval).success, true);
+  assert.equal(ResultSchema.safeParse(version1Approval).success, false);
   assert.equal(StopResultSchema.safeParse(version1Approval).success, false);
 });

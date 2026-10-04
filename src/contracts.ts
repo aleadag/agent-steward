@@ -150,27 +150,6 @@ export const SnapshotSchema = z.strictObject({
   windows: z.array(QuotaWindowSchema),
 });
 
-export const ApprovalInputSchema = z.strictObject({
-  schema_version: z.literal(1),
-  request_id: text,
-  agent: z.strictObject({ id: text, tool: text }),
-  status: z.literal('stopped'),
-  context: z.union([z.null(), z.string(), ApprovalContextObjectSchema]).optional(),
-  pending_action: z
-    .union([
-      z.null(),
-      z.strictObject({
-        action: z.union([z.string(), z.null()]).optional(),
-        target: z.union([z.string(), z.null()]).optional(),
-        permissions: z.union([z.string(), z.null()]).optional(),
-        user_intent: z.union([z.string(), z.null()]).optional(),
-        environment: z.union([z.string(), z.null()]).optional(),
-      }),
-    ])
-    .optional(),
-  automatic_approval_forbidden: z.boolean().default(false),
-});
-
 const StopAgentSchema = z.strictObject({
   id: text,
   tool: text,
@@ -299,46 +278,6 @@ const SelectedResultSchema = z.strictObject({
     pair: EvaluationSchema,
     effort: z.union([EvaluationSchema, z.strictObject({ kind: z.literal('fixed'), level: text })]),
   }),
-});
-const EvaluatedApprovalResultSchema = z
-  .strictObject({
-    schema_version: z.literal(1),
-    request_id: text,
-    decision: z.enum(['approve', 'manual_review', 'no_action']),
-    reason_code: z.enum(['low_risk', 'high_risk', 'unclear_waiting_state', 'not_approval', 'explicit_restriction']),
-    waiting_for: z.enum(['approve_command', 'approve_edit', 'answer_question', 'credentials', 'error_help', 'other']),
-    waiting_confidence: probability,
-    risk_probability: probability,
-    evaluation: EvaluationSchema,
-  })
-  .superRefine((result, context) => {
-    const approvalRequest = result.waiting_for === 'approve_command' || result.waiting_for === 'approve_edit';
-    const nonApproval =
-      result.waiting_for === 'answer_question' ||
-      result.waiting_for === 'credentials' ||
-      result.waiting_for === 'error_help';
-    const consistent =
-      result.reason_code === 'low_risk'
-        ? result.decision === 'approve' && approvalRequest
-        : result.reason_code === 'high_risk'
-          ? result.decision === 'manual_review' && approvalRequest
-          : result.reason_code === 'unclear_waiting_state'
-            ? result.decision === 'manual_review'
-            : result.reason_code === 'not_approval'
-              ? result.decision === 'no_action' && nonApproval
-              : result.decision === 'manual_review' && approvalRequest;
-    if (!consistent)
-      context.addIssue({ code: 'custom', path: ['decision'], message: 'Decision and reason do not match' });
-  });
-const LocalApprovalResultSchema = z.strictObject({
-  schema_version: z.literal(1),
-  request_id: text,
-  decision: z.literal('manual_review'),
-  reason_code: z.literal('insufficient_context'),
-  waiting_for: z.null(),
-  waiting_confidence: z.null(),
-  risk_probability: z.null(),
-  evaluation: z.null(),
 });
 export const FailureDiagnosticsSchema = z.strictObject({
   stage: z.enum(['input', 'config', 'preflight', 'quota', 'credentials', 'evaluation', 'response', 'launch']),
@@ -525,12 +464,7 @@ const StopDecisionResultSchema = z
 const StopErrorResultSchema = ErrorResultSchema.extend({ schema_version: z.literal(2) });
 export const StopResultSchema = z.union([StopDecisionResultSchema, StopErrorResultSchema]);
 
-export const ResultSchema = z.union([
-  SelectedResultSchema,
-  EvaluatedApprovalResultSchema,
-  LocalApprovalResultSchema,
-  ErrorResultSchema,
-]);
+export const ResultSchema = z.union([SelectedResultSchema, ErrorResultSchema]);
 
 export type Config = z.infer<typeof ConfigSchema>;
 export type QuotaBucket = z.infer<typeof QuotaBucketSchema>;
@@ -539,15 +473,11 @@ export type Candidate = Config['candidates'][number];
 export type ThinkingLevel = Candidate['thinking_levels'][number];
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 export type QuotaWindow = Snapshot['windows'][number];
-export type ApprovalInput = z.infer<typeof ApprovalInputSchema>;
 export type StopInput = z.infer<typeof StopInputSchema>;
 export type QuotaFacts = z.infer<typeof QuotaFactsSchema>;
 export type QuotaWindowFact = z.infer<typeof QuotaWindowFactSchema>;
 export type PlannedCommand = z.infer<typeof PlannedCommandSchema>;
 export type SelectedResult = z.infer<typeof SelectedResultSchema>;
-export type EvaluatedApprovalResult = z.infer<typeof EvaluatedApprovalResultSchema>;
-export type LocalApprovalResult = z.infer<typeof LocalApprovalResultSchema>;
-export type ApprovalResult = EvaluatedApprovalResult | LocalApprovalResult;
 export type ErrorResult = z.infer<typeof ErrorResultSchema>;
 export type ChoiceAnswer = z.infer<typeof ChoiceAnswerSchema>;
 export type NoulAnswer = z.infer<typeof NoulAnswerSchema>;
