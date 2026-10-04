@@ -1,6 +1,6 @@
 ---
 name: agent-steward
-description: Use to route and launch a task with agent-steward, inspect or refresh local quota snapshots, or assess a stopped agent. Session inspection and effort adjustment are not supported.
+description: Use to check local agent-steward installation/configuration, route and launch a task, inspect or refresh local quota snapshots, or assess a stopped agent. Session inspection and effort adjustment are not supported.
 ---
 
 # Agent Steward
@@ -11,6 +11,7 @@ Use `agent-steward` to route a task to a native Codex, Pi, or agy executable, or
 
 ```bash
 agent-steward --help
+agent-steward --config ./config.json doctor --json
 # Interactive terminal: live foreground start.
 agent-steward --config ./config.json router start "Review the parser"
 # Non-TTY caller: JSON route preview only, no launch.
@@ -26,7 +27,13 @@ agent-steward quota hook agy
 agent-steward --config ./config.json stop check < stopped-state.json
 ```
 
-The `--` separator ends option parsing. Everything after it is one task argument, so `--help` in the fourth form is task text. Without the separator, give the task as one shell argument, normally by quoting it. The `stopped-state.json` file in the final form is user-prepared; the CLI does not discover or create it. [`examples/stop.json`](../../examples/stop.json) shows its version-2 shape.
+The `--` separator ends option parsing. Everything after it is one task argument, so `--help` in the `router start --dry-run --` form is task text. Without the separator, give the task as one shell argument, normally by quoting it. The `stopped-state.json` file in the final form is user-prepared; the CLI does not discover or create it. [`examples/stop.json`](../../examples/stop.json) shows its version-2 shape.
+
+## Check local installation
+
+Use `doctor [--json]` to diagnose config read/JSON/schema failures, enabled candidate syntax, unsafe PATH entries, missing executables for enabled referenced tools, and missing evaluator API keys. Human output uses ✅ (pass), ❌ (fail), and ⏭️ (skipped), with fixes indented on separate lines; JSON keeps the status strings. Independent checks continue after failures. Exit 0 means all required checks passed; failures exit 1. JSON includes `schema_version: 1`, `ok`, and `checks`, with credential-checked config field names when available, never config values or raw errors. A doctor report is not a routing or stop decision.
+
+Doctor needs no TTY and performs no network calls, agent launches, native auth-store reads, quota reads, history writes, or repairs. Executable versions, login state, and key validity are unverified. A missing evaluator key fails this readiness check even when a command such as local history inspection needs no key. Apply fixes only within the caller's authorization; doctor does not authorize installing tools or changing configuration.
 
 ## Inspect recorded routes
 

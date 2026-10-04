@@ -79,6 +79,126 @@ function runtime(overrides: Partial<Runtime> = {}) {
   return { out, err, reads, launches, io, files };
 }
 
+test('doctor parses config and JSON flags and rejects extra arguments', () => {
+  assert.deepEqual(parseArgs(['--config', 'local.json', 'doctor', '--json']), {
+    kind: 'doctor',
+    config: 'local.json',
+    json: true,
+  });
+  assert.deepEqual(parseArgs(['doctor', '--help']), { kind: 'help' });
+  for (const flags of [['extra'], ['--json', '--json'], ['--', 'task'], ['--dry-run']])
+    assert.throws(() => parseArgs(['doctor', ...flags]));
+});
+
+test('doctor checks only enabled referenced tools without network, launches, auth reads or writes', async () => {
+  const cfg = config({
+    tools: ['codex', 'pi'],
+    candidates: [candidate(), candidate({ id: 'disabled', tool: 'agy', quota_bucket: 'antigravity' })],
+  });
+  const { io, out, err, reads, launches, files } = runtime({
+    env: { HOME: '/isolated/home', PATH: '/isolated/bin', TYPESAFE_API_KEY: 'OpaqueSecretValue' },
+    terminal: { stdin: false, stdout: false },
+    readText: async (path) => {
+      reads.push(path);
+      assert.equal(path, '/isolated/work/local.json');
+      return JSON.stringify(cfg);
+    },
+    executableAvailable: (tool, path) => tool === 'codex' && path === '/isolated/bin',
+  });
+  assert.equal(await run(['doctor', '--config', 'local.json', '--json'], io), 0);
+  const report = JSON.parse(out.join(''));
+  assert.equal(report.ok, true);
+  assert.deepEqual(
+    report.checks.map((check: { id: string; status: string }) => [check.id, check.status]),
+    [
+      ['config', 'pass'],
+      ['path', 'pass'],
+      ['executable.codex', 'pass'],
+      ['evaluator_key', 'pass'],
+    ],
+  );
+  assert.equal(reads.length, 1);
+  assert.equal(launches.length, 0);
+  assert.equal(files.size, 0);
+  assert.equal(err.join(''), '');
+  assert.doesNotMatch(out.join(''), /OpaqueSecretValue/);
+});
+
+test('doctor continues independent checks after config failures and skips config-dependent checks', async () => {
+  for (const [contents, kind] of [
+    [null, 'read'],
+    ['{', 'json'],
+    [JSON.stringify({ tools: [] }), 'schema'],
+  ] as const) {
+    const { io, out } = runtime({
+      env: { HOME: '/isolated/home', PATH: 'relative' },
+      readText: async () => {
+        if (contents === null) throw new Error('private raw failure');
+        return contents;
+      },
+    });
+    assert.equal(await run(['doctor', '--json'], io), 1);
+    const report = JSON.parse(out.join(''));
+    assert.equal(report.ok, false);
+    assert.equal(report.checks[0].kind, kind);
+    assert.deepEqual(
+      report.checks.map((check: { status: string }) => check.status),
+      ['fail', 'fail', 'skipped', 'skipped'],
+    );
+    assert.ok(report.checks[0].fix);
+    assert.doesNotMatch(out.join(''), /private raw failure/);
+  }
+});
+
+test('doctor reports missing executables and selected evaluator key with actionable fixes', async () => {
+  const { io, out } = runtime({
+    env: {
+      HOME: '/isolated/home',
+      PATH: '/isolated/bin',
+      TYPESAFE_API_KEY: 'wrong-provider-key',
+      OPENROUTER_API_KEY: '  ',
+    },
+    readText: async () => JSON.stringify(config({ evaluator: { type: 'jev', provider: 'openrouter' } })),
+    executableAvailable: () => false,
+  });
+  assert.equal(await run(['doctor'], io), 1);
+  assert.match(out.join(''), /❌ executable.codex — Executable is unavailable\.\n\tFix: Install codex/);
+  assert.match(out.join(''), /✅ config —/);
+  assert.doesNotMatch(out.join(''), /: (?:pass|fail|skipped) -/);
+  assert.match(out.join(''), /Install codex/);
+  assert.match(out.join(''), /OPENROUTER_API_KEY/);
+  assert.doesNotMatch(out.join(''), /wrong-provider-key/);
+});
+
+test('doctor rejects empty candidate sets and does not echo unsafe config fields or paths', async () => {
+  for (const cfg of [config({ candidates: [] }), { ...config(), OpaqueSecretValue: 'private' }]) {
+    const { io, out } = runtime({
+      env: { HOME: '/isolated/home', PATH: '/isolated/bin', TYPESAFE_API_KEY: 'OpaqueSecretValue' },
+      readText: async () => JSON.stringify(cfg),
+    });
+    assert.equal(await run(['doctor', '--config', 'OpaqueSecretValue.json', '--json'], io), 1);
+    const report = JSON.parse(out.join(''));
+    assert.equal(report.checks[0].status, 'fail');
+    assert.doesNotMatch(out.join(''), /OpaqueSecretValue|private/);
+  }
+});
+
+test('doctor output privacy failures remain local without publishing launcher logs', async () => {
+  let logs = 0;
+  const { io, out, err } = runtime({
+    env: { HOME: '/isolated/home', PATH: '/isolated/bin', TYPESAFE_API_KEY: 'evaluator_key' },
+    readText: async () => JSON.stringify(config()),
+    executableAvailable: () => true,
+    logFailure: async () => {
+      logs++;
+    },
+  });
+  assert.equal(await run(['doctor', '--json'], io), 1);
+  assert.equal(JSON.parse(out.join('')).reason_code, 'credential_detected');
+  assert.doesNotMatch(out.join('') + err.join(''), /evaluator_key/);
+  assert.equal(logs, 0);
+});
+
 test('OpenRouter routing uses only its selected credential and records normalized Jev answers', async () => {
   const cfg = routeConfig();
   cfg.evaluator = { type: 'jev', provider: 'openrouter', model: '~typesafe/jev-latest' };

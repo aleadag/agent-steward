@@ -37,6 +37,7 @@ function parseUsageForm(line: string): Invocation {
   form = form.replace('router list [--limit <n>]', 'router list');
   form = form.replace('router show <request-id> [--json]', 'router show "generated-id" --json');
   form = form.replace('stop check < stopped-state.json', 'stop check');
+  form = form.replace('doctor [--json]', 'doctor --json');
   form = form.replace('quota refresh [--json]', 'quota refresh --json');
   form = form.replace('quota show [--json]', 'quota show --json');
   return parseArgs(shellWords(form));
@@ -123,6 +124,7 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
     invocations.map((item) => item.kind),
     [
       'help',
+      'doctor',
       'route',
       'route',
       'route',

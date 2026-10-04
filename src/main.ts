@@ -73,6 +73,9 @@ export const httpGet: QuotaHttpGet = async (url, headers) => {
 export function createRuntime(): Runtime {
   const runtime: Runtime = {
     env: {
+      get PATH() {
+        return process.env.PATH;
+      },
       get HOME() {
         return process.env.HOME;
       },
@@ -95,6 +98,7 @@ export function createRuntime(): Runtime {
         return process.env.PI_CODING_AGENT_DIR;
       },
     },
+    executableAvailable: (tool, path) => Bun.which(tool, { PATH: path }) !== null,
     cwd: process.cwd(),
     readText: readFileText,
     writeText: (path: string, text: string, mode: number) =>

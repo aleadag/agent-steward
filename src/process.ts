@@ -22,10 +22,13 @@ function signalExitCode(signal: NodeJS.Signals | null): number {
   return 1;
 }
 
+export function isSafeSearchPath(path: string | undefined): boolean {
+  const paths = path?.split(delimiter);
+  return paths !== undefined && paths.length > 0 && paths.every((entry) => entry.length > 0 && isAbsolute(entry));
+}
+
 export async function launchForeground(command: NativeLaunch, options: LaunchOptions): Promise<number> {
-  const paths = options.env.PATH?.split(delimiter);
-  if (!paths?.length || paths.some((entry) => entry.length === 0 || !isAbsolute(entry)))
-    throw new StewardError('launch_failed');
+  if (!isSafeSearchPath(options.env.PATH)) throw new StewardError('launch_failed');
 
   const env = Object.fromEntries(
     Object.entries(options.env).filter(([key]) => key.toUpperCase() !== 'TYPESAFE_API_KEY'),

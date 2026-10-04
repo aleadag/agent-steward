@@ -55,6 +55,8 @@ These are optional manual instructions only. Agent-steward does not install skil
 
 ```sh
 agent-steward --help
+agent-steward --config ./config.json doctor
+agent-steward --config ./config.json doctor --json
 agent-steward --config ./config.json router start "Review the parser"
 agent-steward --config ./config.json router start "Review the parser" --dry-run --json
 agent-steward --config ./config.json router start --dry-run -- "--help"
@@ -65,7 +67,15 @@ agent-steward --config ./config.json quota refresh --json
 agent-steward --config ./config.json stop check < stopped-state.json
 ```
 
-The first `router start` command launches the selected native agent in the foreground; the next returns a JSON route preview without launching. The `--` separator ends option parsing. The fourth command previews the literal task `--help`; text after the separator is never treated as a CLI option. For start, stop, quota refresh, and quota show, `--config <path>` can appear before or after command tokens, before the separator. List and show reject `--config`. Each route task is exactly one argument; quote multiword tasks. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
+The first `router start` command launches the selected native agent in the foreground; the next returns a JSON route preview without launching. The `--` separator ends option parsing. The `router start --dry-run --` command previews the literal task `--help`; text after the separator is never treated as a CLI option. For doctor, start, stop, quota refresh, and quota show, `--config <path>` can appear before or after command tokens, before the separator. List and show reject `--config`. Each route task is exactly one argument; quote multiword tasks. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
+
+### Local installation checks
+
+Run `agent-steward doctor` to check config readability, JSON/schema validity, enabled candidate syntax, PATH safety, required native executables, and the selected evaluator's API-key presence. It checks only enabled tools referenced by candidates. All PATH entries must be nonempty and absolute, matching live-launch requirements.
+
+Human output marks checks with ✅ (pass), ❌ (fail), or ⏭️ (skipped), with suggested fixes indented on separate lines. JSON retains `pass`, `fail`, and `skipped` status strings. Independent checks continue after a failure; checks needing valid config or a safe PATH are skipped. Exit status is 0 when all required checks pass and 1 otherwise. `--json` returns `{ "schema_version": 1, "ok": true|false, "checks": [...] }`; each check includes `id`, `status`, and `message`, with `fix` on failures. Config failures also include `kind` (`read`, `json`, or `schema`) and may include credential-checked field names, never values or raw errors.
+
+Doctor runs offline without a terminal. It does not launch executables, read native auth stores or quota snapshots, contact providers, write history, or repair files. Executable versions, login state, and key validity remain unverified. Missing evaluator keys fail the readiness check even though commands such as local history inspection do not need them. A separate Node executable is not required by the packaged CLI.
 
 ### Local route history
 

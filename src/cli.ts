@@ -1,6 +1,8 @@
 import { StopInputSchema, StopResultSchema, StewardError, errorResult } from './contracts.ts';
 import type { ErrorResult, FailureDiagnostics, Result, SelectedResult, StopInput, StopResult } from './contracts.ts';
 import { loadConfig } from './config.ts';
+import { diagnose, renderDoctor } from './doctor.ts';
+import type { DoctorIO } from './doctor.ts';
 import { validateCandidateSyntax, shellQuote } from './commands.ts';
 import { agyPaths } from './agy-setup.ts';
 import { assertByteLength, assertJsonDepth } from './limits.ts';
@@ -21,6 +23,7 @@ import type { AgyHookResult } from './agy-hook.ts';
 
 export type Invocation =
   | { kind: 'help' }
+  | { kind: 'doctor'; config?: string; json: boolean }
   | { kind: 'quota-setup-agy' }
   | { kind: 'quota-hook-agy' }
   | { kind: 'route'; config?: string; task: string; dryRun: boolean; json: boolean }
@@ -31,7 +34,13 @@ export type Invocation =
   | { kind: 'quota-show'; config?: string; json: boolean };
 
 export type Runtime = QuotaRefreshIO & {
-  env: QuotaRefreshIO['env'] & { XDG_CONFIG_HOME?: string; TYPESAFE_API_KEY?: string; OPENROUTER_API_KEY?: string };
+  env: QuotaRefreshIO['env'] & {
+    XDG_CONFIG_HOME?: string;
+    TYPESAFE_API_KEY?: string;
+    OPENROUTER_API_KEY?: string;
+    PATH?: string;
+  };
+  executableAvailable?: DoctorIO['executableAvailable'];
   appendText: (path: string, text: string) => Promise<void>;
   readTextIfPresent: (path: string) => Promise<string | null>;
   mkdirp: (path: string, mode: number) => Promise<void>;
@@ -57,6 +66,7 @@ const HELP = `agent-steward - standalone task routing and stopped-agent decision
 
 Usage:
   agent-steward --help
+  agent-steward [--config <path>] doctor [--json]
   agent-steward [--config <path>] router start <task>
   agent-steward [--config <path>] router start <task> --dry-run [--json]
   agent-steward [--config <path>] router start --dry-run -- <task>
@@ -80,6 +90,8 @@ Quota refresh collects Codex/Pi/AGY quota into $XDG_STATE_HOME/agent-steward/quo
 AGY requires explicit hook setup and native trust of its dedicated workdir; missing quota remains unknown.
 Quota show reads saved snapshots only, with relative capture/reset times; stale percentages are historical.
 Routing reads snapshots only. Show/refresh/setup/hook need no Jev key or caller terminal.
+Doctor checks local config, PATH, required executables and evaluator key presence only.
+Doctor does not read native auth stores, contact providers, launch agents or change files.
 Stop check reads JSON from stdin and writes a version-2 JSON result.
 `;
 
@@ -152,6 +164,14 @@ export function parseArgs(argv: readonly string[]): Invocation {
     if (kind === 'list') return { kind, limit, json };
     if (requestId === undefined) invalidInput();
     return { kind: 'show', requestId, json };
+  }
+
+  if (commandTokens[0] === 'doctor') {
+    const flags = commandTokens.slice(1);
+    if (separator >= 0 || flags.length > 1 || flags.some((flag) => flag !== '--json')) invalidInput();
+    if (help) return { kind: 'help' };
+    const invocation: Extract<Invocation, { kind: 'doctor' }> = { kind: 'doctor', json: flags.length === 1 };
+    return config === undefined ? invocation : { ...invocation, config };
   }
 
   if (commandTokens[0] === 'quota' && (commandTokens[1] === 'setup' || commandTokens[1] === 'hook')) {
@@ -494,6 +514,22 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
   if (invocation.kind === 'help') {
     runtime.stdout(HELP);
     return 0;
+  }
+
+  if (invocation.kind === 'doctor') {
+    try {
+      const report = await diagnose(invocation.config, runtime);
+      assertNoCredentials(report, readOptionalApiKey(runtime));
+      const text = invocation.json ? `${JSON.stringify(report)}\n` : renderDoctor(report);
+      assertNoCredentials(text, readOptionalApiKey(runtime));
+      runtime.stdout(text);
+      return report.ok ? 0 : 1;
+    } catch (error) {
+      const failure = safeError(error, null, readOptionalApiKey(runtime));
+      emitJson(runtime, failure);
+      if (!invocation.json) runtime.stderr(`agent-steward: ${failure.reason_code}\n`);
+      return 1;
+    }
   }
 
   if (invocation.kind === 'list' || invocation.kind === 'show') {
