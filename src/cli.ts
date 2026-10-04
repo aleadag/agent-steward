@@ -502,7 +502,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       if (invocation.kind === 'list') {
         const listed = records.slice(0, invocation.limit);
         if (invocation.json) runtime.stdout(`${JSON.stringify(listed)}\n`);
-        else if (listed.length > 0) runtime.stdout(formatLedgerRecords(listed));
+        else if (listed.length > 0) runtime.stdout(formatLedgerRecords(listed, runtime.now()));
       } else {
         const record = records.find((record) => record.request_id === invocation.requestId);
         if (record === undefined) {

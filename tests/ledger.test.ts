@@ -277,6 +277,7 @@ test('oversized UTF-8 events are rejected without changing retained history', as
 
 test('human list aligns headers and full IDs while retaining exit codes and JSON history', async () => {
   const { rt, out } = memoryRuntime(new Map(), { XDG_STATE_HOME: '/isolated/state' });
+  rt.now = () => new Date('2026-10-02T17:06:29.732Z');
   await appendEvent(rt, {
     schema_version: 1,
     request_id: '7f032e75-fc1f-40e1-ac78-1e5a2cbb1d26',
@@ -301,15 +302,15 @@ test('human list aligns headers and full IDs while retaining exit codes and JSON
   const [header, failed, exited, end] = out.join('').split('\n');
   assert.equal(
     header,
-    'REQUEST ID                            TIME (UTC)           ROUTE                 ACCOUNT   STATUS             EXIT CODE',
+    'REQUEST ID                            TIME    ROUTE                 ACCOUNT   STATUS             EXIT CODE',
   );
   assert.equal(
     failed,
-    '102da780-0ae6-49fa-9b88-1ce041d71f57  2026-10-02 14:22:14  —                     —         evaluation_failed  —',
+    '102da780-0ae6-49fa-9b88-1ce041d71f57  2h ago  —                     —         evaluation_failed  —',
   );
   assert.equal(
     exited,
-    '7f032e75-fc1f-40e1-ac78-1e5a2cbb1d26  2026-10-02 17:01:29  pi/gpt-6.1-sol/xhigh  pi_codex  exited             0',
+    '7f032e75-fc1f-40e1-ac78-1e5a2cbb1d26  5m ago  pi/gpt-6.1-sol/xhigh  pi_codex  exited             0',
   );
   assert.equal(end, '');
   out.length = 0;
@@ -320,11 +321,35 @@ test('human list aligns headers and full IDs while retaining exit codes and JSON
   assert.equal(records[1].exit_code, 0);
 });
 
+test('human list displays compact relative times using the runtime clock', async () => {
+  for (const [recorded_at, expected] of [
+    ['2026-10-02T12:00:00Z', 'just now'],
+    ['2026-10-02T11:59:01Z', 'just now'],
+    ['2026-10-02T11:59:00Z', '1m ago'],
+    ['2026-10-02T11:55:00Z', '5m ago'],
+    ['2026-10-02T11:00:00Z', '1h ago'],
+    ['2026-10-02T10:00:00Z', '2h ago'],
+    ['2026-10-01T12:00:00Z', '1d ago'],
+    ['2026-09-29T12:00:00Z', '3d ago'],
+    ['2026-10-02T14:00:00+02:00', 'just now'],
+    ['2026-10-02T12:05:00Z', 'in 5m'],
+  ] as const) {
+    const files = new Map<string, string>();
+    const { rt, out } = memoryRuntime(files, { XDG_STATE_HOME: '/isolated/state' });
+    rt.now = () => new Date('2026-10-02T12:00:00Z');
+    await appendEvent(rt, { ...rotationEvent, recorded_at });
+    const before = files.get(ledgerFile(rt.env));
+    assert.equal(await run(['router', 'list'], rt), 0);
+    assert.deepEqual(out.join('').split('\n')[1]!.split(/ {2,}/), ['boundary', expected, '—', '—', 'dry-run']);
+    assert.equal(files.get(ledgerFile(rt.env)), before);
+  }
+});
+
 test('human list omits the exit column when no exit codes are recorded', async () => {
   const { rt, out } = memoryRuntime(new Map(), { XDG_STATE_HOME: '/isolated/state' });
   await appendEvent(rt, { ...rotationEvent, recorded_at: 'historical-time' });
   assert.equal(await run(['router', 'list'], rt), 0);
-  assert.match(out.join(''), /^REQUEST ID\s+TIME \(UTC\)\s+ROUTE\s+ACCOUNT\s+STATUS\n/);
+  assert.match(out.join(''), /^REQUEST ID\s+TIME\s+ROUTE\s+ACCOUNT\s+STATUS\n/);
   assert.doesNotMatch(out.join(''), /EXIT CODE/);
   assert.match(out.join(''), /historical-time/);
 });

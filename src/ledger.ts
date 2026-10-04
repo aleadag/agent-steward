@@ -117,15 +117,30 @@ export async function readLedger(runtime: LedgerRuntime): Promise<LedgerRecord[]
   return [...folded.values()].reverse();
 }
 
-export function formatLedgerRecords(records: LedgerRecord[]): string {
+function relativeLedgerTime(timestamp: string, now: Date): string {
+  const seconds = (Date.parse(timestamp) - now.getTime()) / 1000;
+  if (!Number.isFinite(seconds)) return timestamp;
+  for (const [unit, size] of [
+    ['d', 86400],
+    ['h', 3600],
+    ['m', 60],
+  ] as const) {
+    if (Math.abs(seconds) < size) continue;
+    const duration = `${Math.floor(Math.abs(seconds) / size)}${unit}`;
+    return seconds > 0 ? `in ${duration}` : `${duration} ago`;
+  }
+  return 'just now';
+}
+
+export function formatLedgerRecords(records: LedgerRecord[], now: Date): string {
   if (records.length === 0) return '';
-  const headers = ['REQUEST ID', 'TIME (UTC)', 'ROUTE', 'ACCOUNT', 'STATUS'];
+  const headers = ['REQUEST ID', 'TIME', 'ROUTE', 'ACCOUNT', 'STATUS'];
   const hasExitCode = records.some((record) => record.exit_code !== undefined);
   if (hasExitCode) headers.push('EXIT CODE');
   const rows = records.map((record) => {
     const selected = record.selected;
     const route = selected ? `${selected.tool}/${selected.model}/${selected.thinking_level}` : '—';
-    const time = record.recorded_at.replace(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?Z$/, '$1 $2');
+    const time = relativeLedgerTime(record.recorded_at, now);
     const fields = [record.request_id, time, route, selected?.quota_bucket ?? '—', record.event];
     if (hasExitCode) fields.push(record.exit_code === undefined ? '—' : String(record.exit_code));
     return fields.map((field) => JSON.stringify(field).slice(1, -1));
