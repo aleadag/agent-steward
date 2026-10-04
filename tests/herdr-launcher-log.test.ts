@@ -170,6 +170,32 @@ test('logged action renders diagnostics without context, messages or terminal ou
   assert.equal(result.stderr, '');
 });
 
+test('logged action preserves fixed response validation categories', async () => {
+  for (const kind of [
+    'json',
+    'schema',
+    'size_limit',
+    'depth_limit',
+    'answer_ids',
+    'answer_type',
+    'choice_options',
+    'probability_sum',
+    'choice_mismatch',
+  ]) {
+    const diagnostic = {
+      request_id: 'response-failure',
+      reason_code: 'invalid_response',
+      diagnostics: { stage: 'response', kind, http_status: 200, duration_ms: 438 },
+    };
+    const result = await execute(renderer, [], {
+      HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({ selected_text: JSON.stringify(diagnostic) }),
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), diagnostic);
+    assert.equal(result.stderr, '');
+  }
+});
+
 test('logged action rejects malformed, oversized and credential-bearing input without echo', async () => {
   for (const context of [
     '{private-invalid-json',

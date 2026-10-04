@@ -281,7 +281,23 @@ const SelectedResultSchema = z.strictObject({
 });
 export const FailureDiagnosticsSchema = z.strictObject({
   stage: z.enum(['input', 'config', 'preflight', 'quota', 'credentials', 'evaluation', 'response', 'launch']),
-  kind: z.enum(['read', 'json', 'schema', 'http', 'network', 'timeout']).optional(),
+  kind: z
+    .enum([
+      'read',
+      'json',
+      'schema',
+      'http',
+      'network',
+      'timeout',
+      'size_limit',
+      'depth_limit',
+      'answer_ids',
+      'answer_type',
+      'choice_options',
+      'probability_sum',
+      'choice_mismatch',
+    ])
+    .optional(),
   config_fields: z.array(z.string().min(1).max(256)).max(16).optional(),
   http_status: z.number().int().min(100).max(599).optional(),
   duration_ms: z.number().int().nonnegative().optional(),

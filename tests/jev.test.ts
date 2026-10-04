@@ -529,6 +529,68 @@ test('invalid response diagnostics preserve safe status and timing only', async 
   }
 });
 
+test('response diagnostics identify failed checks without exposing response values', async () => {
+  const cases: [string, string][] = [
+    ['{private-invalid-json', 'json'],
+    ['x'.repeat(MAX_JSON_BYTES + 1), 'size_limit'],
+    [JSON.stringify({ private: 'private-value' }), 'schema'],
+  ];
+  let deep: unknown = null;
+  for (let index = 0; index < 65; index++) deep = [deep];
+  cases.push([JSON.stringify(deep), 'depth_limit']);
+  for (const [kind, mutate] of [
+    [
+      'answer_ids',
+      (value: Record<string, unknown>) => {
+        delete asRecord(value.answers).risk;
+      },
+    ],
+    [
+      'answer_type',
+      (value: Record<string, unknown>) => {
+        asRecord(value.answers).pair = noulAnswer(0.2);
+      },
+    ],
+    [
+      'choice_options',
+      (value: Record<string, unknown>) => {
+        rawAnswer(value, 'pair').probabilities = { alpha: 1 };
+      },
+    ],
+    [
+      'probability_sum',
+      (value: Record<string, unknown>) => {
+        rawAnswer(value, 'pair').probabilities = { alpha: 0.7, beta: 0.2 };
+      },
+    ],
+    [
+      'choice_mismatch',
+      (value: Record<string, unknown>) => {
+        rawAnswer(value, 'pair').choice = 'beta';
+      },
+    ],
+  ] as const) {
+    const value = rawValidResponse();
+    mutate(value);
+    cases.push([JSON.stringify(value), kind]);
+  }
+  for (const [body, kind] of cases) {
+    const evaluate = makeEvaluator({
+      model: 'jev-1.13.0',
+      apiKey: 'unit-key-not-live',
+      post: async () => ({ status: 200, body }),
+    });
+    await assert.rejects(evaluate({}, requestedQuestions()), (error) => {
+      if (!hasCode(error, 'invalid_response')) return false;
+      assert.equal(error.diagnostics?.kind, kind);
+      assert.equal(error.diagnostics?.stage, 'response');
+      assert.equal(error.diagnostics?.http_status, 200);
+      assert.doesNotMatch(JSON.stringify(error), /private-|unit-key-not-live|alpha|beta/);
+      return true;
+    });
+  }
+});
+
 test('malformed, oversized, and deeply nested fake-post responses fail as invalid_response', async () => {
   const bodies = [
     '{invalid json',

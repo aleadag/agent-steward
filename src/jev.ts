@@ -1,6 +1,6 @@
 import https from 'node:https';
 import type { ClientRequest } from 'node:http';
-import type { Evaluation } from './contracts.ts';
+import type { Evaluation, FailureDiagnostics } from './contracts.ts';
 import { EvaluationSchema, StewardError } from './contracts.ts';
 import { assertByteLength, assertJsonDepth, LimitError } from './limits.ts';
 import { readBoundedUtf8 } from './io.ts';
@@ -123,8 +123,8 @@ function assertQuestions(value: unknown): asserts value is Questions {
   }
 }
 
-function invalidResponse(): StewardError {
-  return new StewardError('invalid_response');
+function invalidResponse(kind: FailureDiagnostics['kind'] = 'schema'): StewardError {
+  return new StewardError('invalid_response', { stage: 'response', kind });
 }
 
 function decimalParts(value: number): { coefficient: bigint; scale: number } {
@@ -148,7 +148,7 @@ export function validateEvaluation(raw: unknown, questions: Questions): Evaluati
   try {
     assertJsonDepth(raw);
   } catch {
-    throw invalidResponse();
+    throw invalidResponse('depth_limit');
   }
   assertQuestions(questions);
 
@@ -156,25 +156,25 @@ export function validateEvaluation(raw: unknown, questions: Questions): Evaluati
   if (!parsed.success) throw invalidResponse();
 
   const expectedAnswers = Object.keys(questions);
-  if (!exactKeys(parsed.data.answers, expectedAnswers)) throw invalidResponse();
+  if (!exactKeys(parsed.data.answers, expectedAnswers)) throw invalidResponse('answer_ids');
 
   for (const id of expectedAnswers) {
     const question = questions[id];
     const answer = parsed.data.answers[id];
-    if (question === undefined || answer === undefined) throw invalidResponse();
+    if (question === undefined || answer === undefined) throw invalidResponse('answer_ids');
     if (question.type === 'noul') {
-      if (answer.type !== 'noul') throw invalidResponse();
+      if (answer.type !== 'noul') throw invalidResponse('answer_type');
       continue;
     }
-    if (answer.type !== 'choice') throw invalidResponse();
+    if (answer.type !== 'choice') throw invalidResponse('answer_type');
 
     const options = Object.keys(question.criteria);
-    if (!exactKeys(answer.probabilities, options)) throw invalidResponse();
+    if (!exactKeys(answer.probabilities, options)) throw invalidResponse('choice_options');
     const probabilities = Object.values(answer.probabilities);
-    if (!choiceSumWithinTolerance(probabilities)) throw invalidResponse();
+    if (!choiceSumWithinTolerance(probabilities)) throw invalidResponse('probability_sum');
     const maximum = Math.max(...probabilities);
     if (!Object.hasOwn(answer.probabilities, answer.choice) || answer.probabilities[answer.choice] !== maximum) {
-      throw invalidResponse();
+      throw invalidResponse('choice_mismatch');
     }
   }
   return parsed.data;
@@ -246,6 +246,7 @@ export function makeEvaluator(options: {
       const invalid = error instanceof StewardError && error.code === 'invalid_response';
       throw new StewardError(invalid ? 'invalid_response' : 'evaluation_failed', {
         stage: invalid ? 'response' : 'evaluation',
+        ...(invalid ? error.diagnostics : {}),
         ...(!invalid ? ({ kind: signal.aborted ? 'timeout' : 'network' } as const) : {}),
         duration_ms: duration(),
       });
@@ -260,11 +261,16 @@ export function makeEvaluator(options: {
     if (response.status < 200 || response.status >= 300)
       throw new StewardError('evaluation_failed', { stage: 'evaluation', kind: 'http', ...timing });
 
+    let kind: FailureDiagnostics['kind'] = 'schema';
     try {
       if (typeof response.body !== 'string') throw invalidResponse();
+      kind = 'size_limit';
       assertByteLength(response.body);
+      kind = 'json';
       const parsed: unknown = JSON.parse(response.body);
+      kind = 'depth_limit';
       assertJsonDepth(parsed);
+      kind = 'schema';
       const evaluation = validateEvaluation(
         options.provider === 'openrouter' ? OpenRouterEvaluationSchema.parse(parsed) : parsed,
         questions,
@@ -273,7 +279,12 @@ export function makeEvaluator(options: {
       return evaluation;
     } catch (error) {
       if (error instanceof StewardError && error.code === 'credential_detected') throw error;
-      throw new StewardError('invalid_response', { stage: 'response', ...timing });
+      throw new StewardError('invalid_response', {
+        stage: 'response',
+        kind:
+          error instanceof StewardError && error.code === 'invalid_response' ? (error.diagnostics?.kind ?? kind) : kind,
+        ...timing,
+      });
     }
   };
 }
@@ -327,7 +338,11 @@ export function postHttps(request: Parameters<HttpPost>[0]): ReturnType<HttpPost
               const invalidBody = error instanceof LimitError || error instanceof TypeError;
               if (!clientRequest.destroyed) clientRequest.destroy();
               if (!response.destroyed) response.destroy();
-              finish(new StewardError(invalidBody ? 'invalid_response' : 'evaluation_failed'));
+              finish(
+                invalidBody
+                  ? invalidResponse(error instanceof LimitError ? 'size_limit' : 'json')
+                  : new StewardError('evaluation_failed'),
+              );
             },
           );
         },

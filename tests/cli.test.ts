@@ -1805,7 +1805,7 @@ test('failed second evaluation emits only one error and never a partial route', 
       ? jevResponse({ pair: choiceAnswer({ 'codex-astra': 1 }) })
       : { model: 'jev-1.13.0', answers: {}, usage: {} },
   );
-  const { io, out } = runtime({
+  const { io, out, files } = runtime({
     env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
     readText: async (path) => (path === CONFIG_PATH ? JSON.stringify(cfg) : JSON.stringify(snapshot([]))),
     post,
@@ -1814,6 +1814,12 @@ test('failed second evaluation emits only one error and never a partial route', 
   assert.equal(out.length, 1);
   assert.equal(result(out).decision, 'error');
   assert.equal(result(out).reason_code, 'invalid_response');
+  assert.equal(result(out).diagnostics?.kind, 'answer_ids');
+  const record = JSON.parse(files.get('/isolated/home/.local/state/agent-steward/router.jsonl')!);
+  assert.equal(record.diagnostics.kind, 'answer_ids');
+  out.length = 0;
+  assert.equal(await run(['router', 'show', record.request_id, '--json'], io), 0);
+  assert.equal(JSON.parse(out[0]!).diagnostics.kind, 'answer_ids');
 });
 
 test('configured non-pattern key in evaluator metadata suppresses a partial stop proposal', async () => {
