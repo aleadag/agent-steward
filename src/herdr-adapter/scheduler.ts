@@ -6,6 +6,7 @@ import type { HerdrReader } from './observe.ts';
 import type { HerdrControl } from './deliver.ts';
 import type { StopInput } from '../contracts.ts';
 import type { LeaseAttempt } from './lease.ts';
+import type { QuotaHint } from './quota-hint.ts';
 
 export type SchedulerResult = 'already_owned' | 'stopped' | 'shutdown_incomplete';
 
@@ -13,6 +14,7 @@ export type SchedulerOptions = {
   store: EpisodeStore;
   herdr: HerdrReader & Partial<Pick<HerdrControl, 'prompt' | 'sendKeys'>>;
   autoApprove?: boolean;
+  quotaHint?: QuotaHint;
   decide: (input: StopInput) => Promise<unknown>;
   targets?: readonly string[];
   sessionId: string;
@@ -117,6 +119,7 @@ export async function reconcileDue(
   targets?: readonly string[],
   handoff: SchedulerOptions['handoff'] = async () => {},
   ownership?: Ownership,
+  quotaHint?: QuotaHint,
 ): Promise<void> {
   const admissionOpen = ownership?.admissionOpen ?? (() => true);
   if (!admissionOpen()) return;
@@ -205,6 +208,7 @@ export async function reconcileDue(
         clock: { now: () => now },
         targets: [pane],
         handoff,
+        quotaHint,
         sessionId: ownership?.sessionId,
         leaseToken: ownership?.leaseToken,
         sessionValid: ownership?.sessionValid,
@@ -447,7 +451,9 @@ export async function runScheduler(options: SchedulerOptions): Promise<Scheduler
           if (polled.kind === 'closed' || !admissionOpen()) return;
         }
         if (!admissionOpen()) return;
-        const due = await waitOpen(reconcileDue(now, store, herdr, decide, listed, options.handoff, ownership));
+        const due = await waitOpen(
+          reconcileDue(now, store, herdr, decide, listed, options.handoff, ownership, options.quotaHint),
+        );
         if (due.kind === 'closed' || !admissionOpen()) return;
       } catch (error) {
         if (!admissionOpen()) return;

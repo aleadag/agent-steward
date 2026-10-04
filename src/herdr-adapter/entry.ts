@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
+import { readFileText } from '../io.ts';
+import { quotaResetHint, type QuotaHint } from './quota-hint.ts';
 import { spawn } from 'node:child_process';
 import { readFile, stat } from 'node:fs/promises';
 import { CorruptEpisodeError, EpisodeStore, type Episode } from './state.ts';
@@ -33,6 +36,7 @@ type HandoffReason = 'observation_unavailable' | 'decision_failed' | 'human_revi
 export type EventDeps = {
   herdr: HerdrReader & Partial<Pick<HerdrControl, 'prompt' | 'sendKeys'>>;
   autoApprove?: boolean;
+  quotaHint?: QuotaHint;
   decide: (input: StopInput) => Promise<unknown>;
   store: Store;
   clock: { now: () => Date };
@@ -470,11 +474,22 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     const base = Date.parse(checked.last_quota_check_at ?? checked.first_observed_at);
     const fallback = Math.min(base + delay, deadline);
     // The CLI classifies this as quota; it cannot supply reset proof or dictate this timer.
-    const next =
-      quota && Number.isFinite(fallback) && fallback > now.getTime() ? new Date(fallback).toISOString() : null;
+    let next = quota && Number.isFinite(fallback) && fallback > now.getTime() ? new Date(fallback).toISOString() : null;
     if (quota && !next) {
       await quarantine('human_review_required');
       return;
+    }
+    if (quota && next && deps.quotaHint) {
+      try {
+        const hint = await deps.quotaHint(observed, now);
+        if (!admissionOpen()) return;
+        if (z.iso.datetime({ offset: true }).safeParse(hint).success) {
+          const at = Date.parse(hint!);
+          if (at > now.getTime() && at < fallback) next = new Date(at).toISOString();
+        }
+      } catch {
+        // A best-effort hint cannot suppress the ordinary quota recheck.
+      }
     }
     if (!admissionOpen()) return;
     const stillOwned = await stillOwner();
@@ -760,6 +775,22 @@ async function visibleHandoff(env: NodeJS.ProcessEnv, reason: HandoffReason): Pr
     });
   });
 }
+function quotaHintFrom(env: NodeJS.ProcessEnv): QuotaHint {
+  return (observed, now) =>
+    quotaResetHint(observed, {
+      env: {
+        HOME: env.HOME,
+        XDG_CONFIG_HOME: env.XDG_CONFIG_HOME,
+        XDG_STATE_HOME: env.XDG_STATE_HOME,
+        TYPESAFE_API_KEY: env.TYPESAFE_API_KEY,
+        OPENROUTER_API_KEY: env.OPENROUTER_API_KEY,
+      },
+      cwd: process.cwd(),
+      readText: readFileText,
+      now,
+    });
+}
+
 async function adapterConfigFrom(
   env: NodeJS.ProcessEnv,
 ): Promise<{ targets: readonly string[] | 'all'; autoApprove: boolean }> {
@@ -810,6 +841,7 @@ export async function runEvent(env: NodeJS.ProcessEnv, decide: EventDeps['decide
     clock: { now: () => new Date() },
     targets,
     autoApprove,
+    quotaHint: quotaHintFrom(env),
     handoff: (reason) => visibleHandoff(env, reason),
     sessionValid: async () => (await socketSession(env.HERDR_SOCKET_PATH!)) === sessionId,
   });
@@ -862,6 +894,7 @@ export async function runVisibleScheduler(
       decide: decideWithCli,
       targets: listed === 'all' ? undefined : listed,
       autoApprove,
+      quotaHint: quotaHintFrom(env),
       sessionId,
       signal: abort.signal,
       handoff: (reason) => visibleHandoff(env, reason),
