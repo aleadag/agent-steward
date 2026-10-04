@@ -956,6 +956,87 @@ test('publication guard survives pending first and takeover renames', async () =
   }
 });
 
+for (const releaseTiming of ['before rejection', 'after rejection'] as const) {
+  test(`committed selector with rejected acknowledgment revokes G (${releaseTiming})`, async () => {
+    const directory = await trackedTempdir('steward-committed-selector-');
+    const selected = join(directory, 'scheduler-lease', 'active.json');
+    const guardPath = join(directory, 'takeover-guard');
+    const committed = deferred<void>();
+    const rejectAcknowledgment = deferred<void>();
+    let hold = true;
+    const store = new SchedulerLeaseStore(
+      directory,
+      async () => {},
+      () => 10_000,
+      {
+        io: {
+          rename: async (from, to) => {
+            await rename(from, to);
+            if (hold && String(to) === selected) {
+              hold = false;
+              committed.resolve();
+              await rejectAcknowledgment.promise;
+              throw Object.assign(new Error('injected lost rename acknowledgment'), { code: 'EIO' });
+            }
+          },
+        },
+      },
+    );
+    const reader = new SchedulerLeaseStore(
+      directory,
+      async () => {},
+      () => 10_000,
+    );
+    const attempt = store.beginAcquire('server-1');
+    const generation = join(directory, 'scheduler-lease', 'generations', attempt.token);
+    try {
+      await within(committed.promise);
+      assert.equal(JSON.parse(await readFile(selected, 'utf8')).token, attempt.token);
+      assert.equal(await reader.leaseMatches(attempt.token, 'server-1'), true, 'rename really committed');
+      assert.equal(await store.owned(attempt.token, 'server-1'), false, 'acknowledgment is still pending');
+      const guardBefore = await snapshot(guardPath);
+      assert.equal((await lstat(guardPath)).isFile(), true);
+      assert.equal((await lstat(guardPath)).mode & 0o777, 0o600);
+      if (releaseTiming === 'before rejection') {
+        await within(attempt.release());
+        assert.equal((await lstat(join(generation, 'released'))).isDirectory(), true);
+        assert.equal(await reader.activeToken('server-1'), null);
+        assert.equal(await reader.leaseMatches(attempt.token, 'server-1'), false);
+      }
+      assert.equal(await reader.acquire('server-1'), null, 'pending acknowledgment still excludes H');
+      assert.deepEqual(await snapshot(guardPath), guardBefore, 'guard survives a committed pending rename');
+      rejectAcknowledgment.resolve();
+      await assert.rejects(within(attempt.ready), LeaseStateError);
+      assert.equal(attempt.isOpen(), false);
+      assert.equal((await lstat(join(generation, 'released'))).isDirectory(), true);
+      assert.equal((await lstat(join(generation, 'released'))).mode & 0o777, 0o700);
+      assert.equal(await reader.activeToken('server-1'), null);
+      assert.equal(await reader.leaseMatches(attempt.token, 'server-1'), false);
+      assert.equal(await store.owned(attempt.token, 'server-1'), false);
+      await assert.rejects(lstat(guardPath), { code: 'ENOENT' });
+
+      const h = await reader.acquire('server-1');
+      assert.ok(h);
+      assert.notEqual(h, attempt.token);
+      const paths = [
+        selected,
+        join(directory, 'scheduler-lease', 'generations', h, 'owner.json'),
+        join(directory, 'scheduler-lease', 'generations', h, 'heartbeat.json'),
+      ];
+      const before = await Promise.all(paths.map((path) => snapshot(path)));
+      await within(attempt.release());
+      assert.equal(await store.heartbeat(attempt.token, 'server-1'), false);
+      assert.equal(await reader.leaseMatches(attempt.token, 'server-1'), false);
+      assert.deepEqual(await Promise.all(paths.map((path) => snapshot(path))), before);
+      assert.equal(await reader.owned(h, 'server-1'), true);
+      await reader.release(h);
+    } finally {
+      rejectAcknowledgment.resolve();
+      await attempt.ready.catch(() => null);
+    }
+  });
+}
+
 test('takeover requires release or expired heartbeat and proven death', async () => {
   const cases = [
     { name: 'expired/live', now: 20_000, pid: 4242, heartbeat: 1, released: false, alive: true, take: false },
