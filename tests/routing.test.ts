@@ -30,7 +30,7 @@ function routeInput(
       ),
   ),
 ) {
-  return { task, requestId: 'route-1', config: cfg, quota, evaluate };
+  return { task, requestId: 'route-1', config: cfg, quota, evaluate, now: new Date(fixedNow) };
 }
 
 function hasCode(error: unknown, code: StewardError['code']): error is StewardError {
@@ -91,6 +91,7 @@ test('winning low-confidence pair is not returned when effort fails', async () =
       requestId: 'route-1',
       config: cfg,
       quota,
+      now: fixedNow,
       evaluate: async (_state, questions) => {
         if (++calls === 2) throw new StewardError('evaluation_failed');
         return validateEvaluation(selectedPairAnswer({ 'codex-astra': 1 }, 0.01), questions);
@@ -99,6 +100,130 @@ test('winning low-confidence pair is not returned when effort fails', async () =
     (error) => hasCode(error, 'evaluation_failed'),
   );
   assert.equal(calls, 2);
+});
+
+test('Jev gets relative resets from one clock without changing shared or stale quota facts', async () => {
+  const lite = candidate({ id: 'lite', cost: 1 });
+  const strong = candidate({ id: 'strong', cost: 20 });
+  const grok = candidate({
+    id: 'grok',
+    tool: 'pi',
+    provider: 'xai',
+    quota_bucket: 'pi_xai',
+    cost: 13,
+    thinking_levels: [
+      { id: 'low', description: 'Low' },
+      { id: 'high', description: 'High' },
+    ],
+  });
+  const cfg = config({ candidates: [lite, strong, grok] });
+  const quota = await loadQuota(cfg, {
+    env: { HOME: '/isolated/home' },
+    now: fixedNow,
+    diagnostic: () => {},
+    readText: async (path) =>
+      JSON.stringify(
+        snapshot(
+          [
+            windowFact(
+              { type: 'account' },
+              {
+                id: 'weekly',
+                cadence: 'weekly',
+                remaining_percent: 63,
+                reset_at: '2026-09-28T16:30:00+02:00',
+              },
+            ),
+            windowFact(
+              { type: 'account' },
+              {
+                id: 'stale',
+                valid_until: '2026-09-28T10:15:00Z',
+                reset_at: '2026-09-28T11:30:00Z',
+              },
+            ),
+            windowFact(
+              { type: 'account' },
+              {
+                id: 'passed',
+                reset_at: '2026-09-28T10:15:00Z',
+                valid_until: '2026-09-28T10:15:00Z',
+              },
+            ),
+          ],
+          { source: path.endsWith('/pi_xai.json') ? 'pi_xai' : 'codex' },
+        ),
+      ),
+  });
+  const before = JSON.stringify([...quota]);
+  type EvaluatorQuota = Omit<QuotaFacts, 'windows'> & {
+    windows: (QuotaFacts['windows'][number] & { seconds_until_reset: number })[];
+  };
+  const wires: {
+    state: {
+      current_time: string;
+      candidates?: (Candidate & { quota: EvaluatorQuota })[];
+      quota?: EvaluatorQuota;
+    };
+    questions: Questions;
+  }[] = [];
+  const now = new Date(fixedNow);
+  const evaluate = makeEvaluator({
+    model: 'jev-1.13.0',
+    apiKey: 'unit-key-not-live',
+    post: async (request) => {
+      const wire = JSON.parse(request.body);
+      wires.push(wire);
+      now.setUTCDate(now.getUTCDate() + 1);
+      return {
+        status: 200,
+        body: JSON.stringify(
+          wire.questions.pair
+            ? selectedPairAnswer({ lite: 0.1, strong: 0.1, grok: 0.8 })
+            : selectedEffortAnswer({ low: 0.8, high: 0.2 }),
+        ),
+      };
+    },
+  });
+  const result = await route({ ...routeInput(cfg, evaluate, quota), now });
+  assert.equal(wires.length, 2);
+  const candidates = wires[0]!.state.candidates!;
+  assert.deepEqual(candidates[0]!.quota, candidates[1]!.quota);
+  assert.equal(candidates[0]!.quota.quota_bucket, 'codex');
+  assert.equal(candidates[2]!.quota.quota_bucket, 'pi_xai');
+  for (const wire of wires) {
+    assert.equal(wire.state.current_time, '2026-09-28T10:30:00.000Z');
+    const facts = wire.state.quota ?? wire.state.candidates![2]!.quota;
+    assert.deepEqual(
+      facts.windows.map((window) => window.seconds_until_reset),
+      [14400, 3600, 0],
+    );
+    assert.equal(facts.windows[0]!.reset_at, '2026-09-28T16:30:00+02:00');
+    assert.equal(facts.windows[0]!.remaining_percent, 63);
+    assert.equal(facts.windows[1]!.status, 'unknown');
+    assert.equal(facts.windows[1]!.reason, 'expired');
+    assert.equal(facts.windows[1]!.remaining_percent, null);
+    assert.equal(facts.windows[2]!.reason, 'reset_passed');
+    assert.equal(facts.windows[2]!.remaining_percent, null);
+  }
+  assert.equal(JSON.stringify([...quota]), before);
+  assert.deepEqual(result.quota, quota.get('grok'));
+  assert.equal(Object.hasOwn(result.quota.windows[0]!, 'seconds_until_reset'), false);
+});
+
+test('invalid routing clock fails before evaluation', async () => {
+  let calls = 0;
+  await assert.rejects(
+    route({
+      ...routeInput(config(), async () => {
+        calls++;
+        return selectedPairAnswer({ 'codex-astra': 1 });
+      }),
+      now: new Date('invalid'),
+    }),
+    (error) => hasCode(error, 'invalid_input'),
+  );
+  assert.equal(calls, 0);
 });
 
 test('pair evaluation includes relative cost in instructions and candidate state', async () => {
@@ -174,7 +299,12 @@ test('low-confidence winning pair and effort produce a complete selected result'
   assert.deepEqual(pairInput.candidates[0]?.thinking_levels, codex.thinking_levels);
   assert.deepEqual(pairInput.candidates[1]?.thinking_levels, pi.thinking_levels);
   assert.deepEqual(Object.keys(effortQuestion.criteria), ['medium', 'high']);
-  assert.deepEqual(effortState.state, { task, candidate: pi, quota: quotaFacts(pi) });
+  assert.deepEqual(effortState.state, {
+    task,
+    current_time: fixedNow.toISOString(),
+    candidate: pi,
+    quota: quotaFacts(pi),
+  });
   assert.equal(result.decision, 'selected');
   assert.equal(result.request_id, 'route-1');
   assert.deepEqual(result.selected, {
@@ -248,8 +378,8 @@ test('agy routing preserves model and effort in evaluation and native launch arg
     }),
   );
   assert.deepEqual(states, [
-    { task, candidates: [{ ...gemini, quota: quotaFacts(gemini) }] },
-    { task, candidate: gemini, quota: quotaFacts(gemini) },
+    { task, current_time: fixedNow.toISOString(), candidates: [{ ...gemini, quota: quotaFacts(gemini) }] },
+    { task, current_time: fixedNow.toISOString(), candidate: gemini, quota: quotaFacts(gemini) },
   ]);
   assert.equal(result.selected.model, 'gemini-3.8-flash');
   assert.equal(result.selected.thinking_level, 'medium');

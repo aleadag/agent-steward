@@ -122,6 +122,10 @@ A `router start --dry-run` route exits 0 for a complete selected preview and 1 f
 
 Routing first selects a tool/model pair, then selects one of that pair's configured thinking levels. A single configured level skips the second evaluation. Each Jev request has its own 30-second deadline with no retries, so a route can involve two sequential requests and two separate deadlines. Evaluation token usage measures Jev usage, not remaining subscription quota.
 
+Both routing evaluations receive `current_time` and quota windows with absolute `reset_at` plus numeric `seconds_until_reset`. The countdown uses the same captured clock as snapshot freshness checks, rounds up to whole seconds, and is zero when reset has passed. These fields are evaluator inputs only; saved snapshots and result quota facts are unchanged. Stale windows remain unknown with null remaining capacity.
+
+Pair selection asks Jev to preserve access to the range of configured capabilities, without fixed model tiers. Among suitable candidates, prefer ample known quota that resets sooner when this preserves capability coverage; when quota is scarce, prefer lower relative cost to conserve availability. Account windows are shared within a quota bucket; pool windows are shared within that bucket and pool. Cost is a conservation hint, not measured quota consumption. This is evaluator guidance, not a deterministic allocation rule or a guarantee of future availability.
+
 ## Configuration
 
 The default file is `$XDG_CONFIG_HOME/agent-steward/config.json`. If `XDG_CONFIG_HOME` is unset or empty, the CLI uses `~/.config/agent-steward/config.json`; a nonempty relative XDG path is invalid. `--config <path>` selects another file. Relative overrides resolve from the current directory. Snapshot paths are generated state, not configurable paths.

@@ -917,6 +917,44 @@ test('failure diagnostics survive router show without leaking config values or H
   }
 });
 
+test('router CLI uses the quota classification clock for both Jev reset countdowns', async () => {
+  const cfg = routeConfig([
+    candidate({
+      thinking_levels: [
+        { id: 'low', description: 'Low' },
+        { id: 'high', description: 'High' },
+      ],
+    }),
+  ]);
+  let clockCalls = 0;
+  const states: {
+    current_time: string;
+    candidates?: { quota: { windows: Record<string, unknown>[] } }[];
+    quota?: { windows: Record<string, unknown>[] };
+  }[] = [];
+  const { post } = fakePost((wire, index) => {
+    states.push(wire.state as (typeof states)[number]);
+    return routeAnswer(wire, index);
+  });
+  const { io, out } = runtime({
+    env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
+    now: () => new Date(NOW.getTime() + clockCalls++ * 60_000),
+    readText: async (path) =>
+      path === CONFIG_PATH ? JSON.stringify(cfg) : JSON.stringify(snapshot([windowFact({ type: 'account' })])),
+    post,
+  });
+  assert.equal(await run(['router', 'start', 'task', '--dry-run', '--json'], io), 0);
+  assert.equal(states.length, 2);
+  for (const state of states) {
+    assert.equal(state.current_time, '2026-09-28T10:30:00.000Z');
+    const window = (state.quota ?? state.candidates![0]!.quota).windows[0]!;
+    assert.equal(window.seconds_until_reset, 5400);
+    assert.equal(window.status, 'known');
+    assert.equal(window.remaining_percent, 40);
+  }
+  assert.equal(Object.hasOwn(result(out).quota.windows[0], 'seconds_until_reset'), false);
+});
+
 test('numeric response details survive route failures, history and launcher reporting', async () => {
   const cfg = routeConfig([
     candidate({

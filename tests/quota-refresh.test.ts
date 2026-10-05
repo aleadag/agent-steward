@@ -548,6 +548,7 @@ for (const bucket of ['codex', 'pi_codex'] as const) {
       const selected = await route({
         task: 'Review the parser',
         requestId: 'privacy-regression',
+        now,
         config: configuration,
         quota,
         evaluate: makeEvaluator({ model: 'jev-1.13.0', apiKey: 'unit-key-not-live', post }),

@@ -690,6 +690,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     });
 
     let quota: Awaited<ReturnType<typeof loadQuota>> | undefined;
+    const routeNow = invocation.kind === 'route' ? runtime.now() : undefined;
     if (invocation.kind === 'route') {
       stage = 'preflight';
       assertRoutePreflight(config);
@@ -697,7 +698,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       quota = await loadQuota(config, {
         env: runtime.env,
         readText: runtime.readText,
-        now: runtime.now(),
+        now: routeNow!,
         diagnostic: (code) => runtime.stderr(`${DIAGNOSTICS[code] ?? 'agent-steward: quota_diagnostic'}\n`),
       });
     }
@@ -720,7 +721,14 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     stage = 'evaluation';
     let result: Result | StopResult;
     if (invocation.kind === 'route') {
-      result = await route({ task: invocation.task, requestId: requestId!, config, quota: quota!, evaluate });
+      result = await route({
+        task: invocation.task,
+        requestId: requestId!,
+        config,
+        quota: quota!,
+        evaluate,
+        now: routeNow!,
+      });
     } else {
       result = await assessStop(stopInput!, { thresholds: config.thresholds, evaluate, now: runtime.now() });
     }

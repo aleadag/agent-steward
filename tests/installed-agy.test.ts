@@ -229,6 +229,7 @@ test.skipIf(!pkg)('installed native renewal and incomplete pools feed an offline
   const routed = await route({
     task: 'offline fixture',
     requestId: 'offline-request',
+    now: new Date(),
     config: cfg,
     quota: facts,
     evaluate: async () => ({
