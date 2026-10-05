@@ -430,6 +430,7 @@ export function mapGrokBilling(payload: unknown, observedAt: string): MappedWind
   const start = timestampSchema.safeParse(period?.start);
   const end = timestampSchema.safeParse(reset);
   const weekly = start.success && end.success && Date.parse(end.data) - Date.parse(start.data) === 168 * 3600_000;
-  const window = mapWindow(config?.creditUsagePercent, reset, observedAt, 'credits', weekly ? 'weekly' : 'other');
+  const used = config?.creditUsagePercent === undefined ? 0 : config?.creditUsagePercent;
+  const window = mapWindow(used, reset, observedAt, 'credits', weekly ? 'weekly' : 'other');
   return window === null ? { status: 'malformed' } : { windows: [window] };
 }

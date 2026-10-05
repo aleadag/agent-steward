@@ -1081,7 +1081,7 @@ test('Grok requires a finite measured percent and usable reset, not just a billi
     [],
     {},
     { config: null },
-    ...[undefined, null, '40', -1, 101, NaN, Infinity].map((creditUsagePercent) => billing({ creditUsagePercent })),
+    ...[null, '40', -1, 101, NaN, Infinity].map((creditUsagePercent) => billing({ creditUsagePercent })),
     billing({ currentPeriod: {} }),
     billing({ currentPeriod: { end: 'invalid' }, billingPeriodEnd: '2026-10-08T00:00:00' }),
   ])
@@ -1094,4 +1094,11 @@ test('Grok requires a finite measured percent and usable reset, not just a billi
     assert.ok('windows' in mapped);
     assert.equal(mapped.windows[0]?.remaining_percent, remaining);
   }
+});
+
+test('Grok maps omitted creditUsagePercent to full remaining when reset is usable', () => {
+  const { creditUsagePercent: _omit, ...config } = billing().config;
+  const mapped = mapGrokBilling({ config }, observed);
+  assert.ok('windows' in mapped);
+  assert.equal(mapped.windows[0]?.remaining_percent, 100);
 });

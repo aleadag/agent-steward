@@ -181,7 +181,7 @@ Collectors read existing logins only:
 | --- | --- | --- |
 | `codex` | `$CODEX_HOME/auth.json`, default `~/.codex/auth.json`; ChatGPT login | ChatGPT WHAM usage |
 | `pi_codex` | `$PI_CODING_AGENT_DIR/auth.json`, default `~/.pi/agent/auth.json`; `openai-codex` OAuth | ChatGPT WHAM usage |
-| `pi_xai` | The same Pi file; `xai` OAuth (SuperGrok) | Grok CLI-proxy billing credits |
+| `pi_xai` | The same Pi file; `xai` OAuth (SuperGrok) | Grok CLI-proxy billing credits; omitted `creditUsagePercent` with a usable reset is stored as 100% remaining |
 | `antigravity` | `~/.gemini/antigravity-cli/antigravity-oauth-token`; consumer OAuth | Native AGY `/usage` and request-correlated statusLine quota |
 
 Explicit `CODEX_HOME` and `PI_CODING_AGENT_DIR` values must be absolute and nonempty. Codex/Pi collectors do not renew tokens: missing, expired, or unusable credentials report `quota_auth`. Their pinned HTTPS requests have a 15-second deadline, no retries, and at most one same-host redirect. Steward never implements OAuth renewal, writes credentials, scans browsers/keyrings, scrapes CSRF tokens, or sends model prompts. AGY may renew its existing consumer login itself, provided the native principal remains unchanged.
