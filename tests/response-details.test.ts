@@ -34,31 +34,10 @@ function diagnostics(value: Evaluation) {
   }
 }
 
-test('sum diagnostics report decimal totals, signed deviation, tolerance and question position', () => {
-  for (const [probabilities, actual, deviation] of [
-    [{ private_alpha: 0.7, private_beta: 0.2 }, 0.9, -0.1],
-    [{ private_alpha: 0.7, private_beta: 0.4 }, 1.1, 0.1],
-    [{ private_alpha: 0.5, private_beta: 0.50000100000001 }, 1.00000100000001, 0.00000100000001],
-    [{ private_alpha: 0.5, private_beta: 0.49999899999999 }, 0.99999899999999, -0.00000100000001],
-    [{ private_alpha: 0, private_beta: 0 }, 0, -1],
-    [{ private_alpha: 1e-7, private_beta: 5e-324 }, 1e-7, -0.9999999],
-  ] as const) {
-    const result = diagnostics(response(probabilities));
-    assert.equal(result?.kind, 'probability_sum');
-    assert.deepEqual(result?.details, {
-      question_index: 1,
-      expected: 1,
-      actual,
-      tolerance: 0.000001,
-      deviation,
-      option_count: 2,
-    });
-  }
-  for (const probabilities of [
-    { private_alpha: 0.5, private_beta: 0.500001 },
-    { private_alpha: 0.5, private_beta: 0.499999 },
-  ])
-    assert.doesNotThrow(() => validateEvaluation(response(probabilities), questions));
+test('all-zero score diagnostics report question position without exposing labels', () => {
+  const result = diagnostics(response({ private_alpha: 0, private_beta: 0 }));
+  assert.equal(result?.kind, 'schema');
+  assert.deepEqual(result?.details, { question_index: 1, option_count: 2 });
 });
 
 test('choice diagnostics distinguish lower probability, missing choice and tied maxima', () => {
@@ -118,7 +97,12 @@ test('both provider adapters preserve check details and index successive HTTP ev
       apiKey: 'SyntheticPrivateKey',
       post: async () => {
         calls++;
-        return { status: 200, body: JSON.stringify(calls === 1 ? response() : response(undefined, 'private_beta')) };
+        return {
+          status: 200,
+          body: JSON.stringify(
+            calls === 1 ? response({ private_alpha: 0.79, private_beta: 0.2 }) : response(undefined, 'private_beta'),
+          ),
+        };
       },
     });
     await evaluate({}, questions);

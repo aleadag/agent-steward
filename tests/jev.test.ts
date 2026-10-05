@@ -179,14 +179,9 @@ test('evaluation validation requires exact choice options and a maximal returned
   }
 });
 
-test('choice distributions enforce finite range and an absolute sum tolerance of 0.000001', () => {
-  const atTolerance = validResponse();
-  choiceIn(atTolerance, 'pair').probabilities = { alpha: 0.5, beta: 0.500001 };
-  choiceIn(atTolerance, 'pair').choice = 'beta';
-  assert.doesNotThrow(() => validateEvaluation(atTolerance, requestedQuestions()));
-
+test('choice scores reject all-zero, out-of-range and nonfinite values', () => {
   for (const probabilities of [
-    { alpha: 0.5, beta: 0.5000011 },
+    { alpha: 0, beta: 0 },
     { alpha: -0.1, beta: 1.1 },
     { alpha: Number.NaN, beta: Number.POSITIVE_INFINITY },
   ]) {
@@ -196,46 +191,38 @@ test('choice distributions enforce finite range and an absolute sum tolerance of
   }
 });
 
-test('decimal sum tolerance accepts both exact edges and rejects values just outside', () => {
+test('choice ranking accepts nonunit totals without normalizing scores', () => {
   const accepted: [Record<string, number>, string][] = [
     [{ alpha: 0.5, beta: 0.500001 }, 'beta'],
     [{ alpha: 0.5, beta: 0.499999 }, 'alpha'],
+    [{ alpha: 0.79, beta: 0.2 }, 'alpha'],
+    [{ alpha: 0.81, beta: 0.2 }, 'alpha'],
+    [{ alpha: 1e-7, beta: 5e-324 }, 'alpha'],
+    [{ alpha: 1, beta: 1 }, 'beta'],
+    [{ alpha: 0.5, beta: 0.50000100000001 }, 'beta'],
+    [{ alpha: 0.5, beta: 0.49999899999999 }, 'alpha'],
   ];
   for (const [probabilities, winner] of accepted) {
     const response = validResponse();
     choiceIn(response, 'pair').probabilities = probabilities;
     choiceIn(response, 'pair').choice = winner;
-    assert.doesNotThrow(() => validateEvaluation(response, requestedQuestions()));
-  }
-
-  const rejected: [Record<string, number>, string][] = [
-    [{ alpha: 0.5, beta: 0.50000100000001 }, 'beta'],
-    [{ alpha: 0.5, beta: 0.49999899999999 }, 'alpha'],
-  ];
-  for (const [probabilities, winner] of rejected) {
-    const response = validResponse();
-    choiceIn(response, 'pair').probabilities = probabilities;
-    choiceIn(response, 'pair').choice = winner;
-    assertStewardCode(() => validateEvaluation(response, requestedQuestions()), 'invalid_response');
+    const parsed = validateEvaluation(response, requestedQuestions());
+    assert.deepEqual(choiceIn(parsed, 'pair').probabilities, probabilities);
+    assert.equal(choiceIn(parsed, 'pair').choice, winner);
   }
 });
 
-test('255-option distribution just outside the absolute tolerance is rejected', () => {
+test('255-option scores select the maximum without requiring a unit total', () => {
   const ids = Array.from({ length: 255 }, (_, index) => `option-${index}`);
   const criteria = Object.fromEntries(ids.map((id) => [id, null]));
-  const probabilities = Object.fromEntries(
-    ids.map((id, index) => [id, index === 0 ? 1 : index === 1 ? 0.00000100000004 : 0]),
-  );
+  const probabilities = Object.fromEntries(ids.map((id, index) => [id, index === 0 ? 0.9 : 0.1]));
   const response = jevResponse({
     pair: choiceAnswer(probabilities, 0.9, 'option-0'),
   });
-  assertStewardCode(
-    () =>
-      validateEvaluation(response, {
-        pair: { type: 'choice', instructions: 'Choose one.', criteria },
-      }),
-    'invalid_response',
-  );
+  const parsed = validateEvaluation(response, {
+    pair: { type: 'choice', instructions: 'Choose one.', criteria },
+  });
+  assert.equal(choiceWinner(choiceIn(parsed, 'pair'), ids).winner, 'option-0');
 });
 
 test('confidence, Noul risk, resolved model, usage and token counters are all validated', () => {
@@ -558,9 +545,9 @@ test('response diagnostics identify failed checks without exposing response valu
       },
     ],
     [
-      'probability_sum',
+      'schema',
       (value: Record<string, unknown>) => {
-        rawAnswer(value, 'pair').probabilities = { alpha: 0.7, beta: 0.2 };
+        rawAnswer(value, 'pair').probabilities = { alpha: 0, beta: 0 };
       },
     ],
     [

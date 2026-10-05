@@ -480,6 +480,43 @@ test('input and thresholds are validated before evaluator use', async () => {
   }
 });
 
+test('nonunit stop scores preserve confidence, risk, restriction and tie safeguards', async () => {
+  for (const [top, other, confidence, risk, forbidden, expected] of [
+    [0.79, 0.2, 0.9, 0.1, false, 'approve_request'],
+    [0.81, 0.2, 0.9, 0.1, false, 'approve_request'],
+    [0.79, 0.2, 0.4, 0.1, false, 'manual_review'],
+    [0.79, 0.2, 0.9, 0.6, false, 'manual_review'],
+    [0.79, 0.2, 0.9, 0.1, true, 'manual_review'],
+    [0.4, 0.4, 0.9, 0.1, false, 'manual_review'],
+  ] as const) {
+    const probabilities = Object.fromEntries(
+      WAITING_FOR.map((key) => [key, key === 'approve_command' ? top : key === 'approve_edit' ? other : 0]),
+    );
+    const evaluate = makeEvaluator({
+      model: 'jev-1.13.0',
+      apiKey: 'unit-key-not-live',
+      post: async () => ({
+        status: 200,
+        body: JSON.stringify(
+          evaluation({
+            waiting_for: choice(probabilities, confidence, 'approve_command'),
+            risky: { type: 'noul', noul: risk },
+          }),
+        ),
+      }),
+    });
+    const result = await assessStopDecision(stopInput({ automatic_approval_forbidden: forbidden }), {
+      now,
+      thresholds: { risky: 0.6, choiceConfidence: 0.45 },
+      evaluate,
+    });
+    assert.equal(result.proposed_action.kind, expected);
+    assert.equal(result.waiting_confidence, confidence);
+    assert.equal(result.risk_probability, risk);
+    assert.deepEqual(result.evaluation?.answers.waiting_for, choice(probabilities, confidence, 'approve_command'));
+  }
+});
+
 test('injected evaluator results are revalidated; any incomplete response rejects with no assessment', async () => {
   const valid = answersFor('approve_command');
   const validWaiting = valid.answers.waiting_for;
@@ -514,11 +551,11 @@ test('injected evaluator results are revalidated; any incomplete response reject
       }),
     ],
     [
-      'distribution does not sum to one',
+      'all-zero choice scores',
       evaluation({
         waiting_for: {
           ...validWaiting,
-          probabilities: { ...validWaiting.probabilities, approve_command: 0.8 },
+          probabilities: { ...validWaiting.probabilities, approve_command: 0 },
         },
         risky: validRisk,
       }),

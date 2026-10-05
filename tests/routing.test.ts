@@ -625,6 +625,41 @@ test('injected evaluator answers are revalidated at both route stages', async ()
   });
 });
 
+test('nonunit pair and effort totals select their highest scores through the real evaluator', async () => {
+  const cfg = config({
+    candidates: [
+      candidate({ id: 'first' }),
+      candidate({
+        id: 'second',
+        thinking_levels: [
+          { id: 'low', description: 'Low' },
+          { id: 'high', description: 'High' },
+        ],
+      }),
+    ],
+  });
+  const evaluate = makeEvaluator({
+    model: 'jev-1.13.0',
+    apiKey: 'unit-key-not-live',
+    post: async (request) => {
+      const wire = JSON.parse(request.body) as { questions: Questions };
+      return {
+        status: 200,
+        body: JSON.stringify(
+          wire.questions.pair
+            ? selectedPairAnswer({ first: 0.2, second: 0.79 })
+            : selectedEffortAnswer({ low: 0.2, high: 0.81 }),
+        ),
+      };
+    },
+  });
+  const result = await route(routeInput(cfg, evaluate));
+  assert.equal(result.selected.candidate_id, 'second');
+  assert.equal(result.selected.thinking_level, 'high');
+  assert.deepEqual(result.evaluations.pair.answers.pair, choice({ first: 0.2, second: 0.79 }));
+  assert.deepEqual(result.evaluations.effort, selectedEffortAnswer({ low: 0.2, high: 0.81 }));
+});
+
 test('invalid second-stage response rejects instead of returning partial selection', async () => {
   const cfg = config({
     candidates: [
@@ -647,7 +682,7 @@ test('invalid second-stage response rejects instead of returning partial selecti
               effort: {
                 type: 'choice',
                 choice: 'low',
-                probabilities: { low: 0.7, high: 0.2 },
+                probabilities: { low: 0, high: 0 },
                 confidence: 1,
               },
             });

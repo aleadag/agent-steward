@@ -929,8 +929,8 @@ test('numeric response details survive route failures, history and launcher repo
     candidate({ id: 'private_second' }),
   ]);
   for (const [failureCall, kind, absent] of [
-    [1, 'probability_sum', false],
-    [2, 'probability_sum', false],
+    [1, 'schema', false],
+    [2, 'schema', false],
     [2, 'choice_mismatch', false],
     [2, 'choice_mismatch', true],
   ] as const) {
@@ -944,7 +944,7 @@ test('numeric response details survive route failures, history and launcher repo
       const failing = index === failureCall;
       return jevResponse({
         [id]: choiceAnswer(
-          { [first]: 0.75, [second]: failing && kind === 'probability_sum' ? 0.15 : 0.25 },
+          failing && kind === 'schema' ? { [first]: 0, [second]: 0 } : { [first]: 0.75, [second]: 0.25 },
           0.9,
           failing && kind === 'choice_mismatch' ? (absent ? 'private_missing' : second) : first,
         ),
@@ -965,14 +965,10 @@ test('numeric response details survive route failures, history and launcher repo
     assert.equal(failure.diagnostics.kind, kind);
     assert.deepEqual(
       failure.diagnostics.details,
-      kind === 'probability_sum'
+      kind === 'schema'
         ? {
             evaluation_index: failureCall - 1,
             question_index: 0,
-            expected: 1,
-            actual: 0.9,
-            tolerance: 0.000001,
-            deviation: -0.1,
             option_count: 2,
           }
         : {

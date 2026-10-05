@@ -144,27 +144,6 @@ function keyMismatchDetails(value: Record<string, unknown>, expected: readonly s
   };
 }
 
-function decimalParts(value: number): { coefficient: bigint; scale: number } {
-  const [significand = '0', exponentText] = value.toString().toLowerCase().split('e');
-  const exponent = exponentText === undefined ? 0 : Number(exponentText);
-  const [whole = '0', fraction = ''] = significand.split('.');
-  return { coefficient: BigInt(`${whole}${fraction}`), scale: fraction.length - exponent };
-}
-
-function choiceSumSummary(values: readonly number[]) {
-  // Sum canonical decimal spellings exactly, keeping decimal boundary values inside the specified tolerance.
-  const parts = values.map(decimalParts);
-  const scale = Math.max(0, ...parts.map((part) => part.scale));
-  const total = parts.reduce((sum, part) => sum + part.coefficient * 10n ** BigInt(scale - part.scale), 0n);
-  const unit = 10n ** BigInt(scale);
-  const difference = total >= unit ? total - unit : unit - total;
-  return {
-    withinTolerance: difference * 1_000_000n <= unit,
-    total: Number(`${total}e-${scale}`),
-    deviation: Number(`${total - unit}e-${scale}`),
-  };
-}
-
 export function validateEvaluation(raw: unknown, questions: Questions): Evaluation {
   try {
     assertJsonDepth(raw);
@@ -195,17 +174,8 @@ export function validateEvaluation(raw: unknown, questions: Questions): Evaluati
     if (!exactKeys(answer.probabilities, options))
       throw invalidResponse('choice_options', { ...context, ...keyMismatchDetails(answer.probabilities, options) });
     const probabilities = Object.values(answer.probabilities);
-    const sum = choiceSumSummary(probabilities);
-    if (!sum.withinTolerance)
-      throw invalidResponse('probability_sum', {
-        ...context,
-        expected: 1,
-        actual: sum.total,
-        tolerance: 0.000001,
-        deviation: sum.deviation,
-        option_count: options.length,
-      });
     const maximum = Math.max(...probabilities);
+    if (maximum === 0) throw invalidResponse('schema', { ...context, option_count: options.length });
     const choicePresent = Object.hasOwn(answer.probabilities, answer.choice);
     if (!choicePresent || answer.probabilities[answer.choice] !== maximum) {
       throw invalidResponse('choice_mismatch', {
