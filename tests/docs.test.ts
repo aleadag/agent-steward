@@ -223,13 +223,32 @@ test('optional adapter documents incomplete shutdown and offline recovery bounda
     'shutdown_incomplete',
     'release unconfirmed',
     'five seconds',
-    'event hooks may still',
     'pre-admitted',
     'offline',
     'generation tombstones',
     '15-second',
+    'pause',
+    'resume',
+    'workflows/',
+    'no menu polling',
   ])
     assert.ok(section.includes(term), `optional adapter section must include ${term}`);
+  assert.equal(section.includes('event hooks may still'), false);
+  assert.equal(section.includes('open its `supervisor` pane'), false);
+});
+
+test('adapter guidance describes deadline-driven recovery jobs rather than ordinary polling', () => {
+  assert.equal(readme.includes('ordinary polling'), false);
+  assert.equal(
+    readFileSync(new URL('../RELEASE_NOTES.md', import.meta.url), 'utf8').includes('ordinary polling'),
+    false,
+  );
+  assert.equal(
+    skill.includes('ordinary polling'),
+    false,
+    'bundled skill must not retain supervisor ordinary-polling wording',
+  );
+  assert.match(skill, /deadline-driven job/);
 });
 
 test('unreleased portability does not rewrite published-alpha or live-runtime claims', () => {

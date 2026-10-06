@@ -12,6 +12,7 @@ import type { EventDeps } from '../src/herdr-adapter/entry.ts';
 import type { AgentSnapshot, HerdrReader, ReadSnapshot } from '../src/herdr-adapter/observe.ts';
 import type { Episode } from '../src/herdr-adapter/state.ts';
 import type { StopInput, StopResult } from '../src/contracts.ts';
+import { deferred, within } from './herdr-lease-helpers.ts';
 
 type TestHandoffReason = Parameters<EventDeps['handoff']>[0];
 type AdapterHerdr = HerdrReader &
@@ -279,31 +280,62 @@ test('event hook remains inert without a scheduler lease even with explicit targ
   });
 });
 
-test('package-relative script uses only its sibling wrapper and rejects other commands', async () => {
+test('recover plugin manifest keeps status/exit hooks and metadata pause/resume without panes', async () => {
+  const manifest = await readFile(
+    new URL('../herdr-plugins/agent-steward-recover/herdr-plugin.toml', import.meta.url),
+    'utf8',
+  );
+  assert.match(manifest, /on = "pane\.agent_status_changed"/);
+  assert.match(manifest, /on = "pane\.exited"/);
+  assert.match(manifest, /command = \["sh", "run\.sh", "event"\]/);
+  assert.match(manifest, /id = "pause"[\s\S]*command = \["sh", "run\.sh", "pause"\]/);
+  assert.match(manifest, /id = "resume"[\s\S]*command = \["sh", "run\.sh", "resume"\]/);
+  assert.equal(manifest.includes('[[panes]]'), false);
+  assert.equal(manifest.includes('scheduler'), false);
+  assert.equal(manifest.includes('[[startup]]'), false);
+  assert.equal(manifest.includes('subscriptions'), false);
+});
+
+test('package-relative script uses only its sibling wrapper and rejects retired scheduler mode', async () => {
   const base = await mkdtemp(join(tmpdir(), 'steward-wrapper-'));
   const script = join(base, 'run.sh');
   const wrapper = join(base, 'agent-steward-herdr-adapter');
   await cp(new URL('../herdr-plugins/agent-steward-recover/run.sh', import.meta.url), script);
-  await writeFile(wrapper, '#!/bin/sh\nprintf "%s" "$1"\n');
+  await writeFile(wrapper, '#!/bin/sh\nprintf "mode=%s key=%s" "$1" "${TYPESAFE_API_KEY-}"\n');
   await chmod(wrapper, 0o755);
   await writeFile(join(base, 'node'), '#!/bin/sh\nexit 43\n');
   await chmod(join(base, 'node'), 0o755);
   await writeFile(join(base, 'bun'), '#!/bin/sh\nexit 43\n');
   await chmod(join(base, 'bun'), 0o755);
-  const result = spawnSync('sh', [script, 'event'], { encoding: 'utf8', env: { PATH: `${base}:${process.env.PATH}` } });
+  const secret = join(base, 'key');
+  await writeFile(secret, 'secret-value\n');
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${base}:${process.env.PATH}` };
+  delete env.TYPESAFE_API_KEY;
+  const result = spawnSync('sh', [script, 'event'], {
+    encoding: 'utf8',
+    env: { ...env, TYPESAFE_API_KEY_FILE: secret },
+  });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, 'event');
+  assert.equal(result.stdout, 'mode=event key=secret-value');
+  for (const mode of ['pause', 'resume'] as const) {
+    const control = spawnSync('sh', [script, mode], {
+      encoding: 'utf8',
+      env: { ...env, TYPESAFE_API_KEY_FILE: secret },
+    });
+    assert.equal(control.status, 0, control.stderr);
+    assert.equal(control.stdout, `mode=${mode} key=`);
+  }
   const refused = spawnSync('sh', [script, 'unknown'], { encoding: 'utf8' });
-  assert.notEqual(refused.status, 0);
+  assert.equal(refused.status, 2);
   const override = join(base, 'override-adapter');
   await writeFile(override, '#!/bin/sh\nprintf "over:%s" "$1"\n');
   await chmod(override, 0o755);
   const redirected = spawnSync('sh', [script, 'scheduler'], {
     encoding: 'utf8',
-    env: { ...process.env, AGENT_STEWARD_HERDR_ADAPTER: override },
+    env: { ...env, AGENT_STEWARD_HERDR_ADAPTER: override },
   });
-  assert.equal(redirected.status, 0, redirected.stderr);
-  assert.equal(redirected.stdout, 'over:scheduler');
+  assert.equal(redirected.status, 2);
+  assert.equal(redirected.stdout, '');
 });
 
 test('plain detection text is untrusted evidence: accepted without asserting an isolated stop', async () => {
@@ -707,4 +739,161 @@ test('explicit 12-line/2048-byte detection limits accept boundary without clippi
   const observed = await observeStop(fakeHerdr(agent(), output({ text: within })), 'w1:p1');
   assert.ok(observed);
   assert.equal(observed.context, within);
+});
+
+test('normalizeEvent accepts dotted and underscored status and exit hooks', async () => {
+  const { normalizeEvent } = await import('../src/herdr-adapter/events.ts');
+  for (const type of ['pane.agent_status_changed', 'pane_agent_status_changed', 'pane.exited', 'pane_exited']) {
+    const event = normalizeEvent({ type, pane_id: 'w1:p1', workspace_id: 'w1', agent_status: 'idle' });
+    assert.ok(event);
+    assert.equal(event.type, type);
+    assert.equal(event.pane_id, 'w1:p1');
+  }
+  const enveloped = normalizeEvent({
+    event: 'pane.agent_status_changed',
+    data: { pane_id: 'wG:p1', workspace_id: 'wG', agent_status: 'blocked' },
+  });
+  assert.ok(enveloped);
+  assert.equal(enveloped.type, 'pane.agent_status_changed');
+  assert.equal(enveloped.pane_id, 'wG:p1');
+  const underscored = normalizeEvent({ event: 'pane_exited', data: { pane_id: 'w1:p1' } });
+  assert.ok(underscored);
+  assert.equal(underscored.type, 'pane_exited');
+});
+
+test('normalizeEvent rejects malformed shape, type and pane identity', async () => {
+  const { normalizeEvent } = await import('../src/herdr-adapter/events.ts');
+  assert.equal(normalizeEvent(null), null);
+  assert.equal(normalizeEvent('pane.agent_status_changed'), null);
+  assert.equal(normalizeEvent({ type: 'pane.output_changed', pane_id: 'w1:p1' }), null);
+  assert.equal(normalizeEvent({ type: 'pane.agent_status_changed' }), null);
+  assert.equal(normalizeEvent({ type: 'pane.agent_status_changed', pane_id: '../w1:p1' }), null);
+  assert.equal(normalizeEvent({ type: 'pane.agent_status_changed', pane_id: 'w1:p1\n' }), null);
+  assert.equal(normalizeEvent({ type: 'pane.agent_status_changed', pane_id: 'G:p1' }), null);
+  assert.equal(normalizeEvent({ event: 'pane.agent_status_changed', data: null }), null);
+  assert.equal(normalizeEvent({ event: 'pane.agent_status_changed', data: { pane_id: 1 } }), null);
+});
+
+test('scoped healthy no-action assessment creates no recovery job without a global lease', async () => {
+  const { beginWorkflow, reserveJobSlot } = await import('../src/herdr-adapter/authority.ts');
+  const { WorkflowState } = await import('../src/herdr-adapter/workflow-state.ts');
+  const { EpisodeStore } = await import('../src/herdr-adapter/state.ts');
+  const { workflowEventDeps } = await import('../src/herdr-adapter/events.ts');
+  const root = await mkdtemp(join(tmpdir(), 'steward-scoped-no-action-'));
+  const state = new WorkflowState(root);
+  const store = new EpisodeStore(root);
+  const attempt = beginWorkflow({
+    state,
+    scope: {
+      serverId: '47:1',
+      agent: 'agy',
+      sessionId: 's1',
+      sessionKind: 'id',
+      sessionSource: 'herdr:antigravity_cli',
+    },
+    paneId: 'w1:p1',
+    workspaceId: 'w1',
+    permission: async () => ({ serverId: '47:1', enabled: true, targets: 'all' as const, autoApprove: false }),
+    signal: new AbortController().signal,
+  });
+  try {
+    const authority = await attempt.ready;
+    assert.ok(authority);
+    assert.equal(await store.active(), false);
+    let activeCalls = 0;
+    const active = store.active.bind(store);
+    store.active = async (session) => {
+      activeCalls++;
+      return active(session);
+    };
+    const healthy = agent({
+      agent: 'agy',
+      agent_status: 'idle',
+      agent_session: { agent: 'agy', kind: 'id', source: 'herdr:antigravity_cli', value: 's1' },
+    });
+    const excerpt = output({ text: 'Task completed successfully.\n' });
+    const herdr = fakeHerdr(healthy, excerpt);
+    const { deps, handoffs } = fixture(herdr);
+    const decisions: StopInput[] = [];
+    const entered = deferred<void>();
+    const resume = deferred<void>();
+    const scoped = workflowEventDeps(
+      {
+        ...deps,
+        store,
+        decide: async (input) => {
+          decisions.push(input);
+          if (decisions.length === 1) {
+            entered.resolve();
+            await resume.promise;
+            return {
+              ...localDecision(input),
+              proposed_action: { kind: 'no_action' },
+              reason_code: 'completed',
+              waiting_for: 'completed',
+            };
+          }
+          return {
+            ...localDecision(input),
+            proposed_action: { kind: 'wait_for_quota', not_before: '2026-09-29T10:05:00Z' },
+            reason_code: 'quota_limit',
+            waiting_for: 'quota_limit',
+            waiting_confidence: 1,
+            evaluation: {
+              model: 'jev-1.13.0',
+              usage: {},
+              answers: {
+                waiting_for: {
+                  type: 'choice',
+                  choice: 'quota_limit',
+                  probabilities: { quota_limit: 1 },
+                  confidence: 1,
+                },
+              },
+            },
+          };
+        },
+      },
+      authority,
+      state,
+    );
+    const running = handleEvent({ ...event, agent: 'agy', agent_status: 'idle' }, scoped);
+    try {
+      await within(entered.promise);
+      assert.equal(await store.sessionRetry('agy', 's1'), null);
+    } finally {
+      resume.resolve();
+      await within(running);
+    }
+    assert.equal(activeCalls, 0);
+    assert.equal(await store.sessionRetry('agy', 's1'), null);
+    assert.deepEqual(handoffs, []);
+    assert.equal((await state.binding(authority.scope))?.phase, 'observing');
+    const slot = reserveJobSlot(state, authority);
+    try {
+      assert.equal(await slot.ready, null);
+    } finally {
+      await slot.finish();
+    }
+
+    // A later distinct failure must reach assessment, not mismatch manufactured
+    // recovery history from the healthy observation.
+    herdr.replace({ ...healthy, revision: 9, state_change_seq: 5 });
+    excerpt.revision = 9;
+    excerpt.text = 'Quota exhausted.\n';
+    await handleEvent({ ...event, agent: 'agy', agent_status: 'idle' }, scoped);
+    assert.equal(decisions.length, 2);
+    assert.notEqual(decisions[1]!.current_episode_id, decisions[0]!.current_episode_id);
+    assert.equal(decisions[1]!.retry.attempt_count, 0);
+    assert.equal(decisions[1]!.retry.quota_check_count, 0);
+    const pending = await store.sessionRetry('agy', 's1');
+    assert.ok(pending);
+    assert.equal(pending.failure_episode_id, decisions[1]!.current_episode_id);
+    assert.equal(pending.next_check_at, '2026-09-29T10:05:00.000Z');
+    assert.equal(pending.last_delivery_state, 'none');
+    assert.deepEqual(handoffs, []);
+  } finally {
+    attempt.close();
+    await attempt.finish();
+  }
 });

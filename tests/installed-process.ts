@@ -24,11 +24,24 @@ function diagnostic(result: SpawnSyncReturns<string>): string {
   });
 }
 
-function invoke(variable: string, args: string[]): string {
+function vanishedPid(result: SpawnSyncReturns<string>): boolean {
+  return (
+    result.status === 1 &&
+    result.signal == null &&
+    result.error === undefined &&
+    Buffer.byteLength(result.stdout ?? '') === 0 &&
+    Buffer.byteLength(result.stderr ?? '') === 0
+  );
+}
+
+function invoke(variable: string, args: string[]): string;
+function invoke(variable: string, args: string[], missing: true): string | null;
+function invoke(variable: string, args: string[], missing = false): string | null {
   const command = process.env[variable];
   assert.ok(command, `installed observation requires ${variable}`);
   const result = spawnSync(command, args, { env: { PATH: '' }, encoding: 'utf8', timeout: 1_000 });
   const details = `diagnostic=${diagnostic(result)}`;
+  if (missing && vanishedPid(result)) return null;
   assert.equal(result.status, 0, `native installed process observation failed; ${details}`);
   assert.equal(result.error, undefined, `native installed process observation failed; ${details}`);
   return result.stdout.trim();
@@ -40,12 +53,18 @@ export function executablePath(pid: number): string {
   return realpathSync(path);
 }
 
-export function processRow(pid: number): ProcessRow {
-  const line = invoke('AGENT_STEWARD_PS', ['-ww', '-p', String(pid), '-o', 'pid=,ppid=,stat=,command=']);
+function parseProcessRow(pid: number, line: string): ProcessRow {
   const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/.exec(line);
   assert.ok(match, 'owned process row must be complete');
   assert.equal(Number(match[1]), pid);
   return { pid, parent: Number(match[2]), state: match[3]!, command: match[4]! };
+}
+
+export function processRow(pid: number): ProcessRow {
+  return parseProcessRow(
+    pid,
+    invoke('AGENT_STEWARD_PS', ['-ww', '-p', String(pid), '-o', 'pid=,ppid=,stat=,command=']),
+  );
 }
 
 export function childPids(parent: number): number[] {
@@ -75,7 +94,10 @@ export function assertInstalledProcess(pid: number, runtime: string, entry: stri
 
 export function findInstalledChild(parent: number, runtime: string, entry: string): number | undefined {
   const pid = childPids(parent).find((child) => {
-    const row = processRow(child);
+    // Enumeration can observe a child that exits before argv inspection; that is not a broken observer.
+    const line = invoke('AGENT_STEWARD_PS', ['-ww', '-p', String(child), '-o', 'pid=,ppid=,stat=,command='], true);
+    if (line === null) return false;
+    const row = parseProcessRow(child, line);
     return row.parent === parent && row.command.split(/\s+/).includes(entry);
   });
   if (pid === undefined) return undefined;

@@ -1,596 +1,89 @@
 import { randomUUID } from 'node:crypto';
-import { z } from 'zod';
-import { readFileText } from '../io.ts';
-import { quotaResetHint, type QuotaHint } from './quota-hint.ts';
 import { spawn } from 'node:child_process';
-import { readFile, stat } from 'node:fs/promises';
-import { CorruptEpisodeError, EpisodeStore, type Episode } from './state.ts';
+import { realpath, stat } from 'node:fs/promises';
 import { connect } from 'node:net';
-import { fileURLToPath } from 'node:url';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import process from 'node:process';
-import { StopInputSchema, StopResultSchema } from '../contracts.ts';
-import { assertNoCredentials } from '../privacy.ts';
-import { observeStop } from './observe.ts';
-import { deliverProposal } from './deliver.ts';
-import { approvalMenu, handleBestEffortApproval } from './best-effort-approval.ts';
-import { runScheduler, type SchedulerResult } from './scheduler.ts';
+import { fileURLToPath } from 'node:url';
+import { StopResultSchema } from '../contracts.ts';
+import { readFileText } from '../io.ts';
+import { beginWorkflow } from './authority.ts';
 import type { HerdrControl } from './deliver.ts';
+import { handleEvent, normalizeEvent, workflowEventDeps, type EventDeps, type EventTrigger } from './events.ts';
+import { runEpisodeJob, type JobOptions } from './jobs.ts';
 import type { HerdrReader, AgentSnapshot, ReadSnapshot } from './observe.ts';
+import { quotaResetHint, type QuotaHint } from './quota-hint.ts';
+import { EpisodeStore, type Episode } from './state.ts';
+import {
+  validateWorkflowScope,
+  workflowSession,
+  WorkflowState,
+  type ControlResult,
+  type RuntimePermission,
+  type WorkflowResult,
+  type WorkflowScope,
+} from './workflow-state.ts';
 import type { StopInput, StopResult } from '../contracts.ts';
 
-type Retry = StopInput['retry'];
-type Event = { type?: string; pane_id?: string; workspace_id?: string; agent?: string | null; agent_status?: string };
-type EventTrigger = Event | { event: string; data: Event };
-type Store = {
-  active: (session?: string) => Promise<boolean>;
-  leaseMatches?: (token: string, session: string) => Promise<boolean>;
-  retry: (paneId: string) => Promise<Episode | null>;
-  record: (paneId: string, retry: Episode) => Promise<void>;
-  clear?: (paneId: string) => Promise<void>;
-  approval?: EpisodeStore['approval'];
-  recordApproval?: EpisodeStore['recordApproval'];
-  withEpisodeLock?: <T>(paneId: string, action: () => Promise<T>) => Promise<T | null>;
-};
-type HandoffReason = 'observation_unavailable' | 'decision_failed' | 'human_review_required';
-export type EventDeps = {
-  herdr: HerdrReader & Partial<Pick<HerdrControl, 'prompt' | 'sendKeys'>>;
-  autoApprove?: boolean;
-  quotaHint?: QuotaHint;
-  decide: (input: StopInput) => Promise<unknown>;
-  store: Store;
-  clock: { now: () => Date };
-  targets: readonly string[] | 'all';
-  handoff: (reason: HandoffReason) => Promise<void>;
-  sessionId?: string;
-  leaseToken?: string;
-  sessionValid?: () => Promise<boolean>;
-  admissionOpen?: () => boolean;
-};
+export { handleEvent, type EventDeps };
 
-export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = false): Promise<void> {
-  const admissionOpen = deps.admissionOpen ?? (() => true);
-  if (!admissionOpen()) return;
-  const event: Event =
-    'event' in trigger && trigger.data && typeof trigger.data === 'object'
-      ? { ...trigger.data, type: trigger.event }
-      : (trigger as Event);
-  const statusEvent = event.type === 'pane_agent_status_changed' || event.type === 'pane.agent_status_changed';
-  const exitEvent = event.type === 'pane_exited' || event.type === 'pane.exited';
-  if (
-    (!statusEvent && !exitEvent) ||
-    typeof event.pane_id !== 'string' ||
-    (deps.targets !== 'all' && !deps.targets.includes(event.pane_id))
-  )
-    return;
-  if (!admissionOpen()) return;
-  const active = await deps.store.active(deps.sessionId);
-  if (!admissionOpen() || !active) return;
-  const stillOwner = async (): Promise<boolean> => {
-    if (!admissionOpen()) return false;
-    if (deps.sessionValid) {
-      const valid = await deps.sessionValid();
-      if (!admissionOpen() || !valid) return false;
-    }
-    if (!admissionOpen()) return false;
-    const allowed = deps.sessionId
-      ? !!deps.leaseToken && !!(await deps.store.leaseMatches?.(deps.leaseToken, deps.sessionId))
-      : await deps.store.active();
-    return admissionOpen() && allowed;
+type HandoffReason = 'observation_unavailable' | 'decision_failed' | 'human_review_required';
+const socketTimeoutMs = 2_000;
+const socketLimitBytes = 65_536;
+const recoverPluginId = 'agent-steward-recover';
+const incompleteWarning = 'agent-steward: release unconfirmed; shutdown incomplete. Human review required.\n';
+const migrationWarning =
+  'agent-steward: legacy supervisor state is live or unverifiable. Disable the plugin, stop all adapters and verify they are dead before offline cleanup of a stranded guard or legacy lease. Preserve episode records and generation tombstones.\n';
+
+function isMissing(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT';
+}
+
+function recoverable(episode: Episode | null): episode is Episode {
+  return (
+    episode !== null &&
+    episode.last_delivery_state === 'none' &&
+    episode.next_check_at !== null &&
+    episode.lifecycle_handoff_sent !== true
+  );
+}
+
+function processOutput(): { write(text: string): void; fail(): void } {
+  return {
+    write: (text) => {
+      process.stderr.write(text);
+    },
+    fail: () => {
+      process.exitCode = 1;
+    },
   };
-  const notify = async (reason: HandoffReason): Promise<void> => {
-    if (admissionOpen()) await deps.handoff(reason);
-  };
-  const assess = async () => {
-    if (!admissionOpen()) return;
-    if (
-      exitEvent ||
-      (event.agent_status !== 'blocked' && event.agent_status !== 'idle' && event.agent_status !== 'done')
-    ) {
-      if (!exitEvent && !['working', 'unknown'].includes(event.agent_status ?? '')) return;
-      if (!admissionOpen()) return;
-      const owns = await stillOwner();
-      if (!admissionOpen() || !owns) return;
-      let current;
-      try {
-        current = await deps.herdr.get(event.pane_id!);
-      } catch {
-        if (!admissionOpen()) return;
-        await notify('observation_unavailable');
-        return;
-      }
-      if (!admissionOpen()) return;
-      let old;
-      try {
-        old = await deps.store.retry(event.pane_id!);
-      } catch (error) {
-        if (!admissionOpen()) return;
-        if (!(error instanceof CorruptEpisodeError)) throw error;
-        const stillOwned = await stillOwner();
-        if (!admissionOpen()) return;
-        if (!stillOwned) {
-          await notify('human_review_required');
-          return;
-        }
-        // Unreadable history cannot authorize a fresh retry budget.
-        await notify('observation_unavailable');
-        return;
-      }
-      if (!admissionOpen()) return;
-      if (!old) return;
-      const replaced = current?.agent_session?.value && current.agent_session.value !== old.session_id;
-      const moved = current && current.workspace_id !== event.pane_id!.split(':')[0];
-      const settled =
-        !current ||
-        (current.workspace_id === event.workspace_id &&
-          (exitEvent
-            ? ['working', 'done', 'unknown'].includes(current.agent_status)
-            : current.agent_status === event.agent_status));
-      if (replaced || moved || settled) {
-        const lifecycle = !current || moved || current.agent_status === 'unknown';
-        const notifyLifecycle = lifecycle && !old.lifecycle_handoff_sent;
-        const quarantine = old.last_delivery_state === 'none';
-        if (!replaced && !notifyLifecycle && !quarantine) return;
-        if (!admissionOpen()) return;
-        const stillOwned = await stillOwner();
-        if (!admissionOpen()) return;
-        if (!stillOwned) {
-          await notify('human_review_required');
-          return;
-        }
-        if (!admissionOpen()) return;
-        if (replaced) await deps.store.clear?.(event.pane_id!);
-        else
-          await deps.store.record(event.pane_id!, {
-            ...old,
-            ...(quarantine ? { next_check_at: null, last_delivery_state: 'human' as const } : {}),
-            ...(notifyLifecycle ? { lifecycle_handoff_sent: true } : {}),
-          });
-        if (!admissionOpen()) return;
-        await notify('observation_unavailable');
-      }
-      return;
-    }
-    if (!statusEvent || !admissionOpen()) return;
-    // Recheck the lease *inside* the episode lock; an earlier event never grants authority.
-    const owns = await stillOwner();
-    if (!admissionOpen() || !owns) return;
-    let existing;
-    try {
-      existing = await deps.store.retry(event.pane_id!);
-    } catch (error) {
-      if (!admissionOpen()) return;
-      if (!(error instanceof CorruptEpisodeError)) throw error;
-      const stillOwned = await stillOwner();
-      if (!admissionOpen()) return;
-      if (!stillOwned) {
-        await notify('human_review_required');
-        return;
-      }
-      // Keep corrupt history as a fail-closed quarantine until human repair.
-      await notify('observation_unavailable');
-      return;
-    }
-    if (!admissionOpen()) return;
-    if (
-      due &&
-      (!(existing as Episode | null)?.next_check_at ||
-        Date.parse((existing as Episode).next_check_at!) > deps.clock.now().getTime())
-    )
-      return;
-    let observed;
-    try {
-      observed = await observeStop(deps.herdr, event.pane_id!);
-    } catch {
-      if (!admissionOpen()) return;
-      if (due) throw new Error('Herdr observation unavailable');
-      await notify('observation_unavailable');
-      return;
-    }
-    if (!admissionOpen()) return;
-    if (
-      !observed ||
-      event.workspace_id !== observed.workspace_id ||
-      event.agent_status !== observed.status ||
-      (event.agent != null && event.agent !== observed.agent)
-    ) {
-      if (existing) {
-        let live;
-        try {
-          live = await deps.herdr.get(event.pane_id!);
-        } catch {
-          if (!admissionOpen()) return;
-          if (due) throw new Error('Herdr observation unavailable');
-          await notify('observation_unavailable');
-          return;
-        }
-        if (!admissionOpen()) return;
-        // A rejected excerpt or stale event workspace alone cannot establish a move.
-        const moved =
-          !!live &&
-          live.pane_id === event.pane_id &&
-          !!live.workspace_id &&
-          live.workspace_id !== event.pane_id!.split(':')[0] &&
-          live.agent_session?.value === existing.session_id;
-        if (moved) {
-          const notifyLifecycle = !existing.lifecycle_handoff_sent;
-          const quarantine = existing.next_check_at !== null || existing.last_delivery_state !== 'human';
-          if (notifyLifecycle || quarantine) {
-            if (!admissionOpen()) return;
-            const stillOwned = await stillOwner();
-            if (!admissionOpen()) return;
-            if (!stillOwned) {
-              await notify('human_review_required');
-              return;
-            }
-            if (!admissionOpen()) return;
-            await deps.store.record(event.pane_id!, {
-              ...existing,
-              next_check_at: null,
-              last_delivery_state: 'human',
-              lifecycle_handoff_sent: true,
-            });
-            if (!admissionOpen()) return;
-          }
-          if (notifyLifecycle) await notify('observation_unavailable');
-          return;
-        }
-      }
-      if (due && existing) {
-        if (!admissionOpen()) return;
-        const stillOwned = await stillOwner();
-        if (!admissionOpen()) return;
-        if (!stillOwned) {
-          await notify('human_review_required');
-          return;
-        }
-        if (!admissionOpen()) return;
-        await deps.store.record(event.pane_id!, { ...existing, next_check_at: null, last_delivery_state: 'human' });
-        if (!admissionOpen()) return;
-      }
-      await notify('observation_unavailable');
-      return;
-    }
-    if (await handleBestEffortApproval(observed, deps, stillOwner)) return;
-    if (!admissionOpen()) return;
-    const history = existing;
-    const quarantine = async (reason: HandoffReason) => {
-      if (!admissionOpen()) return;
-      if (due && history) {
-        const stillOwned = await stillOwner();
-        if (!admissionOpen()) return;
-        if (!stillOwned) {
-          await notify('human_review_required');
-          return;
-        }
-        if (!admissionOpen()) return;
-        await deps.store.record(observed.pane_id, {
-          ...(history as Episode),
-          next_check_at: null,
-          last_delivery_state: 'human',
-        });
-        if (!admissionOpen()) return;
-      }
-      await notify(reason);
-    };
-    if (history && (history as Episode).session_id !== observed.session_id) {
-      if (!admissionOpen()) return;
-      const stillOwned = await stillOwner();
-      if (!admissionOpen()) return;
-      if (!stillOwned) {
-        await notify('human_review_required');
-        return;
-      }
-      if (!admissionOpen()) return;
-      await deps.store.clear?.(observed.pane_id);
-      if (!admissionOpen()) return;
-      await notify('observation_unavailable');
-      return;
-    }
-    if (history && history.failure_episode_id !== observed.current_episode_id) {
-      // A sequence/revision/status change, even with identical or different historical
-      // detection text, cannot prove a fresh failure. Keep the same-session caps.
-      const moved = observed.workspace_id !== observed.pane_id.split(':')[0];
-      const notifyLifecycle = moved && !history.lifecycle_handoff_sent;
-      const quarantine = history.last_delivery_state === 'none' || history.last_delivery_state === 'delivered';
-      if (quarantine || notifyLifecycle) {
-        if (!admissionOpen()) return;
-        const stillOwned = await stillOwner();
-        if (!admissionOpen()) return;
-        if (!stillOwned) {
-          await notify('human_review_required');
-          return;
-        }
-        if (!admissionOpen()) return;
-        await deps.store.record(observed.pane_id, {
-          ...history,
-          ...(quarantine ? { next_check_at: null, last_delivery_state: 'human' as const } : {}),
-          ...(notifyLifecycle ? { lifecycle_handoff_sent: true } : {}),
-        });
-        if (!admissionOpen()) return;
-        await notify('observation_unavailable');
-      }
-      return;
-    }
-    if (history && (history as Episode).last_delivery_state !== 'none') return;
-    if (observed.status === 'done' && !deps.autoApprove && approvalMenu(observed.context)) {
-      if (history) {
-        const stillOwned = await stillOwner();
-        if (!admissionOpen()) return;
-        if (!stillOwned) {
-          await notify('human_review_required');
-          return;
-        }
-        await deps.store.record(observed.pane_id, { ...history, next_check_at: null, last_delivery_state: 'human' });
-        if (!admissionOpen()) return;
-      }
-      await notify('human_review_required');
-      return;
-    }
-    if (
-      history &&
-      (history as Episode).next_check_at &&
-      deps.clock.now().getTime() >= Date.parse(history.first_observed_at) + 24 * 60 * 60_000
-    ) {
-      if (!admissionOpen()) return;
-      const stillOwned = await stillOwner();
-      if (!admissionOpen()) return;
-      if (!stillOwned) {
-        await notify('human_review_required');
-        return;
-      }
-      if (!admissionOpen()) return;
-      await deps.store.record(observed.pane_id, {
-        ...(history as Episode),
-        next_check_at: null,
-        last_delivery_state: 'human',
-      });
-      if (!admissionOpen()) return;
-      await notify('human_review_required');
-      return;
-    }
-    // No new classification for the same pending timer. Due wake-ups advance quota
-    // history only when the fresh decision still confirms quota exhaustion.
-    if (
-      !due &&
-      (history as Episode | null)?.next_check_at &&
-      Date.parse((history as Episode).next_check_at!) > deps.clock.now().getTime()
-    )
-      return;
-    const now = deps.clock.now();
-    if (!Number.isFinite(now.getTime())) return;
-    const retry: Retry = history
-      ? {
-          failure_episode_id: history.failure_episode_id,
-          first_observed_at: history.first_observed_at,
-          attempt_count: history.attempt_count,
-          last_attempt_at: history.last_attempt_at,
-          quota_check_count: history.quota_check_count,
-          last_quota_check_at: history.last_quota_check_at,
-        }
-      : {
-          failure_episode_id: observed.current_episode_id,
-          first_observed_at: now.toISOString(),
-          attempt_count: 0,
-          last_attempt_at: null,
-          quota_check_count: 0,
-          last_quota_check_at: null,
-        };
-    let current;
-    try {
-      current = await deps.herdr.get(observed.pane_id);
-    } catch {
-      if (!admissionOpen()) return;
-      // A failed socket read cannot prove a changed occupant. Preserve the due record
-      // and let the runner enter its bounded reconnect path rather than waking at 100ms.
-      if (due) throw new Error('Herdr read unavailable');
-      await notify('observation_unavailable');
-      return;
-    }
-    if (!admissionOpen()) return;
-    if (
-      !current ||
-      current.agent !== observed.agent ||
-      current.agent_status !== observed.status ||
-      current.agent_session?.agent !== observed.agent ||
-      current.agent_session?.kind !== observed.session_kind ||
-      current.agent_session?.source !== observed.session_source ||
-      current.agent_session?.value !== observed.session_id ||
-      current.revision !== observed.revision ||
-      current.state_change_seq !== observed.state_change_seq ||
-      current.workspace_id !== observed.workspace_id
-    ) {
-      await quarantine('observation_unavailable');
-      return;
-    }
-    const inputRetry: Retry =
-      due && history && (history as Episode).next_check_at
-        ? {
-            ...retry,
-            quota_check_count: retry.quota_check_count + 1,
-            last_quota_check_at: now.toISOString(),
-          }
-        : retry;
-    const input = StopInputSchema.safeParse({
-      schema_version: 2,
-      request_id: randomUUID(),
-      agent: {
-        id: observed.session_id,
-        tool: observed.agent,
-        pane_id: observed.pane_id,
-        session_id: observed.session_id,
-      },
-      status: observed.status,
-      context: observed.context,
-      current_episode_id: observed.current_episode_id,
-      automatic_approval_forbidden: true,
-      retry: inputRetry,
-    });
-    if (!input.success) {
-      await quarantine('observation_unavailable');
-      return;
-    }
-    try {
-      assertNoCredentials(input.data, process.env.TYPESAFE_API_KEY ?? '');
-    } catch {
-      await quarantine('observation_unavailable');
-      return;
-    }
-    if (!admissionOpen()) return;
-    let result: StopResult;
-    try {
-      result = StopResultSchema.parse(await deps.decide(input.data));
-    } catch {
-      if (!admissionOpen()) return;
-      await quarantine('decision_failed');
-      return;
-    }
-    if (!admissionOpen()) return;
-    if (result.decision !== 'stop_decision' || result.request_id !== input.data.request_id) {
-      await quarantine('decision_failed');
-      return;
-    }
-    if (result.proposed_action.kind === 'manual_review' || result.proposed_action.kind === 'approve_request') {
-      await quarantine('human_review_required');
-      return;
-    }
-    // Never store action text. A proposed reset from the CLI is not trusted reset proof;
-    // Herdr 0.9.1 exposes no independently bound live agent account/pool identity.
-    const action = result.proposed_action;
-    if (
-      due &&
-      history &&
-      action.kind === 'send_recovery_instruction' &&
-      (history as Episode).next_check_at !== action.not_before
-    ) {
-      await quarantine('human_review_required');
-      return;
-    }
-    const quota = action.kind === 'wait_for_quota';
-    const deadline = Date.parse(retry.first_observed_at) + 24 * 60 * 60_000;
-    const checked = due && quota ? inputRetry : retry;
-    const delays = [5, 15, 45, 120];
-    const delay = (delays[checked.quota_check_count] ?? 360) * 60_000;
-    const base = Date.parse(checked.last_quota_check_at ?? checked.first_observed_at);
-    const fallback = Math.min(base + delay, deadline);
-    // The CLI classifies this as quota; it cannot supply reset proof or dictate this timer.
-    let next = quota && Number.isFinite(fallback) && fallback > now.getTime() ? new Date(fallback).toISOString() : null;
-    if (quota && !next) {
-      await quarantine('human_review_required');
-      return;
-    }
-    if (quota && next && deps.quotaHint) {
-      try {
-        const hint = await deps.quotaHint(observed, now);
-        if (!admissionOpen()) return;
-        if (z.iso.datetime({ offset: true }).safeParse(hint).success) {
-          const at = Date.parse(hint!);
-          if (at > now.getTime() && at < fallback) next = new Date(at).toISOString();
-        }
-      } catch {
-        // A best-effort hint cannot suppress the ordinary quota recheck.
-      }
-    }
-    if (!admissionOpen()) return;
-    const stillOwned = await stillOwner();
-    if (!admissionOpen()) return;
-    if (!stillOwned) {
-      await notify('human_review_required');
-      return;
-    }
-    const record: Episode = {
-      ...retry,
-      ...(due && quota ? inputRetry : {}),
-      pane_id: observed.pane_id,
-      session_id: observed.session_id,
-      error_evidence_digest: observed.error_evidence_digest,
-      next_check_at: next,
-      last_delivery_state: 'none',
-    };
-    if (!admissionOpen()) return;
-    await deps.store.record(observed.pane_id, record);
-    if (!admissionOpen()) return;
-    if (action.kind === 'send_recovery_instruction') {
-      if (!deps.herdr.prompt) {
-        if (!admissionOpen()) return;
-        const stillOwnedBeforeQuarantine = await stillOwner();
-        if (!admissionOpen()) return;
-        if (stillOwnedBeforeQuarantine) {
-          if (!admissionOpen()) return;
-          await deps.store.record(observed.pane_id, {
-            ...record,
-            next_check_at: null,
-            last_delivery_state: 'human',
-          });
-          if (!admissionOpen()) return;
-        }
-        await notify('human_review_required');
-        return;
-      }
-      if (!admissionOpen()) return;
-      const outcome = await deliverProposal(
-        deps.herdr as HerdrControl,
-        observed,
-        result,
-        deps.store as EpisodeStore,
-        deps.clock,
-        deps.decide as (input: StopInput) => Promise<StopResult>,
-        stillOwner,
-        true,
-        admissionOpen,
-      );
-      if (!admissionOpen()) return;
-      if (outcome === 'human' || outcome === 'uncertain') {
-        const stillOwnedForCleanup = await stillOwner();
-        if (!admissionOpen()) return;
-        if (stillOwnedForCleanup) {
-          const latest = await deps.store.retry(observed.pane_id);
-          if (!admissionOpen()) return;
-          if (latest) {
-            const stillOwnedAfterRead = await stillOwner();
-            if (!admissionOpen()) return;
-            if (stillOwnedAfterRead) {
-              if (!admissionOpen()) return;
-              await deps.store.record(observed.pane_id, {
-                ...(latest as Episode),
-                next_check_at: null,
-                last_delivery_state: outcome === 'human' ? 'human' : 'uncertain',
-              });
-              if (!admissionOpen()) return;
-            }
-          }
-        }
-        await notify('human_review_required');
-      }
-    }
-  };
-  if (!admissionOpen()) return;
-  if (deps.store.withEpisodeLock) {
-    await deps.store.withEpisodeLock(event.pane_id!, assess);
-    if (!admissionOpen()) return;
-  } else await assess();
 }
 
 // Herdr 0.9.1 newline-delimited socket protocol for bounded observation.
 async function request(
   socketPath: string,
-  method: 'agent.get' | 'agent.read' | 'agent.list',
+  method: 'agent.get' | 'agent.read' | 'agent.list' | 'plugin.list',
   params: object,
 ): Promise<unknown> {
   return await new Promise((resolve, reject) => {
     const socket = connect(socketPath);
     const id = randomUUID();
     let data = '';
+    let settled = false;
     const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       socket.destroy();
       reject(error);
     };
-    socket.setTimeout(3000, () => fail(new Error('Herdr read timeout')));
+    const timer = setTimeout(() => fail(new Error('Herdr read timeout')), socketTimeoutMs);
+    socket.setTimeout(socketTimeoutMs, () => fail(new Error('Herdr read timeout')));
     socket.on('connect', () => socket.write(`${JSON.stringify({ id, method, params })}\n`));
-    socket.on('error', reject);
+    socket.on('error', (error) => fail(error));
     socket.on('data', (chunk: Buffer) => {
       data += chunk.toString('utf8');
-      if (Buffer.byteLength(data, 'utf8') > 65536) {
+      if (Buffer.byteLength(data, 'utf8') > socketLimitBytes) {
         fail(new Error('Herdr response too large'));
         return;
       }
@@ -600,12 +93,15 @@ async function request(
       try {
         const response = JSON.parse(data.slice(0, end));
         if (response.id !== id || response.error || !response.result) throw new Error('Herdr read failed');
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
         resolve(response.result);
       } catch {
-        reject(new Error('Invalid Herdr response'));
+        fail(new Error('Invalid Herdr response'));
       }
     });
-    socket.on('end', () => reject(new Error('Incomplete Herdr response')));
+    socket.on('end', () => fail(new Error('Incomplete Herdr response')));
   });
 }
 
@@ -749,10 +245,12 @@ async function socketSession(path: string): Promise<string | null> {
     return null;
   }
 }
+
 function handoff(reason: HandoffReason): Promise<void> {
   process.stderr.write(`agent-steward: human_review_required (${reason})\n`);
   return Promise.resolve();
 }
+
 async function visibleHandoff(env: NodeJS.ProcessEnv, reason: HandoffReason): Promise<void> {
   await handoff(reason);
   if (!env.HERDR_BIN_PATH || !isAbsolute(env.HERDR_BIN_PATH) || !env.HERDR_SOCKET_PATH) return;
@@ -775,6 +273,7 @@ async function visibleHandoff(env: NodeJS.ProcessEnv, reason: HandoffReason): Pr
     });
   });
 }
+
 function quotaHintFrom(env: NodeJS.ProcessEnv): QuotaHint {
   return (observed, now) =>
     quotaResetHint(observed, {
@@ -793,17 +292,258 @@ function quotaHintFrom(env: NodeJS.ProcessEnv): QuotaHint {
 
 async function adapterConfigFrom(
   env: NodeJS.ProcessEnv,
-): Promise<{ targets: readonly string[] | 'all'; autoApprove: boolean }> {
-  const config = JSON.parse(await readFile(`${env.HERDR_PLUGIN_CONFIG_DIR}/targets.json`, 'utf8'));
-  const targets =
-    !Object.hasOwn(config, 'pane_ids') || (Array.isArray(config.pane_ids) && config.pane_ids.length === 0)
-      ? 'all'
-      : Array.isArray(config.pane_ids) && config.pane_ids.every((id: unknown) => typeof id === 'string')
-        ? config.pane_ids
-        : [];
-  return { targets, autoApprove: config.auto_approve === true };
+): Promise<{ targets: readonly string[] | 'all'; autoApprove: boolean } | null> {
+  if (!env.HERDR_PLUGIN_CONFIG_DIR) return null;
+  const path = join(env.HERDR_PLUGIN_CONFIG_DIR, 'targets.json');
+  let text: string;
+  try {
+    text = await readFileText(path);
+  } catch (error) {
+    return isMissing(error) ? { targets: 'all', autoApprove: false } : null;
+  }
+  let config: unknown;
+  try {
+    config = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return null;
+  const body = config as { pane_ids?: unknown; auto_approve?: unknown };
+  if (!Object.hasOwn(body, 'pane_ids') || (Array.isArray(body.pane_ids) && body.pane_ids.length === 0))
+    return { targets: 'all', autoApprove: body.auto_approve === true };
+  if (!Array.isArray(body.pane_ids) || !body.pane_ids.every((id) => typeof id === 'string')) return null;
+  return { targets: body.pane_ids, autoApprove: body.auto_approve === true };
 }
-export async function runEvent(env: NodeJS.ProcessEnv, decide: EventDeps['decide'] = decideWithCli): Promise<void> {
+
+export async function readPluginContext(
+  env: NodeJS.ProcessEnv,
+): Promise<{ serverId: string; enabled: boolean } | null> {
+  if (env.HERDR_PLUGIN_ID !== recoverPluginId || !env.HERDR_SOCKET_PATH || !env.HERDR_PLUGIN_ROOT) return null;
+  let root: string;
+  let manifest: string;
+  try {
+    root = await realpath(env.HERDR_PLUGIN_ROOT);
+    manifest = await realpath(join(env.HERDR_PLUGIN_ROOT, 'herdr-plugin.toml'));
+  } catch {
+    return null;
+  }
+  const serverId = await socketSession(env.HERDR_SOCKET_PATH);
+  if (!serverId) return null;
+  let result: unknown;
+  try {
+    result = await request(env.HERDR_SOCKET_PATH, 'plugin.list', { plugin_id: recoverPluginId });
+  } catch {
+    return null;
+  }
+  if ((await socketSession(env.HERDR_SOCKET_PATH)) !== serverId) return null;
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+  const body = result as { type?: unknown; plugins?: unknown };
+  if (body.type !== 'plugin_list' || !Array.isArray(body.plugins)) return null;
+  const matches = body.plugins.filter(
+    (plugin) =>
+      plugin &&
+      typeof plugin === 'object' &&
+      !Array.isArray(plugin) &&
+      (plugin as { plugin_id?: unknown }).plugin_id === recoverPluginId,
+  );
+  if (matches.length !== 1) return null;
+  const plugin = matches[0] as {
+    plugin_id?: unknown;
+    plugin_root?: unknown;
+    manifest_path?: unknown;
+    enabled?: unknown;
+  };
+  if (
+    typeof plugin.plugin_id !== 'string' ||
+    typeof plugin.plugin_root !== 'string' ||
+    typeof plugin.manifest_path !== 'string' ||
+    typeof plugin.enabled !== 'boolean'
+  )
+    return null;
+  let listedRoot: string;
+  let listedManifest: string;
+  try {
+    listedRoot = await realpath(plugin.plugin_root);
+    listedManifest = await realpath(plugin.manifest_path);
+  } catch {
+    return null;
+  }
+  if (listedRoot !== root || listedManifest !== manifest) return null;
+  if ((await socketSession(env.HERDR_SOCKET_PATH)) !== serverId) return null;
+  return { serverId, enabled: plugin.enabled };
+}
+
+export async function readRuntimePermission(env: NodeJS.ProcessEnv): Promise<RuntimePermission | null> {
+  const context = await readPluginContext(env);
+  if (!context || context.enabled !== true) return null;
+  const config = await adapterConfigFrom(env);
+  if (!config) return null;
+  if (!env.HERDR_SOCKET_PATH || (await socketSession(env.HERDR_SOCKET_PATH)) !== context.serverId) return null;
+  return { serverId: context.serverId, enabled: true, targets: config.targets, autoApprove: config.autoApprove };
+}
+
+export type EventRunOptions = {
+  state?: WorkflowState;
+  output?: { write(text: string): void; fail(): void };
+  shutdownDeadline?: (ms: number, expire: () => void) => () => void;
+  scheduleHeartbeat?: (tick: () => void) => () => void;
+  wait?: JobOptions['wait'];
+};
+
+export async function runControl(
+  env: NodeJS.ProcessEnv,
+  mode: 'pause' | 'resume',
+  options: Pick<EventRunOptions, 'state'> = {},
+): Promise<ControlResult> {
+  if (!env.HERDR_PLUGIN_STATE_DIR) return 'denied';
+  const deadlineAt = performance.now() + 5000;
+  let expired = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const operation = async (): Promise<ControlResult> => {
+    const context = await readPluginContext(env);
+    if (expired || performance.now() >= deadlineAt) return 'shutdown_incomplete';
+    if (!context || (mode === 'resume' && context.enabled !== true)) return 'denied';
+    const state = options.state ?? new WorkflowState(env.HERDR_PLUGIN_STATE_DIR!);
+    return mode === 'pause'
+      ? state.pause(context.serverId, deadlineAt)
+      : state.resume(context.serverId, context.enabled, deadlineAt);
+  };
+  try {
+    return await Promise.race([
+      operation().catch((): ControlResult => 'shutdown_incomplete'),
+      new Promise<ControlResult>((resolve) => {
+        timer = setTimeout(
+          () => {
+            expired = true;
+            resolve('shutdown_incomplete');
+          },
+          Math.max(0, deadlineAt - performance.now()),
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+export function reportWorkflowResult(
+  result: WorkflowResult | ControlResult,
+  output: { write(text: string): void; fail(): void },
+): void {
+  if (result !== 'shutdown_incomplete' && result !== 'denied') return;
+  output.write(
+    result === 'denied'
+      ? 'agent-steward: control denied; no change confirmed. Human review required.\n'
+      : incompleteWarning,
+  );
+  output.fail();
+}
+
+function scopeFromSnapshot(
+  serverId: string,
+  pane: AgentSnapshot,
+): { scope: WorkflowScope; paneId: string; workspaceId: string } | null {
+  try {
+    if (!pane.agent_session) return null;
+    const scope = validateWorkflowScope({
+      serverId,
+      agent: pane.agent_session.agent,
+      sessionId: pane.agent_session.value,
+      sessionKind: pane.agent_session.kind,
+      sessionSource: pane.agent_session.source,
+    });
+    if (pane.workspace_id !== pane.pane_id.split(':')[0]) return null;
+    return { scope, paneId: pane.pane_id, workspaceId: pane.workspace_id };
+  } catch {
+    return null;
+  }
+}
+
+async function currentGrantStillHolds(
+  env: NodeJS.ProcessEnv,
+  state: WorkflowState,
+  serverId: string,
+  paneId: string,
+  ticket: { serverId: string; epoch: string },
+  generation: string,
+  occupant: string,
+  scope: WorkflowScope,
+): Promise<boolean> {
+  if ((await socketSession(env.HERDR_SOCKET_PATH!)) !== serverId) return false;
+  const permission = await readRuntimePermission(env);
+  if (!permission || permission.serverId !== serverId) return false;
+  if (permission.targets !== 'all' && !permission.targets.includes(paneId)) return false;
+  if (!(await state.matches(ticket))) return false;
+  const current = await state.binding(scope);
+  if (
+    !current ||
+    current.paneId !== paneId ||
+    current.generation !== generation ||
+    current.epoch !== ticket.epoch ||
+    current.scope.serverId !== serverId ||
+    workflowSession(current.scope) !== occupant
+  )
+    return false;
+  if (!(await state.lease(scope).leaseMatches(generation, occupant))) return false;
+  // Pause/socket/permission/G can complete during inspect. Recheck the captured
+  // ticket before the caller is allowed to write.
+  if ((await socketSession(env.HERDR_SOCKET_PATH!)) !== serverId) return false;
+  const latestPermission = await readRuntimePermission(env);
+  if (!latestPermission || latestPermission.serverId !== serverId) return false;
+  if (latestPermission.targets !== 'all' && !latestPermission.targets.includes(paneId)) return false;
+  if (!(await state.matches(ticket))) return false;
+  const confirmed = await state.binding(scope);
+  return (
+    confirmed !== null &&
+    confirmed.paneId === paneId &&
+    confirmed.generation === generation &&
+    confirmed.epoch === ticket.epoch &&
+    confirmed.scope.serverId === serverId &&
+    workflowSession(confirmed.scope) === occupant
+  );
+}
+
+async function quarantineLocatedEpisode(
+  state: WorkflowState,
+  serverId: string,
+  paneId: string,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  const scope = await state.locate(serverId, paneId);
+  if (!scope) return;
+  const binding = await state.binding(scope);
+  if (!binding || binding.paneId !== paneId || binding.scope.serverId !== serverId) return;
+  const ticket = { serverId: binding.scope.serverId, epoch: binding.epoch };
+  const generation = binding.generation;
+  const occupant = workflowSession(binding.scope);
+  if (!(await currentGrantStillHolds(env, state, serverId, paneId, ticket, generation, occupant, scope))) return;
+  const episodes = new EpisodeStore(state.directory);
+  const retryKey = 'retry-session:' + JSON.stringify([scope.agent, scope.sessionId]);
+  await episodes.withEpisodeLock(paneId, () =>
+    episodes.withEpisodeLock(retryKey, async () => {
+      if (!(await currentGrantStillHolds(env, state, serverId, paneId, ticket, generation, occupant, scope))) return;
+      const episode = await state.sessionRetry(scope);
+      if (!episode || episode.last_delivery_state !== 'none' || episode.next_check_at === null) return;
+      if (episode.pane_id !== paneId) return;
+      if (await state.recoveryQuarantined(scope)) return;
+      if (!(await currentGrantStillHolds(env, state, serverId, paneId, ticket, generation, occupant, scope))) return;
+      await state.recordAdmittedSessionRetry(
+        scope,
+        ticket,
+        { ...episode, next_check_at: null, last_delivery_state: 'human' },
+        () => currentGrantStillHolds(env, state, serverId, paneId, ticket, generation, occupant, scope),
+        generation,
+      );
+    }),
+  );
+}
+
+export async function runEvent(
+  env: NodeJS.ProcessEnv,
+  decide: EventDeps['decide'] = decideWithCli,
+  options: EventRunOptions = {},
+): Promise<void> {
+  const output = options.output ?? processOutput();
   if (
     !env.HERDR_PLUGIN_EVENT_JSON ||
     !env.HERDR_SOCKET_PATH ||
@@ -811,104 +551,153 @@ export async function runEvent(env: NodeJS.ProcessEnv, decide: EventDeps['decide
     !env.HERDR_PLUGIN_STATE_DIR
   )
     return;
-  let event: EventTrigger;
-  let targets: readonly string[] | 'all';
-  let autoApprove = false;
+  let trigger: unknown;
   try {
-    event = JSON.parse(env.HERDR_PLUGIN_EVENT_JSON);
+    trigger = JSON.parse(env.HERDR_PLUGIN_EVENT_JSON);
   } catch {
     return;
   }
-  try {
-    ({ targets, autoApprove } = await adapterConfigFrom(env));
-  } catch {
-    targets = 'all';
-  }
-  if (!event || typeof event !== 'object') return;
-  const paneId = 'data' in event ? event.data?.pane_id : event.pane_id;
-  if (targets !== 'all' && !targets.includes(paneId ?? '')) return;
-  const sessionId = await socketSession(env.HERDR_SOCKET_PATH);
-  if (!sessionId) return;
-  const store = new EpisodeStore(env.HERDR_PLUGIN_STATE_DIR);
-  const leaseToken = await store.activeToken(sessionId);
-  if (!leaseToken) return;
-  await handleEvent(event, {
-    herdr: socketControl(env.HERDR_SOCKET_PATH, env.HERDR_BIN_PATH),
-    decide,
-    store,
-    sessionId,
-    leaseToken,
-    clock: { now: () => new Date() },
-    targets,
-    autoApprove,
-    quotaHint: quotaHintFrom(env),
-    handoff: (reason) => visibleHandoff(env, reason),
-    sessionValid: async () => (await socketSession(env.HERDR_SOCKET_PATH!)) === sessionId,
-  });
-}
-
-export function reportSchedulerResult(
-  result: SchedulerResult,
-  output: { write: (text: string) => void; fail: () => void },
-): void {
-  if (result === 'shutdown_incomplete') {
-    output.write(
-      'agent-steward: release unconfirmed; shutdown incomplete; event hooks may still act. Human review required.\n',
-    );
+  const event = normalizeEvent(trigger);
+  if (!event || !event.pane_id) return;
+  const permission = await readRuntimePermission(env);
+  if (!permission) return;
+  if (permission.targets !== 'all' && !permission.targets.includes(event.pane_id)) return;
+  if ((await socketSession(env.HERDR_SOCKET_PATH)) !== permission.serverId) return;
+  const state = options.state ?? new WorkflowState(env.HERDR_PLUGIN_STATE_DIR);
+  if (!(await state.legacyInactive())) {
+    output.write(migrationWarning);
     output.fail();
+    return;
   }
-  if (result === 'already_owned') {
-    output.write(
-      'agent-steward: scheduler lease unavailable. If recovery is needed, disable the plugin, stop all adapters and verify they are dead before offline cleanup of a stranded guard or legacy lease. Preserve episode records and generation tombstones.\n',
-    );
-  }
-}
-
-export async function runVisibleScheduler(
-  env: NodeJS.ProcessEnv,
-  schedule: typeof runScheduler = runScheduler,
-): Promise<void> {
-  if (!env.HERDR_SOCKET_PATH || !env.HERDR_PLUGIN_CONFIG_DIR || !env.HERDR_PLUGIN_STATE_DIR) return;
-  const sessionId = await socketSession(env.HERDR_SOCKET_PATH);
-  if (!sessionId) {
+  if ((await socketSession(env.HERDR_SOCKET_PATH)) !== permission.serverId) return;
+  const herdr = socketControl(env.HERDR_SOCKET_PATH, env.HERDR_BIN_PATH);
+  const exitEvent = event.type === 'pane.exited' || event.type === 'pane_exited';
+  let pane: AgentSnapshot | null = null;
+  try {
+    pane = await herdr.get(event.pane_id);
+  } catch {
+    if (exitEvent) {
+      if ((await socketSession(env.HERDR_SOCKET_PATH)) === permission.serverId)
+        await quarantineLocatedEpisode(state, permission.serverId, event.pane_id, env);
+      return;
+    }
     await visibleHandoff(env, 'observation_unavailable');
     return;
   }
-  let listed: readonly string[] | 'all';
-  let autoApprove = false;
-  try {
-    const config = await adapterConfigFrom(env);
-    listed = config.targets;
-    autoApprove = config.autoApprove;
-  } catch {
-    listed = 'all';
+  if ((await socketSession(env.HERDR_SOCKET_PATH)) !== permission.serverId) return;
+  const live = pane ? scopeFromSnapshot(permission.serverId, pane) : null;
+  if (
+    exitEvent &&
+    (!live || (await state.locate(permission.serverId, event.pane_id))?.sessionId !== live.scope.sessionId)
+  ) {
+    await quarantineLocatedEpisode(state, permission.serverId, event.pane_id, env);
+    return;
   }
+  if (!live) return;
   const abort = new AbortController();
-  const stop = () => abort.abort();
+  let deadlineAt: number | undefined;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  let resolveDeadline: ((value: 'deadline') => void) | undefined;
+  const deadline = new Promise<'deadline'>((resolve) => {
+    resolveDeadline = resolve;
+  });
+  const armDeadline = () => {
+    deadlineAt ??= Date.now();
+    if (deadlineTimer !== undefined) return;
+    deadlineTimer = setTimeout(() => resolveDeadline?.('deadline'), 5_000);
+  };
+  const sharedShutdown =
+    options.shutdownDeadline ??
+    ((ms: number, expire: () => void) => {
+      if (ms !== 5000) {
+        const timer = setTimeout(expire, ms);
+        return () => clearTimeout(timer);
+      }
+      armDeadline();
+      const remaining = Math.max(0, 5_000 - (Date.now() - (deadlineAt ?? Date.now())));
+      const timer = setTimeout(expire, remaining);
+      return () => clearTimeout(timer);
+    });
+  const stop = () => {
+    armDeadline();
+    abort.abort();
+  };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
-  try {
-    const result = await schedule({
-      store: new EpisodeStore(env.HERDR_PLUGIN_STATE_DIR),
-      herdr: socketControl(env.HERDR_SOCKET_PATH, env.HERDR_BIN_PATH),
-      decide: decideWithCli,
-      targets: listed === 'all' ? undefined : listed,
-      autoApprove,
+  const attempt = beginWorkflow({
+    state,
+    scope: live.scope,
+    paneId: live.paneId,
+    workspaceId: live.workspaceId,
+    permission: () => readRuntimePermission(env),
+    signal: abort.signal,
+    shutdownDeadline: sharedShutdown,
+    ...(options.scheduleHeartbeat ? { scheduleHeartbeat: options.scheduleHeartbeat } : {}),
+  });
+  attempt.signal.addEventListener('abort', armDeadline, { once: true });
+  const closed = new Promise<WorkflowResult>((resolve) => {
+    if (attempt.signal.aborted) resolve('stopped');
+    else attempt.signal.addEventListener('abort', () => resolve('stopped'), { once: true });
+  });
+  let jobWork: Promise<WorkflowResult> | undefined;
+  const foreground = async (): Promise<WorkflowResult> => {
+    const authority = await attempt.ready;
+    if (!authority) return abort.signal.aborted || attempt.signal.aborted ? 'stopped' : 'not_admitted';
+    const episodes = new EpisodeStore(env.HERDR_PLUGIN_STATE_DIR!);
+    const base: EventDeps = {
+      herdr,
+      decide,
+      store: {
+        active: async () => true,
+        retry: (paneId) => episodes.retry(paneId),
+        record: (paneId, retry) => episodes.record(paneId, retry),
+        clear: (paneId) => episodes.clear(paneId),
+        approval: (agent, session) => episodes.approval(agent, session),
+        recordApproval: (paneId, attemptRecord) => episodes.recordApproval(paneId, attemptRecord),
+        withEpisodeLock: (key, action) => episodes.withEpisodeLock(key, action),
+      },
+      clock: { now: () => new Date() },
+      targets: authority.permission.targets,
+      autoApprove: authority.permission.autoApprove,
       quotaHint: quotaHintFrom(env),
-      sessionId,
-      signal: abort.signal,
       handoff: (reason) => visibleHandoff(env, reason),
-      sessionValid: async () => (await socketSession(env.HERDR_SOCKET_PATH!)) === sessionId,
-    });
-    reportSchedulerResult(result, {
-      write: (text) => {
-        process.stderr.write(text);
-      },
-      fail: () => {
-        process.exitCode = 1;
-      },
-    });
+    };
+    const deps = workflowEventDeps(base, authority, state);
+    await handleEvent(event as EventTrigger, deps);
+    if (!authority.admissionOpen()) return 'stopped';
+    const binding = await state.binding(live.scope);
+    const episode = await state.sessionRetry(live.scope);
+    if (authority.ownsGeneration && binding && recoverable(episode) && !(await state.recoveryQuarantined(live.scope))) {
+      jobWork = runEpisodeJob({
+        state,
+        authority,
+        episodes,
+        deps,
+        binding,
+        signal: attempt.signal,
+        ...(options.wait ? { wait: options.wait } : {}),
+      });
+      return jobWork;
+    }
+    return 'finished';
+  };
+  try {
+    const workPromise = foreground().catch((): WorkflowResult => (attempt.signal.aborted ? 'stopped' : 'not_admitted'));
+    await Promise.race([workPromise, closed]);
+    const finishing = attempt.finish();
+    const aborted = abort.signal.aborted || attempt.signal.aborted;
+    void workPromise.catch(() => {});
+    const jobWait = jobWork
+      ? aborted
+        ? Promise.race([jobWork, deadline]).then((value) => (value === 'deadline' ? 'shutdown_incomplete' : value))
+        : jobWork
+      : Promise.resolve(aborted ? 'stopped' : await workPromise);
+    const [jobResult, release] = await Promise.all([jobWait, finishing]);
+    const combined: WorkflowResult =
+      release === 'shutdown_incomplete' || jobResult === 'shutdown_incomplete' ? 'shutdown_incomplete' : jobResult;
+    reportWorkflowResult(combined, output);
   } finally {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
   }
@@ -916,5 +705,6 @@ export async function runVisibleScheduler(
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   if (process.argv[2] === 'event') await runEvent(process.env);
-  if (process.argv[2] === 'scheduler') await runVisibleScheduler(process.env);
+  if (process.argv[2] === 'pause') reportWorkflowResult(await runControl(process.env, 'pause'), processOutput());
+  if (process.argv[2] === 'resume') reportWorkflowResult(await runControl(process.env, 'resume'), processOutput());
 }

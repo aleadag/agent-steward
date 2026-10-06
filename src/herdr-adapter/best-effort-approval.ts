@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { StopInputSchema, StopResultSchema } from '../contracts.ts';
 import { observeStop, type ObservedStop } from './observe.ts';
-import type { EventDeps } from './entry.ts';
+import type { EventDeps } from './events.ts';
 import type { ApprovalAttempt } from './state.ts';
 
 // Recognize an explicit one-time control, not a bare "1", yes/no question,
@@ -48,6 +48,7 @@ export async function handleBestEffortApproval(
   stillOwner: () => Promise<boolean>,
 ): Promise<boolean> {
   if (!deps.autoApprove) return false;
+  if (deps.observationAllowed && !deps.observationAllowed(observed)) return true;
   const menu = approvalMenu(observed.context);
   if (!menu) return false;
   const admissionOpen = deps.admissionOpen ?? (() => true);
@@ -95,7 +96,11 @@ export async function handleBestEffortApproval(
       const matchingObservation = async () => {
         if (!(await owns())) return false;
         const fresh = await observeStop(deps.herdr, observed.pane_id);
-        return admissionOpen() && fresh?.current_episode_id === observed.current_episode_id;
+        return (
+          admissionOpen() &&
+          fresh?.current_episode_id === observed.current_episode_id &&
+          (!deps.observationAllowed || deps.observationAllowed(fresh))
+        );
       };
       const input = () =>
         StopInputSchema.parse({
@@ -158,7 +163,9 @@ export async function handleBestEffortApproval(
         }
         // Herdr cannot make the last observation and keypress atomic. Global enablement
         // explicitly accepts that race; do not label this native request-binding proof.
-        await deps.herdr.sendKeys!(observed.pane_id, ['1']);
+        const send = () => deps.herdr.sendKeys!(observed.pane_id, ['1']);
+        if (deps.dispatchEffect) await deps.dispatchEffect('approval', send);
+        else await send();
         if (!(await owns())) return true;
         await deps.store.recordApproval!(observed.pane_id, { ...record, state: 'delivered' });
       } catch {

@@ -3,6 +3,7 @@ import { test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { connect, createServer, type Server, type Socket } from 'node:net';
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -17,7 +18,9 @@ import {
 } from 'node:fs';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const pkg = process.env.AGENT_STEWARD_PACKAGE;
 const fifoWriterModule = process.env.AGENT_STEWARD_FIFO_WRITER ?? new URL('./fifo-writer.ts', import.meta.url).href;
@@ -139,7 +142,11 @@ async function closeFakeServerAndRemoveRoot(
   rmSync(root, { recursive: true, force: true });
 }
 
-function installedLeaseReady(state: string, expectedPid: number, expectedSession: string): { token: string } | null {
+function installedLeaseReady(
+  leaseRoot: string,
+  expectedPid: number,
+  expectedSession: string,
+): { token: string } | null {
   try {
     const safe = (path: string, directory: boolean): void => {
       const info = lstatSync(path);
@@ -156,8 +163,7 @@ function installedLeaseReady(state: string, expectedPid: number, expectedSession
       if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('not ready');
       return value as Record<string, unknown>;
     };
-    safe(state, true);
-    const root = join(state, 'scheduler-lease');
+    const root = leaseRoot;
     safe(root, true);
     safe(join(root, 'generations'), true);
     const selected = object(join(root, 'active.json'));
@@ -224,22 +230,22 @@ test('installed readiness rejects retained generations', () => {
       [join(generation, 'heartbeat.json'), heartbeat],
     ] as const)
       writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
-    assert.deepEqual(installedLeaseReady(state, process.pid, identity.session), { token });
-    assert.equal(installedLeaseReady(state, process.pid, 'other-session'), null);
-    assert.equal(installedLeaseReady(state, process.pid + 1, identity.session), null);
+    assert.deepEqual(installedLeaseReady(root, process.pid, identity.session), { token });
+    assert.equal(installedLeaseReady(root, process.pid, 'other-session'), null);
+    assert.equal(installedLeaseReady(root, process.pid + 1, identity.session), null);
     writeFileSync(join(generation, 'heartbeat.json'), JSON.stringify({ ...heartbeat, heartbeat: 1 }));
-    assert.equal(installedLeaseReady(state, process.pid, identity.session), null);
+    assert.equal(installedLeaseReady(root, process.pid, identity.session), null);
     writeFileSync(join(generation, 'heartbeat.json'), JSON.stringify(heartbeat));
     mkdirSync(join(generation, 'released'), { mode: 0o700 });
-    assert.equal(installedLeaseReady(state, process.pid, identity.session), null);
+    assert.equal(installedLeaseReady(root, process.pid, identity.session), null);
     rmSync(join(generation, 'released'), { recursive: true, force: true });
     writeFileSync(join(root, 'active.json'), JSON.stringify({ ...identity, token: '../outside' }));
-    assert.equal(installedLeaseReady(state, process.pid, identity.session), null);
+    assert.equal(installedLeaseReady(root, process.pid, identity.session), null);
     const successor = { ...identity, token: '00000000-0000-4000-8000-000000000002' };
     writeFileSync(join(root, 'active.json'), JSON.stringify(successor));
     mkdirSync(join(root, 'generations', successor.token), { mode: 0o700 });
     assert.equal(
-      installedLeaseReady(state, process.pid, identity.session),
+      installedLeaseReady(root, process.pid, identity.session),
       null,
       'selected successor with no owner must not appear ready',
     );
@@ -441,7 +447,7 @@ test('config FIFO writer fails within a bound when no reader opens it', async ()
 // Catches the plugin depending on checkout-relative paths or a global JS runtime,
 // or a package that activates Herdr configuration during installation.
 test.skipIf(!pkg)(
-  'installed optional plugin uses package-local Bun and fails closed on bounded fake Herdr observation',
+  'installed optional plugin uses package-local Bun and event-owned scoped leases on bounded fake Herdr',
   async () => {
     assert.ok(pkg, 'installed check must supply the package path');
     const root = mkdtempSync(join(tmpdir(), 'steward-herdr-installed-'));
@@ -479,17 +485,17 @@ test.skipIf(!pkg)(
     const snapshot = {
       pane_id: 'w1:p1',
       workspace_id: 'w1',
-      agent: 'codex',
-      agent_status: 'blocked',
-      agent_session: { agent: 'codex', source: 'integration:codex', kind: 'id', value: 'synthetic-session' },
+      agent: 'agy',
+      agent_status: 'idle',
+      agent_session: { agent: 'agy', source: 'herdr:antigravity_cli', kind: 'id', value: 'synthetic-session' },
       state_change_seq: 4,
       revision: 8,
     };
+    const detectionText = 'model-one quota exhausted';
+    const pluginRoot = realpathSync(plugin);
+    const pluginManifest = realpathSync(join(plugin, 'herdr-plugin.toml'));
+    let pluginEnabled = true;
     const methods: { method: string; params: unknown }[] = [];
-    let readSeenResolve: (() => void) | undefined;
-    const readSeen = new Promise<void>((resolve) => {
-      readSeenResolve = resolve;
-    });
     const sockets = new Set<Socket>();
     const server = createServer((connection) => {
       sockets.add(connection);
@@ -502,29 +508,44 @@ test.skipIf(!pkg)(
         const request = JSON.parse(data.slice(0, end)) as { id: string; method: string; params: unknown };
         methods.push({ method: request.method, params: request.params });
         const result =
-          request.method === 'agent.get'
-            ? { type: 'agent_info', agent: snapshot }
-            : {
-                type: 'pane_read',
-                read: {
-                  pane_id: 'w1:p1',
-                  source: 'detection',
-                  revision: 0,
-                  text: 'Current API failure: request timed out',
-                  truncated: false,
-                },
-              };
-        if (request.method === 'agent.read') readSeenResolve?.();
+          request.method === 'plugin.list'
+            ? {
+                type: 'plugin_list',
+                plugins: [
+                  {
+                    plugin_id: 'agent-steward-recover',
+                    name: 'Agent Steward recover',
+                    version: '0.1.0',
+                    plugin_root: pluginRoot,
+                    manifest_path: pluginManifest,
+                    enabled: pluginEnabled,
+                  },
+                ],
+              }
+            : request.method === 'agent.get'
+              ? { type: 'agent_info', agent: snapshot }
+              : {
+                  type: 'pane_read',
+                  read: {
+                    pane_id: 'w1:p1',
+                    source: 'detection',
+                    revision: 8,
+                    text: detectionText,
+                    truncated: false,
+                  },
+                };
         setTimeout(
           () => connection.end(`${JSON.stringify({ id: request.id, result })}\n`),
           request.method === 'agent.read' ? 250 : 10,
         );
       });
     });
-    let scheduler: ReturnType<typeof spawn> | undefined;
     let eventChild: ReturnType<typeof spawn> | undefined;
-    let schedulerStderrG = '';
-    let schedulerStderrH = '';
+    let duplicateChild: ReturnType<typeof spawn> | undefined;
+    let pauseChild: ReturnType<typeof spawn> | undefined;
+    let finishChild: ReturnType<typeof spawn> | undefined;
+    let incompleteChild: ReturnType<typeof spawn> | undefined;
+    let incompletePause: ReturnType<typeof spawn> | undefined;
     let eventStderr = '';
     try {
       server.listen(socket);
@@ -532,6 +553,9 @@ test.skipIf(!pkg)(
       const manifest = readFileSync(join(plugin, 'herdr-plugin.toml'), 'utf8');
       assert.ok(manifest.includes('min_herdr_version = "0.9.1"'));
       assert.ok(manifest.includes('[[events]]'));
+      assert.ok(manifest.includes('id = "pause"'));
+      assert.ok(manifest.includes('id = "resume"'));
+      assert.equal(manifest.includes('[[panes]]'), false);
       assert.ok(existsSync(join(plugin, 'run.sh')));
       const adapterLink = join(plugin, 'agent-steward-herdr-adapter');
       assert.ok(lstatSync(adapterLink).isSymbolicLink());
@@ -552,6 +576,58 @@ test.skipIf(!pkg)(
       };
       for (const command of ['node', 'bun', 'npm']) checkNoGlobalRuntime(command);
 
+      const refused = spawnSync(shell, [join(plugin, 'run.sh'), 'scheduler'], {
+        cwd: root,
+        env: { PATH: bin },
+        encoding: 'utf8',
+      });
+      assert.equal(refused.status, 2);
+
+      const socketInfo = statSync(socket);
+      const serverId = `${socketInfo.dev}:${socketInfo.ino}`;
+      const workflowSession = JSON.stringify([serverId, 'agy', 'synthetic-session']);
+      const leaseRoot = join(
+        state,
+        'workflows',
+        createHash('sha256').update(workflowSession).digest('hex'),
+        'scheduler-lease',
+      );
+      const installed = (name: string) =>
+        pathToFileURL(join(pkg, 'lib/agent-steward/dist/src/herdr-adapter', `${name}.js`)).href;
+      const { EpisodeStore } = (await import(installed('state'))) as typeof import('../src/herdr-adapter/state.ts');
+      const { observeStop } = (await import(installed('observe'))) as typeof import('../src/herdr-adapter/observe.ts');
+      const store = new EpisodeStore(state);
+      const observed = await observeStop(
+        {
+          get: async () => snapshot,
+          read: async () => ({
+            pane_id: 'w1:p1',
+            source: 'detection',
+            revision: 8,
+            text: detectionText,
+            truncated: false,
+          }),
+        },
+        'w1:p1',
+      );
+      assert.ok(observed);
+      const firstObserved = new Date(Date.now() - 60_000).toISOString();
+      const pending = {
+        pane_id: observed.pane_id,
+        session_id: observed.session_id,
+        failure_episode_id: observed.current_episode_id,
+        error_evidence_digest: observed.error_evidence_digest,
+        first_observed_at: firstObserved,
+        attempt_count: 0,
+        last_attempt_at: null,
+        quota_check_count: 0,
+        last_quota_check_at: null,
+        next_check_at: '2099-01-01T00:00:00.000Z',
+        last_delivery_state: 'none' as const,
+      };
+      await store.recordSessionRetry('agy', 'synthetic-session', pending);
+      assert.deepEqual(await store.sessionRetry('agy', 'synthetic-session'), pending);
+
       const baseEnv = {
         PATH: bin,
         HOME: home,
@@ -559,50 +635,20 @@ test.skipIf(!pkg)(
         HERDR_SOCKET_PATH: socket,
         HERDR_PLUGIN_CONFIG_DIR: config,
         HERDR_PLUGIN_STATE_DIR: state,
+        HERDR_PLUGIN_ID: 'agent-steward-recover',
+        HERDR_PLUGIN_ROOT: plugin,
+        HERDR_ENV: '1',
       };
-      scheduler = spawn(shell, [join(plugin, 'run.sh'), 'scheduler'], {
-        cwd: root,
-        env: baseEnv,
-        stdio: ['ignore', 'ignore', 'pipe'],
+      const eventJson = JSON.stringify({
+        type: 'pane_agent_status_changed',
+        pane_id: 'w1:p1',
+        workspace_id: 'w1',
+        agent_status: 'idle',
+        agent: 'agy',
       });
-      trackChildClose(scheduler);
-      assert.ok(scheduler.stderr);
-      scheduler.stderr.setEncoding('utf8');
-      scheduler.stderr.on('data', (chunk) => {
-        schedulerStderrG += chunk;
-      });
-      const socketInfo = statSync(socket);
-      const session = `${socketInfo.dev}:${socketInfo.ino}`;
-      const waitForReady = async (
-        child: ReturnType<typeof spawn>,
-        diagnostics: () => string,
-      ): Promise<{ token: string }> => {
-        for (let attempt = 0; attempt < 120; attempt++) {
-          if (child.pid === undefined) throw new Error('packaged supervisor did not receive a PID');
-          const ready = installedLeaseReady(state, child.pid, session);
-          if (ready && !existsSync(join(state, 'takeover-guard'))) return ready;
-          if (child.exitCode !== null) break;
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
-        throw new Error(`packaged supervisor must start with its own live generation: ${diagnostics()}`);
-      };
-      const generationG = await waitForReady(scheduler, () => schedulerStderrG);
-      if (scheduler.pid === undefined) throw new Error('packaged supervisor did not receive a PID');
-      const schedulerPidG = scheduler.pid;
-      assertInstalledProcess(schedulerPidG, runtime, entry);
-
       eventChild = spawn(shell, [join(plugin, 'run.sh'), 'event'], {
         cwd: root,
-        env: {
-          ...baseEnv,
-          HERDR_PLUGIN_EVENT_JSON: JSON.stringify({
-            type: 'pane_agent_status_changed',
-            pane_id: 'w1:p1',
-            workspace_id: 'w1',
-            agent_status: 'blocked',
-            agent: 'codex',
-          }),
-        },
+        env: { ...baseEnv, HERDR_PLUGIN_EVENT_JSON: eventJson },
         stdio: ['ignore', 'ignore', 'pipe'],
       });
       trackChildClose(eventChild);
@@ -611,102 +657,231 @@ test.skipIf(!pkg)(
       eventChild.stderr.on('data', (chunk) => {
         eventStderr += chunk;
       });
-      await Promise.race([
-        readSeen,
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('bounded observation did not reach Herdr')), 3_000),
-        ),
-      ]);
-      assertInstalledProcess(eventChild.pid!, runtime, entry);
-      const observed = methods.find(({ method }) => method === 'agent.read');
-      assert.deepEqual(observed, {
-        method: 'agent.read',
-        params: { target: 'w1:p1', source: 'detection', lines: 12, format: 'text' },
-      });
-
-      let childPid: number | undefined;
-      for (let attempt = 0; attempt < 200; attempt++) {
-        childPid = findInstalledChild(eventChild.pid!, runtime, main);
-        if (childPid) break;
-        if (eventChild.exitCode !== null) break;
-        await new Promise((resolve) => setTimeout(resolve, 10));
+      const waitForReady = async (
+        child: ReturnType<typeof spawn>,
+        diagnostics: () => string,
+      ): Promise<{ token: string }> => {
+        for (let attempt = 0; attempt < 160; attempt++) {
+          if (child.pid === undefined) throw new Error('packaged event did not receive a PID');
+          const ready = installedLeaseReady(leaseRoot, child.pid, workflowSession);
+          if (ready && !existsSync(join(leaseRoot, 'takeover-guard'))) return ready;
+          if (child.exitCode !== null) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        throw new Error(`packaged event must own a scoped generation: ${diagnostics()}`);
+      };
+      const generationG = await waitForReady(eventChild, () => eventStderr);
+      if (eventChild.pid === undefined) throw new Error('packaged event did not receive a PID');
+      const eventPid = eventChild.pid;
+      assertInstalledProcess(eventPid, runtime, entry);
+      const serverHash = createHash('sha256')
+        .update(JSON.stringify([serverId]))
+        .digest('hex');
+      let slotReady = false;
+      for (let attempt = 0; attempt < 160 && !slotReady; attempt++) {
+        for (let index = 0; index < 8; index++) {
+          const slotRoot = join(state, 'automation', serverHash, 'capacity', String(index), 'scheduler-lease');
+          if (
+            installedLeaseReady(
+              slotRoot,
+              eventPid,
+              JSON.stringify([createHash('sha256').update(workflowSession).digest('hex'), generationG.token]),
+            )
+          ) {
+            slotReady = true;
+            break;
+          }
+        }
+        if (!slotReady) await new Promise((resolve) => setTimeout(resolve, 25));
       }
-      assert.ok(childPid, `adapter must execute packaged main.js via process.execPath: ${eventStderr}`);
-      const readerIsAlive = (): boolean => processAlive(childPid!);
-      assert.ok(readerIsAlive(), 'packaged main.js must remain alive while the config FIFO reader starts');
-      assertInstalledProcess(childPid, runtime, main);
+      assert.equal(slotReady, true, `pending event must own a capacity slot: ${eventStderr}`);
 
-      const { writeFifoWithDeadline } = await import(fifoWriterModule);
-      await writeFifoWithDeadline(fifo, JSON.stringify({ tools: [], candidates: [] }), readerIsAlive);
-      const eventCode = await waitForChildClose(eventChild, 3_000);
-      assert.equal(eventCode, 0, eventStderr);
-      assert.match(eventStderr, /human_review_required \(decision_failed\)/);
-      assert.equal(eventStderr.includes('synthetic-session'), false);
-      assert.equal(eventStderr.includes('Current API failure'), false);
-      assert.ok(methods.some(({ method }) => method === 'agent.get'));
-      assert.ok(methods.every(({ method }) => method === 'agent.get' || method === 'agent.read'));
-      assert.equal(existsSync(join(config, 'herdr')), false, 'package must not enable/link plugins');
-      assert.equal(existsSync(join(home, '.config/herdr')), false, 'package must not edit Herdr user config');
+      duplicateChild = spawn(shell, [join(plugin, 'run.sh'), 'event'], {
+        cwd: root,
+        env: { ...baseEnv, HERDR_PLUGIN_EVENT_JSON: eventJson },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      trackChildClose(duplicateChild);
+      const duplicateCode = await waitForChildClose(duplicateChild, 5_000);
+      assert.equal(duplicateCode, 0);
+      assert.equal(installedLeaseReady(leaseRoot, eventPid, workflowSession)?.token, generationG.token);
 
-      const selector = join(state, 'scheduler-lease/active.json');
-      const generationPath = (token: string): string => join(state, 'scheduler-lease/generations', token);
-      const schedulerCodeG = await waitForChildClose(scheduler, 3_000, 'SIGTERM');
-      assert.equal(schedulerCodeG, 0, schedulerStderrG);
-      const generationGPath = generationPath(generationG.token);
-      const markerG = join(generationGPath, 'released');
-      assert.equal(lstatSync(markerG).isDirectory(), true);
-      assert.equal(lstatSync(markerG).mode & 0o777, 0o700);
-      assert.equal(JSON.parse(readFileSync(selector, 'utf8')).token, generationG.token);
-      assert.equal(schedulerStderrG.includes('release unconfirmed'), false, schedulerStderrG);
-      assert.equal(
-        installedLeaseReady(state, schedulerPidG, session),
-        null,
-        'retained selector with a release marker must not be ready',
-      );
-
-      scheduler = spawn(shell, [join(plugin, 'run.sh'), 'scheduler'], {
+      pauseChild = spawn(shell, [join(plugin, 'run.sh'), 'pause'], {
         cwd: root,
         env: baseEnv,
         stdio: ['ignore', 'ignore', 'pipe'],
       });
-      trackChildClose(scheduler);
-      assert.ok(scheduler.stderr);
-      scheduler.stderr.setEncoding('utf8');
-      scheduler.stderr.on('data', (chunk) => {
-        schedulerStderrH += chunk;
+      trackChildClose(pauseChild);
+      assert.equal(await waitForChildClose(pauseChild, 6_000), 0);
+      const ownerCode = await waitForChildClose(eventChild, 6_000);
+      assert.equal(ownerCode, 0, eventStderr);
+      assert.equal(
+        installedLeaseReady(leaseRoot, eventPid, workflowSession),
+        null,
+        'pause must revoke the event-owned generation',
+      );
+      const denied = spawn(shell, [join(plugin, 'run.sh'), 'event'], {
+        cwd: root,
+        env: { ...baseEnv, HERDR_PLUGIN_EVENT_JSON: eventJson },
+        stdio: ['ignore', 'ignore', 'pipe'],
       });
-      const generationH = await waitForReady(scheduler, () => schedulerStderrH);
-      if (scheduler.pid === undefined) throw new Error('restarted supervisor did not receive a PID');
-      const schedulerPidH = scheduler.pid;
-      assert.notEqual(generationH.token, generationG.token);
-      assertInstalledProcess(schedulerPidH, runtime, entry);
-      assert.equal(installedLeaseReady(state, schedulerPidH, session)?.token, generationH.token);
-      assert.equal(existsSync(generationGPath), false, 'dead unselected G must be collected after H acquisition');
-      const generationHPath = generationPath(generationH.token);
-      const ownerH = JSON.parse(readFileSync(join(generationHPath, 'owner.json'), 'utf8'));
-      const heartbeatH = JSON.parse(readFileSync(join(generationHPath, 'heartbeat.json'), 'utf8'));
-      assert.deepEqual(ownerH, { protocol: 2, token: generationH.token, pid: schedulerPidH, session });
-      assert.equal(heartbeatH.protocol, 2);
-      assert.equal(heartbeatH.token, generationH.token);
-      assert.equal(typeof heartbeatH.heartbeat, 'number');
-      assert.ok(heartbeatH.heartbeat + 15_000 > Date.now());
-      const schedulerCodeH = await waitForChildClose(scheduler, 3_000, 'SIGTERM');
-      assert.equal(schedulerCodeH, 0, schedulerStderrH);
-      const markerH = join(generationHPath, 'released');
-      assert.equal(lstatSync(markerH).isDirectory(), true);
-      assert.equal(JSON.parse(readFileSync(selector, 'utf8')).token, generationH.token);
-      assert.equal(schedulerStderrH.includes('release unconfirmed'), false, schedulerStderrH);
-    } finally {
-      if (eventChild) {
+      trackChildClose(denied);
+      assert.equal(await waitForChildClose(denied, 5_000), 0);
+      assert.equal(installedLeaseReady(leaseRoot, denied.pid ?? -1, workflowSession), null);
+
+      const resume = spawn(shell, [join(plugin, 'run.sh'), 'resume'], {
+        cwd: root,
+        env: baseEnv,
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      trackChildClose(resume);
+      assert.equal(await waitForChildClose(resume, 5_000), 0);
+      const sessionHash = createHash('sha256')
+        .update(JSON.stringify(['agy', 'synthetic-session']))
+        .digest('hex');
+      // Ordinary finish must be unbound: a retained canonical reference quarantines without spawning CLI.
+      rmSync(join(state, `retry-session-${sessionHash}.json`), { force: true });
+      rmSync(join(state, `retry-session-${sessionHash}.binding.json`), { force: true });
+      finishChild = spawn(shell, [join(plugin, 'run.sh'), 'event'], {
+        cwd: root,
+        env: { ...baseEnv, HERDR_PLUGIN_EVENT_JSON: eventJson },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      trackChildClose(finishChild);
+      let finishStderr = '';
+      assert.ok(finishChild.stderr);
+      finishChild.stderr.setEncoding('utf8');
+      finishChild.stderr.on('data', (chunk) => {
+        finishStderr += chunk;
+      });
+      const { writeFifoWithDeadline } = await import(fifoWriterModule);
+      let childPid: number | undefined;
+      for (let attempt = 0; attempt < 200; attempt++) {
+        if (finishChild.pid !== undefined) childPid = findInstalledChild(finishChild.pid, runtime, main);
+        if (childPid) break;
+        if (finishChild.exitCode !== null) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(childPid, `packaged finish event must spawn package-local main.js: ${finishStderr}`);
+      assertInstalledProcess(childPid, runtime, main);
+      await writeFifoWithDeadline(fifo, JSON.stringify({ tools: [], candidates: [] }), () => processAlive(childPid));
+      const finishCode = await waitForChildClose(finishChild, 8_000);
+      assert.equal(finishCode, 0, finishStderr);
+      assert.equal(finishStderr.includes('synthetic-session'), false);
+      await store.recordSessionRetry('agy', 'synthetic-session', pending);
+      incompleteChild = spawn(shell, [join(plugin, 'run.sh'), 'event'], {
+        cwd: root,
+        env: { ...baseEnv, HERDR_PLUGIN_EVENT_JSON: eventJson },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      trackChildClose(incompleteChild);
+      let incompleteStderr = '';
+      assert.ok(incompleteChild.stderr);
+      incompleteChild.stderr.setEncoding('utf8');
+      incompleteChild.stderr.on('data', (chunk) => {
+        incompleteStderr += chunk;
+      });
+      const incompleteGeneration = await waitForReady(incompleteChild, () => incompleteStderr);
+      const generationDir = join(leaseRoot, 'generations', incompleteGeneration.token);
+      chmodSync(generationDir, 0);
+      incompleteChild.kill('SIGINT');
+      const incompleteCode = await waitForChildClose(incompleteChild, 8_000);
+      try {
+        chmodSync(generationDir, 0o700);
+      } catch {
+        /* The generation directory may already be gone. */
+      }
+      assert.equal(incompleteCode, 1, incompleteStderr);
+      assert.equal(
+        incompleteStderr.includes('agent-steward: release unconfirmed; shutdown incomplete. Human review required.'),
+        true,
+        incompleteStderr,
+      );
+      const controlDir = join(state, 'automation', serverHash);
+      const controlGuard = join(controlDir, 'control-guard');
+      // Exclusive publication occupancy is unconfirmed pause; chmod of 0700/0600 paths is denied, not incomplete.
+      writeFileSync(controlGuard, '', { mode: 0o600 });
+      incompletePause = spawn(shell, [join(plugin, 'run.sh'), 'pause'], {
+        cwd: root,
+        env: baseEnv,
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      trackChildClose(incompletePause);
+      let pauseStderr = '';
+      assert.ok(incompletePause.stderr);
+      incompletePause.stderr.setEncoding('utf8');
+      incompletePause.stderr.on('data', (chunk) => {
+        pauseStderr += chunk;
+      });
+      const incompletePauseCode = await waitForChildClose(incompletePause, 8_000);
+      try {
+        rmSync(controlGuard, { force: true });
+      } catch {
+        /* restored below if still present */
+      }
+      assert.equal(incompletePauseCode, 1, pauseStderr);
+      assert.equal(
+        pauseStderr.includes('agent-steward: release unconfirmed; shutdown incomplete. Human review required.'),
+        true,
+        pauseStderr,
+      );
+      // Exercise the actual packaged run.sh/wrapper, with no evaluator credentials
+      // or global runtime. A refused metadata control is not a successful pause.
+      for (const refusal of ['corrupt', 'unsafe', 'missing', 'disabled'] as const) {
+        const refusedRoot = join(root, `control-${refusal}`);
+        const refusedControl = join(refusedRoot, 'automation', serverHash, 'control.json');
+        mkdirSync(join(refusedRoot, 'automation', serverHash), { recursive: true, mode: 0o700 });
+        writeFileSync(
+          refusedControl,
+          refusal === 'corrupt' ? '{bad-json' : readFileSync(join(controlDir, 'control.json')),
+          { mode: 0o600 },
+        );
+        const before = readFileSync(refusedControl, 'utf8');
+        if (refusal === 'unsafe') chmodSync(refusedRoot, 0o777);
+        pluginEnabled = refusal !== 'disabled';
+        const controlEnv: NodeJS.ProcessEnv = { ...baseEnv, HERDR_PLUGIN_STATE_DIR: refusedRoot };
+        if (refusal === 'missing') delete controlEnv.HERDR_PLUGIN_ROOT;
+        const refusedControlChild: ReturnType<typeof spawn> = spawn(
+          shell,
+          [join(plugin, 'run.sh'), refusal === 'disabled' ? 'resume' : 'pause'],
+          {
+            cwd: root,
+            env: controlEnv,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        );
+        trackChildClose(refusedControlChild);
+        let stdout = '',
+          stderr = '';
+        refusedControlChild.stdout!.on('data', (chunk) => {
+          stdout += chunk;
+        });
+        refusedControlChild.stderr!.on('data', (chunk) => {
+          stderr += chunk;
+        });
         try {
-          await waitForChildClose(eventChild, 1_000, 'SIGTERM');
-        } catch {
-          /* The disposable child and its stdio are force-closed by the watchdog. */
+          assert.equal(await waitForChildClose(refusedControlChild, 5_000), 1, stderr);
+          assert.equal(stdout, '');
+          assert.equal(stderr, 'agent-steward: control denied; no change confirmed. Human review required.\n');
+          assert.equal(readFileSync(refusedControl, 'utf8'), before);
+        } finally {
+          pluginEnabled = true;
+          chmodSync(refusedRoot, 0o700);
+          await waitForChildClose(refusedControlChild, 1_000, 'SIGTERM');
         }
       }
-      if (scheduler) {
+      assert.ok(methods.some(({ method }) => method === 'plugin.list'));
+      assert.ok(methods.some(({ method }) => method === 'agent.get'));
+      assert.ok(
+        methods.every(({ method }) => method === 'agent.get' || method === 'agent.read' || method === 'plugin.list'),
+      );
+      assert.equal(existsSync(join(config, 'herdr')), false, 'package must not enable/link plugins');
+      assert.equal(existsSync(join(home, '.config/herdr')), false, 'package must not edit Herdr user config');
+    } finally {
+      for (const child of [eventChild, duplicateChild, pauseChild, finishChild, incompleteChild, incompletePause]) {
+        if (!child) continue;
         try {
-          await waitForChildClose(scheduler, 1_000, 'SIGTERM');
+          await waitForChildClose(child, 1_000, 'SIGTERM');
         } catch {
           /* The disposable child and its stdio are force-closed by the watchdog. */
         }
@@ -714,5 +889,5 @@ test.skipIf(!pkg)(
       await closeFakeServerAndRemoveRoot(server, sockets, root, 1_000);
     }
   },
-  15000,
+  35_000,
 );

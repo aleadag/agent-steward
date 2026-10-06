@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'bun:test';
-import { mkdtemp, writeFile, mkdir, chmod, readFile, stat, rename } from 'node:fs/promises';
+import { mkdtemp, writeFile, mkdir, chmod, readFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EpisodeStore } from '../src/herdr-adapter/state.ts';
 import { observeStop } from '../src/herdr-adapter/observe.ts';
-import { reconcileDue } from '../src/herdr-adapter/scheduler.ts';
 import { deliverProposal, type HerdrControl } from '../src/herdr-adapter/deliver.ts';
 import { decideWithCli, handleEvent, runEvent, type EventDeps } from '../src/herdr-adapter/entry.ts';
 import type { AgentSnapshot } from '../src/herdr-adapter/observe.ts';
@@ -900,7 +900,25 @@ for (const status of ['idle', 'done']) {
       assert.equal(decisions, 1);
       assert.equal(f.herdr.writes().length, 0);
       assert.equal((await retryEpisode(f)).next_check_at, at);
-      await reconcileDue(new Date(at), f.store, f.herdr, decide, ['w1:p1'], async () => {}, ownership);
+      await handleEvent(
+        {
+          type: 'pane.agent_status_changed',
+          pane_id: 'w1:p1',
+          workspace_id: 'w1',
+          agent: 'codex',
+          agent_status: status,
+        },
+        {
+          herdr: f.herdr,
+          store: f.store,
+          clock: { now: () => new Date(at) },
+          targets: ['w1:p1'],
+          handoff: async () => {},
+          decide,
+          ...ownership,
+        },
+        true,
+      );
       assert.equal(decisions, 3);
       assert.equal(f.herdr.writes().length, 1);
     } finally {
@@ -962,7 +980,7 @@ for (const matchingEvidence of [false, true]) {
     try {
       await handleEvent(event, deps);
       await handleEvent(event, deps);
-      await reconcileDue(new Date(at), f.store, f.herdr, deps.decide, ['w1:p1'], deps.handoff, ownership);
+      await handleEvent(event, deps, true);
       assert.equal(handoffs.length, 1);
       assert.equal(decisions, 0);
       assert.deepEqual(f.herdr.writes(), []);
@@ -992,25 +1010,33 @@ test('due scheduler keeps its original lease token across a held decision', asyn
   const handoffs: TestHandoffReason[] = [];
   let replacement: string | null = null;
   try {
-    const oldDue = reconcileDue(
-      new Date(at),
-      f.store,
-      f.herdr,
-      async (input) => {
-        entered();
-        await held;
-        return recovery(input);
-      },
-      ['w1:p1'],
-      async (reason) => {
-        handoffs.push(reason);
+    const oldDue = handleEvent(
+      {
+        type: 'pane.agent_status_changed',
+        pane_id: 'w1:p1',
+        workspace_id: 'w1',
+        agent: 'pi',
+        agent_status: 'idle',
       },
       {
+        herdr: f.herdr,
+        store: f.store,
+        clock: { now: () => new Date(at) },
+        targets: ['w1:p1'],
+        decide: async (input) => {
+          entered();
+          await held;
+          return recovery(input);
+        },
+        handoff: async (reason) => {
+          handoffs.push(reason);
+        },
         sessionId: 'server-1',
         leaseToken: oldToken,
         sessionValid: async () => true,
         admissionOpen: () => true,
       },
+      true,
     );
     await pending;
     await f.store.release(oldToken);
@@ -1027,20 +1053,27 @@ test('due scheduler keeps its original lease token across a held decision', asyn
   }
 });
 
-test('late decision cannot adopt a successor after old heartbeat commit', async () => {
-  let milliseconds = Date.now();
-  const directory = await mkdtemp(join(tmpdir(), 'steward-lease-swap-'));
+test('installed event uses the supplied Herdr 0.9.1 agent prompt CLI, not raw pane input', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'steward-delivery-wire-'));
   const socket = join(directory, 'herdr.sock'),
     executable = join(directory, 'fake-herdr');
   const config = join(directory, 'config'),
+    plugin = join(directory, 'plugin'),
+    state = join(directory, 'state'),
     calls = join(directory, 'calls.json');
   await mkdir(config);
+  await mkdir(plugin);
+  await mkdir(state, { mode: 0o700 });
+  await writeFile(join(plugin, 'herdr-plugin.toml'), 'id = "agent-steward-recover"\n');
   await writeFile(join(config, 'targets.json'), JSON.stringify({ pane_ids: ['w1:p1'] }));
   await writeFile(
     executable,
     `#!${process.execPath}\nimport { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + '\\n');\n`,
   );
   await chmod(executable, 0o755);
+  const live = pane({
+    agent_session: { agent: 'pi', source: 'herdr:pi', kind: 'id', value: 's1' },
+  });
   const server = createServer((connection) => {
     let bytes = '';
     connection.on('data', (chunk) => {
@@ -1051,74 +1084,38 @@ test('late decision cannot adopt a successor after old heartbeat commit', async 
         JSON.stringify({
           id,
           result:
-            method === 'agent.get'
-              ? { type: 'agent_info', agent: pane() }
-              : {
-                  type: 'pane_read',
-                  read: { pane_id: 'w1:p1', source: 'detection', revision: 8, text, truncated: false },
-                },
+            method === 'plugin.list'
+              ? {
+                  type: 'plugin_list',
+                  plugins: [
+                    {
+                      plugin_id: 'agent-steward-recover',
+                      name: 'Agent Steward recover',
+                      version: '0.1.0',
+                      plugin_root: plugin,
+                      manifest_path: join(plugin, 'herdr-plugin.toml'),
+                      enabled: true,
+                    },
+                  ],
+                }
+              : method === 'agent.get'
+                ? { type: 'agent_info', agent: live }
+                : {
+                    type: 'pane_read',
+                    read: { pane_id: 'w1:p1', source: 'detection', revision: 8, text, truncated: false },
+                  },
         }) + '\n',
       );
     });
   });
   await new Promise<void>((resolve) => server.listen(socket, () => resolve()));
-  const info = await stat(socket),
-    session = `${info.dev}:${info.ino}`;
-  const heartbeatEntered = deferred<void>();
-  const finishHeartbeat = deferred<void>();
-  let holdHeartbeat = false;
-  let oldToken = '';
-  const store = new EpisodeStore(directory, () => milliseconds, {
-    io: {
-      rename: async (from, to) => {
-        if (holdHeartbeat && to === join(directory, 'scheduler-lease', 'generations', oldToken, 'heartbeat.json')) {
-          holdHeartbeat = false;
-          heartbeatEntered.resolve();
-          await finishHeartbeat.promise;
-        }
-        await rename(from, to);
-      },
-    },
-  });
-  const observation = await observeStop(
-    {
-      get: async () => pane(),
-      read: async () => ({ pane_id: 'w1:p1', source: 'detection', revision: 8, text, truncated: false }),
-    },
-    'w1:p1',
-  );
-  assert.ok(observation);
-  const original: Episode = {
-    pane_id: 'w1:p1',
-    session_id: 's1',
-    failure_episode_id: observation.current_episode_id,
-    error_evidence_digest: observation.error_evidence_digest,
-    first_observed_at: at,
-    attempt_count: 0,
-    last_attempt_at: null,
-    quota_check_count: 0,
-    last_quota_check_at: null,
-    next_check_at: null,
-    last_delivery_state: 'none',
-  };
-  await store.record('w1:p1', original);
-  const acquired = await store.acquire(session);
-  assert.ok(acquired);
-  oldToken = acquired;
-  let entered!: () => void;
-  let releaseDecision!: () => void;
-  const pending = new Promise<void>((resolve) => {
-    entered = resolve;
-  });
-  const held = new Promise<void>((resolve) => {
-    releaseDecision = resolve;
-  });
   const env = {
-    ...process.env,
     HERDR_SOCKET_PATH: socket,
     HERDR_BIN_PATH: executable,
+    HERDR_PLUGIN_ID: 'agent-steward-recover',
+    HERDR_PLUGIN_ROOT: plugin,
     HERDR_PLUGIN_CONFIG_DIR: config,
-    HERDR_PLUGIN_STATE_DIR: directory,
+    HERDR_PLUGIN_STATE_DIR: state,
     HERDR_PLUGIN_EVENT_JSON: JSON.stringify({
       type: 'pane.agent_status_changed',
       pane_id: 'w1:p1',
@@ -1127,96 +1124,8 @@ test('late decision cannot adopt a successor after old heartbeat commit', async 
       agent_status: 'idle',
     }),
   };
-  let replacement;
   try {
-    const oldHook = runEvent(env, async (input) => {
-      entered();
-      await held;
-      return recovery(input);
-    });
-    await pending;
-    holdHeartbeat = true;
-    const heartbeat = store.heartbeat(oldToken, session);
-    await within(heartbeatEntered.promise);
-    await store.release(oldToken);
-    milliseconds += 1_000;
-    replacement = await store.acquire(session);
-    assert.ok(replacement && replacement !== oldToken);
-    finishHeartbeat.resolve();
-    assert.equal(await within(heartbeat), false);
-    releaseDecision();
-    await oldHook;
-    assert.deepEqual(await store.retry('w1:p1'), original);
-    assert.equal(await store.owned(replacement, session), true);
-    const commands = await readFile(calls, 'utf8').catch((error) => {
-      if (error.code === 'ENOENT') return '';
-      throw error;
-    });
-    assert.equal(commands.includes('"agent","prompt"'), false);
-  } finally {
-    releaseDecision?.();
-    finishHeartbeat.resolve();
-    if (replacement) await store.release(replacement);
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
-});
-
-test('installed event uses the supplied Herdr 0.9.1 agent prompt CLI, not raw pane input', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'steward-delivery-wire-'));
-  const socket = join(directory, 'herdr.sock'),
-    executable = join(directory, 'fake-herdr');
-  const config = join(directory, 'config'),
-    calls = join(directory, 'calls.json');
-  await mkdir(config);
-  await writeFile(join(config, 'targets.json'), JSON.stringify({ pane_ids: ['w1:p1'] }));
-  await writeFile(
-    executable,
-    `#!${process.execPath}\nimport { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + '\\n');\n`,
-  );
-  await chmod(executable, 0o755);
-  const server = createServer((connection) => {
-    let bytes = '';
-    connection.on('data', (chunk) => {
-      bytes += chunk;
-      if (!bytes.includes('\n')) return;
-      const { id, method } = JSON.parse(bytes.slice(0, bytes.indexOf('\n')));
-      connection.end(
-        JSON.stringify({
-          id,
-          result:
-            method === 'agent.get'
-              ? { type: 'agent_info', agent: pane() }
-              : {
-                  type: 'pane_read',
-                  read: { pane_id: 'w1:p1', source: 'detection', revision: 8, text, truncated: false },
-                },
-        }) + '\n',
-      );
-    });
-  });
-  await new Promise<void>((resolve) => server.listen(socket, () => resolve()));
-  const info = await stat(socket);
-  const store = new EpisodeStore(directory),
-    token = await store.acquire(`${info.dev}:${info.ino}`);
-  assert.ok(token);
-  try {
-    await runEvent(
-      {
-        ...process.env,
-        HERDR_SOCKET_PATH: socket,
-        HERDR_BIN_PATH: executable,
-        HERDR_PLUGIN_CONFIG_DIR: config,
-        HERDR_PLUGIN_STATE_DIR: directory,
-        HERDR_PLUGIN_EVENT_JSON: JSON.stringify({
-          type: 'pane.agent_status_changed',
-          pane_id: 'w1:p1',
-          workspace_id: 'w1',
-          agent: 'pi',
-          agent_status: 'idle',
-        }),
-      },
-      async (input) => recovery(input),
-    );
+    await runEvent(env, async (input) => recovery(input));
     assert.deepEqual(
       (await readFile(calls, 'utf8'))
         .trim()
@@ -1224,37 +1133,7 @@ test('installed event uses the supplied Herdr 0.9.1 agent prompt CLI, not raw pa
         .map((line) => JSON.parse(line)),
       [['agent', 'prompt', 'w1:p1', recovery({ request_id: 'unused' }).proposed_action.instruction]],
     );
-    await store.clear('w1:p1');
-    await runEvent(
-      {
-        ...process.env,
-        HERDR_SOCKET_PATH: socket,
-        HERDR_BIN_PATH: executable,
-        HERDR_PLUGIN_CONFIG_DIR: config,
-        HERDR_PLUGIN_STATE_DIR: directory,
-        HERDR_PLUGIN_EVENT_JSON: JSON.stringify({
-          type: 'pane.agent_status_changed',
-          pane_id: 'w1:p1',
-          workspace_id: 'w1',
-          agent: 'pi',
-          agent_status: 'idle',
-        }),
-      },
-      async (input) => ({
-        ...recovery(input),
-        proposed_action: { kind: 'manual_review' },
-        reason_code: 'retry_exhausted',
-      }),
-    );
-    assert.deepEqual(
-      (await readFile(calls, 'utf8'))
-        .trim()
-        .split('\n')
-        .map((line) => JSON.parse(line))[1],
-      ['notification', 'show', 'Agent Steward: human review required', '--body', 'Review the stopped agent manually.'],
-    );
   } finally {
-    await store.release(token);
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
@@ -1279,3 +1158,597 @@ process.stdout.write(JSON.stringify(response));`,
   assert.equal(await deliver(bad, (input) => decideWithCli(input, script)), 'human');
   assert.equal(bad.herdr.writes().length, 0);
 });
+
+const permissionDialog =
+  'Requesting permission for:\n  printf probe\nRun this command?\n> 1. Yes, run command\n  2. No, cancel';
+const partialPermission = 'Requesting permission for:\n  printf probe\nRun this command?\n> 1. Yes, run command';
+
+test('due recovery cannot send approval keys for a recognized permission menu', async () => {
+  const f = await setup('codex', false, 'idle');
+  f.herdr.excerpt(permissionDialog);
+  const menu = await observeStop(f.herdr, 'w1:p1');
+  assert.ok(menu);
+  const original: Episode = {
+    ...(await retryEpisode(f)),
+    failure_episode_id: menu.current_episode_id,
+    error_evidence_digest: menu.error_evidence_digest,
+    attempt_count: 1,
+    last_attempt_at: '2026-09-29T10:00:00Z',
+    next_check_at: at,
+  };
+  await f.store.record('w1:p1', original);
+  const token = await f.store.acquire('server-1');
+  assert.ok(token);
+  const keys: string[][] = [];
+  const handoffs: TestHandoffReason[] = [];
+  let decisions = 0;
+  try {
+    await handleEvent(
+      {
+        type: 'pane.agent_status_changed',
+        pane_id: 'w1:p1',
+        workspace_id: 'w1',
+        agent: 'codex',
+        agent_status: 'idle',
+      },
+      {
+        herdr: {
+          ...f.herdr,
+          sendKeys: async (_pane, input) => {
+            keys.push(input);
+          },
+        },
+        store: f.store,
+        clock: f.clock,
+        targets: ['w1:p1'],
+        autoApprove: true,
+        sessionId: 'server-1',
+        leaseToken: token,
+        sessionValid: async () => true,
+        handoff: async (reason) => {
+          handoffs.push(reason);
+        },
+        decide: async (input) => {
+          decisions++;
+          return recovery(input);
+        },
+      },
+      true,
+    );
+    assert.deepEqual(keys, []);
+    assert.equal(decisions, 0);
+    assert.equal((await retryEpisode(f)).next_check_at, null);
+    assert.equal((await retryEpisode(f)).attempt_count, 1);
+    assert.equal((await retryEpisode(f)).last_delivery_state, 'human');
+    assert.equal(handoffs.length, 1);
+  } finally {
+    await f.store.release(token);
+  }
+});
+
+test('due recovery does not treat a partial permission menu as a reason to poll', async () => {
+  const f = await setup('codex', false, 'idle');
+  f.herdr.excerpt(partialPermission);
+  const menu = await observeStop(f.herdr, 'w1:p1');
+  assert.ok(menu);
+  await f.store.record('w1:p1', {
+    ...(await retryEpisode(f)),
+    failure_episode_id: menu.current_episode_id,
+    error_evidence_digest: menu.error_evidence_digest,
+    attempt_count: 1,
+    last_attempt_at: '2026-09-29T10:00:00Z',
+    next_check_at: at,
+  });
+  const token = await f.store.acquire('server-1');
+  assert.ok(token);
+  const handoffs: TestHandoffReason[] = [];
+  let decisions = 0;
+  let reads = 0;
+  const read = f.herdr.read.bind(f.herdr);
+  f.herdr.read = async (pane) => {
+    reads++;
+    return read(pane);
+  };
+  try {
+    await handleEvent(
+      {
+        type: 'pane.agent_status_changed',
+        pane_id: 'w1:p1',
+        workspace_id: 'w1',
+        agent: 'codex',
+        agent_status: 'idle',
+      },
+      {
+        herdr: f.herdr,
+        store: f.store,
+        clock: f.clock,
+        targets: ['w1:p1'],
+        autoApprove: true,
+        sessionId: 'server-1',
+        leaseToken: token,
+        sessionValid: async () => true,
+        handoff: async (reason) => {
+          handoffs.push(reason);
+        },
+        decide: async (input) => {
+          decisions++;
+          return recovery(input);
+        },
+      },
+      true,
+    );
+    assert.equal(decisions, 0);
+    assert.equal(reads, 1);
+    assert.equal((await retryEpisode(f)).next_check_at, null);
+    assert.equal((await retryEpisode(f)).attempt_count, 1);
+    assert.ok(handoffs.length >= 1);
+    assert.deepEqual(f.herdr.writes(), []);
+  } finally {
+    await f.store.release(token);
+  }
+});
+
+async function scopedDelivery(status: 'idle' | 'done' = 'idle') {
+  const { beginWorkflow } = await import('../src/herdr-adapter/authority.ts');
+  const { WorkflowState } = await import('../src/herdr-adapter/workflow-state.ts');
+  const { workflowEventDeps } = await import('../src/herdr-adapter/events.ts');
+  const root = await mkdtemp(join(tmpdir(), 'steward-scoped-delivery-'));
+  const state = new WorkflowState(root);
+  const store = new EpisodeStore(root);
+  const attempt = beginWorkflow({
+    state,
+    scope: {
+      serverId: '47:1',
+      agent: 'agy',
+      sessionId: 's1',
+      sessionKind: 'id',
+      sessionSource: 'herdr:antigravity_cli',
+    },
+    paneId: 'w1:p1',
+    workspaceId: 'w1',
+    permission: async () => ({ serverId: '47:1', enabled: true, targets: 'all' as const, autoApprove: false }),
+    signal: new AbortController().signal,
+  });
+  const authority = await attempt.ready;
+  assert.ok(authority);
+  let current = pane({
+    agent: 'agy',
+    agent_status: status,
+    agent_session: { agent: 'agy', source: 'herdr:antigravity_cli', kind: 'id', value: 's1' },
+  });
+  let excerpt = text;
+  const writes: [string, string][] = [];
+  const herdr: DeliveryHerdr = {
+    get: async (id = current.pane_id) =>
+      id === current.pane_id ? current : { ...current, pane_id: id, workspace_id: id.split(':')[0]! },
+    read: async (id = current.pane_id) => ({
+      pane_id: id,
+      source: 'detection',
+      revision: current.revision,
+      text: excerpt,
+      truncated: false,
+    }),
+    prompt: async (target, instruction) => {
+      writes.push([target, instruction]);
+    },
+    change: (next) => {
+      current = next;
+    },
+    excerpt: (next) => {
+      excerpt = next;
+    },
+    writes: () => writes,
+  };
+  const clock = { now: () => new Date(at) };
+  return {
+    state,
+    store,
+    attempt,
+    authority,
+    herdr,
+    clock,
+    workflowEventDeps,
+    cleanup: async () => {
+      attempt.close();
+      await attempt.finish();
+    },
+  };
+}
+
+for (const association of ['ambiguous', 'corrupt', 'closed_after_association', 'paused_after_association'] as const) {
+  test(`scoped ${association} legacy association has no budget or input and hands off only while authorized`, async () => {
+    const f = await scopedDelivery();
+    const held = association === 'closed_after_association' || association === 'paused_after_association';
+    const entered = deferred<void>();
+    const resume = deferred<void>();
+    let running: Promise<void> | undefined;
+    try {
+      const observed = await observeStop(f.herdr, 'w1:p1');
+      assert.ok(observed);
+      const legacy: Episode = {
+        pane_id: 'w1:p1',
+        session_id: 's1',
+        failure_episode_id: observed.current_episode_id,
+        error_evidence_digest: observed.error_evidence_digest,
+        first_observed_at: '2026-09-29T10:00:00Z',
+        attempt_count: 2,
+        last_attempt_at: '2026-09-29T10:00:20Z',
+        quota_check_count: 1,
+        last_quota_check_at: '2026-09-29T10:00:10Z',
+        next_check_at: '2026-09-29T10:05:00Z',
+        last_delivery_state: 'none',
+      };
+      await f.store.record('w1:p1', legacy);
+      if (association === 'corrupt') {
+        const path = join(f.store.directory, createHash('sha256').update('w1:p1').digest('hex') + '.json');
+        await writeFile(path, '{', { mode: 0o600 });
+      } else {
+        await f.store.record('w1:p2', { ...legacy, pane_id: 'w1:p2' });
+      }
+      if (held) {
+        const adopt = f.state.adoptLegacyRetry.bind(f.state);
+        f.state.adoptLegacyRetry = async (...args) => {
+          const result = await adopt(...args);
+          assert.equal(result, 'quarantined');
+          entered.resolve();
+          await resume.promise;
+          return result;
+        };
+      }
+      const handoffs: TestHandoffReason[] = [];
+      let decisions = 0;
+      const deps = f.workflowEventDeps(
+        {
+          herdr: f.herdr,
+          store: f.store,
+          clock: f.clock,
+          targets: 'all',
+          handoff: async (reason) => {
+            handoffs.push(reason);
+          },
+          decide: async (input) => {
+            decisions++;
+            return recovery(input);
+          },
+        },
+        f.authority,
+        f.state,
+      );
+      running = handleEvent(
+        { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent: 'agy', agent_status: 'idle' },
+        deps,
+      );
+      if (held) {
+        await within(entered.promise);
+        assert.deepEqual(handoffs, []);
+        assert.equal(await f.store.sessionRetry('agy', 's1'), null);
+        if (association === 'closed_after_association') f.attempt.close();
+        else assert.equal(await f.state.pause(f.authority.scope.serverId), 'paused');
+        resume.resolve();
+      }
+      await within(running);
+      assert.equal(await f.store.sessionRetry('agy', 's1'), null);
+      assert.equal(await f.state.recoveryQuarantined(f.authority.scope), true);
+      assert.equal(decisions, 0);
+      assert.deepEqual(f.herdr.writes(), []);
+      assert.deepEqual(handoffs, held ? [] : ['human_review_required']);
+      if (association !== 'corrupt') assert.deepEqual(await f.store.retry('w1:p1'), legacy);
+    } finally {
+      resume.resolve();
+      if (running) await within(running);
+      await f.cleanup();
+    }
+  });
+}
+
+test('first upgraded event preserves nonzero legacy attempt and quota counters', async () => {
+  const f = await scopedDelivery();
+  try {
+    const observed = await observeStop(f.herdr, 'w1:p1');
+    assert.ok(observed);
+    await f.store.record('w1:p1', {
+      pane_id: 'w1:p1',
+      session_id: 's1',
+      failure_episode_id: observed.current_episode_id,
+      error_evidence_digest: observed.error_evidence_digest,
+      first_observed_at: '2026-09-29T10:00:00Z',
+      attempt_count: 2,
+      last_attempt_at: '2026-09-29T10:00:20Z',
+      quota_check_count: 1,
+      last_quota_check_at: '2026-09-29T10:00:10Z',
+      next_check_at: '2026-09-29T10:05:00Z',
+      last_delivery_state: 'none',
+    });
+    assert.equal(await f.store.sessionRetry('agy', 's1'), null);
+    const retries: StopInput['retry'][] = [];
+    const deps = f.workflowEventDeps(
+      {
+        herdr: f.herdr,
+        store: f.store,
+        clock: f.clock,
+        targets: 'all',
+        handoff: async () => {},
+        decide: async (input) => {
+          retries.push(input.retry);
+          return {
+            ...recovery(input),
+            proposed_action: { kind: 'manual_review' },
+            reason_code: 'insufficient_context',
+            waiting_for: 'other',
+          };
+        },
+      },
+      f.authority,
+      f.state,
+    );
+    await handleEvent(
+      { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent: 'agy', agent_status: 'idle' },
+      deps,
+    );
+    const canonical = await f.store.sessionRetry('agy', 's1');
+    assert.equal(canonical?.attempt_count, 2);
+    assert.equal(canonical?.quota_check_count, 1);
+    assert.equal(canonical?.next_check_at, '2026-09-29T10:05:00Z');
+    assert.equal(canonical?.last_delivery_state, 'none');
+    if (retries[0]) {
+      assert.equal(retries[0].attempt_count, 2);
+      assert.equal(retries[0].quota_check_count, 1);
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('another pane cannot initialize a fresh budget for an unresolved session binding', async () => {
+  const f = await scopedDelivery();
+  try {
+    const observed = await observeStop(f.herdr, 'w1:p1');
+    assert.ok(observed);
+    await f.store.recordSessionRetry('agy', 's1', {
+      pane_id: 'w1:p1',
+      session_id: 's1',
+      failure_episode_id: observed.current_episode_id,
+      error_evidence_digest: observed.error_evidence_digest,
+      first_observed_at: '2026-09-29T10:00:00Z',
+      attempt_count: 2,
+      last_attempt_at: '2026-09-29T10:00:20Z',
+      quota_check_count: 0,
+      last_quota_check_at: null,
+      next_check_at: '2026-09-29T10:05:00Z',
+      last_delivery_state: 'none',
+    });
+    const before = await f.store.sessionRetry('agy', 's1');
+    const handoffs: TestHandoffReason[] = [];
+    const deps = f.workflowEventDeps(
+      {
+        herdr: f.herdr,
+        store: f.store,
+        clock: f.clock,
+        targets: 'all',
+        handoff: async (reason) => {
+          handoffs.push(reason);
+        },
+        decide: async (input) => recovery(input),
+      },
+      f.authority,
+      f.state,
+    );
+    await handleEvent(
+      { type: 'pane.agent_status_changed', pane_id: 'w1:p2', workspace_id: 'w1', agent: 'agy', agent_status: 'idle' },
+      deps,
+    );
+    assert.deepEqual(await f.store.sessionRetry('agy', 's1'), before);
+    assert.equal(await f.store.retry('w1:p2'), null);
+    assert.deepEqual(f.herdr.writes(), []);
+    assert.deepEqual(handoffs, []);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('scoped due no-action preserves canonical history and counters while clearing its timer', async () => {
+  const f = await scopedDelivery();
+  try {
+    const observed = await observeStop(f.herdr, 'w1:p1');
+    assert.ok(observed);
+    const pending: Episode = {
+      pane_id: 'w1:p1',
+      session_id: 's1',
+      failure_episode_id: observed.current_episode_id,
+      error_evidence_digest: observed.error_evidence_digest,
+      first_observed_at: '2026-09-29T10:00:00Z',
+      attempt_count: 2,
+      last_attempt_at: '2026-09-29T10:00:20Z',
+      quota_check_count: 1,
+      last_quota_check_at: '2026-09-29T10:00:10Z',
+      next_check_at: at,
+      last_delivery_state: 'none',
+    };
+    await f.store.recordSessionRetry('agy', 's1', pending);
+    const inputs: StopInput[] = [];
+    const handoffs: TestHandoffReason[] = [];
+    const deps = f.workflowEventDeps(
+      {
+        herdr: f.herdr,
+        store: f.store,
+        clock: f.clock,
+        targets: 'all',
+        handoff: async (reason) => {
+          handoffs.push(reason);
+        },
+        decide: async (input) => {
+          inputs.push(input);
+          return {
+            ...recovery(input),
+            proposed_action: { kind: 'no_action' },
+            reason_code: 'completed',
+            waiting_for: 'completed',
+            waiting_confidence: null,
+            risk_probability: null,
+            evaluation: null,
+          };
+        },
+      },
+      f.authority,
+      f.state,
+    );
+    await handleEvent(
+      { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent: 'agy', agent_status: 'idle' },
+      deps,
+      true,
+    );
+    assert.equal(inputs.length, 1);
+    assert.equal(inputs[0]!.retry.attempt_count, 2);
+    assert.equal(inputs[0]!.retry.quota_check_count, 2);
+    assert.deepEqual(await f.store.sessionRetry('agy', 's1'), { ...pending, next_check_at: null });
+    assert.deepEqual(f.herdr.writes(), []);
+    assert.deepEqual(handoffs, []);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('replacement clear does not delete another session canonical retry history', async () => {
+  const f = await scopedDelivery();
+  try {
+    const observed = await observeStop(f.herdr, 'w1:p1');
+    assert.ok(observed);
+    await f.store.recordSessionRetry('agy', 's1', {
+      pane_id: 'w1:p1',
+      session_id: 's1',
+      failure_episode_id: observed.current_episode_id,
+      error_evidence_digest: observed.error_evidence_digest,
+      first_observed_at: '2026-09-29T10:00:00Z',
+      attempt_count: 2,
+      last_attempt_at: '2026-09-29T10:00:20Z',
+      quota_check_count: 0,
+      last_quota_check_at: null,
+      next_check_at: null,
+      last_delivery_state: 'uncertain',
+    });
+    f.herdr.change(
+      pane({
+        agent: 'agy',
+        agent_session: { agent: 'agy', source: 'herdr:antigravity_cli', kind: 'id', value: 's2' },
+      }),
+    );
+    const handoffs: TestHandoffReason[] = [];
+    const deps = f.workflowEventDeps(
+      {
+        herdr: f.herdr,
+        store: f.store,
+        clock: f.clock,
+        targets: 'all',
+        handoff: async (reason) => {
+          handoffs.push(reason);
+        },
+        decide: async (input) => recovery(input),
+      },
+      f.authority,
+      f.state,
+    );
+    await handleEvent(
+      { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent: 'agy', agent_status: 'idle' },
+      deps,
+    );
+    const canonical = await f.store.sessionRetry('agy', 's1');
+    assert.equal(canonical?.attempt_count, 2);
+    assert.equal(canonical?.last_delivery_state, 'uncertain');
+    assert.equal(await f.store.sessionRetry('agy', 's2'), null);
+    assert.deepEqual(handoffs, []);
+    assert.deepEqual(f.herdr.writes(), []);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+for (const stage of ['observation', 'decision', 'quota_hint', 'uncertain', 'acknowledgment'] as const) {
+  test(`captured authority closure after ${stage} prevents later writes and input`, async () => {
+    const f = await scopedDelivery();
+    try {
+      const observed = await observeStop(f.herdr, 'w1:p1');
+      assert.ok(observed);
+      let gets = 0;
+      const get = f.herdr.get.bind(f.herdr);
+      f.herdr.get = async (paneId) => {
+        const snapshot = await get(paneId);
+        gets++;
+        if (stage === 'observation' && gets === 3) f.attempt.close();
+        return snapshot;
+      };
+      const baseRecord = f.store.recordSessionRetry.bind(f.store);
+      if (stage === 'uncertain' || stage === 'acknowledgment') {
+        f.store.recordSessionRetry = async (agent, session, episode) => {
+          await baseRecord(agent, session, episode);
+          if (episode.last_delivery_state === 'uncertain') f.attempt.close();
+        };
+      }
+      const prompt = f.herdr.prompt.bind(f.herdr);
+      f.herdr.prompt = async (paneId, instruction) => {
+        await prompt(paneId, instruction);
+        if (stage === 'acknowledgment') f.attempt.close();
+      };
+      const deps = f.workflowEventDeps(
+        {
+          herdr: f.herdr,
+          store: f.store,
+          clock: f.clock,
+          targets: 'all',
+          quotaHint:
+            stage === 'quota_hint'
+              ? async () => {
+                  f.attempt.close();
+                  return '2026-09-29T10:01:00Z';
+                }
+              : undefined,
+          handoff: async () => {},
+          decide: async (input) => {
+            if (stage === 'decision') f.attempt.close();
+            if (stage === 'quota_hint') {
+              return {
+                schema_version: 2,
+                request_id: input.request_id,
+                decision: 'stop_decision',
+                proposed_action: { kind: 'wait_for_quota', not_before: '2026-09-29T10:20:00Z' },
+                reason_code: 'quota_limit',
+                waiting_for: 'quota_limit',
+                waiting_confidence: 1,
+                risk_probability: null,
+                evaluation: recovery(input).evaluation,
+              };
+            }
+            return recovery(input);
+          },
+        },
+        f.authority,
+        f.state,
+      );
+      if (stage === 'uncertain' || stage === 'acknowledgment') {
+        const originalRecord = deps.store.record.bind(deps.store);
+        deps.store.record = async (pane, episode) => {
+          await originalRecord(pane, episode);
+          if (episode.last_delivery_state === 'uncertain' && stage === 'uncertain') f.attempt.close();
+        };
+      }
+      await handleEvent(
+        { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent: 'agy', agent_status: 'idle' },
+        deps,
+      );
+      const canonical = await f.store.sessionRetry('agy', 's1');
+      if (stage === 'observation' || stage === 'decision' || stage === 'quota_hint') {
+        assert.equal(canonical, null);
+        assert.deepEqual(f.herdr.writes(), []);
+      }
+      if (stage === 'uncertain') {
+        assert.equal(canonical?.last_delivery_state, 'uncertain');
+        assert.deepEqual(f.herdr.writes(), []);
+      }
+      if (stage === 'acknowledgment') {
+        assert.equal(canonical?.last_delivery_state, 'uncertain');
+        assert.equal(f.herdr.writes().length, 1);
+      }
+    } finally {
+      await f.cleanup();
+    }
+  });
+}

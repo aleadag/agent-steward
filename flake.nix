@@ -58,7 +58,7 @@
         root = ./.;
         fileset = lib.fileset.unions [
           ./package.json ./bun.lock ./tsconfig.json ./tsconfig.tests.json ./src ./tests
-          ./skills ./herdr-plugins ./examples ./README.md
+          ./skills ./herdr-plugins ./examples ./README.md ./RELEASE_NOTES.md
         ];
       };
       package = pkgs.stdenv.mkDerivation {

@@ -178,3 +178,100 @@ test('event approval proposal emits human handoff and never sends keys', async (
     await f.store.release(token);
   }
 });
+
+test('invalidation after either scoped assessment prevents keys and fresh writes', async () => {
+  const { beginWorkflow } = await import('../src/herdr-adapter/authority.ts');
+  const { WorkflowState } = await import('../src/herdr-adapter/workflow-state.ts');
+  const { workflowEventDeps } = await import('../src/herdr-adapter/events.ts');
+  const { assessStop } = await import('../src/triage.ts');
+  const root = await mkdtemp(join(tmpdir(), 'steward-scoped-invalidation-'));
+  const state = new WorkflowState(root);
+  const store = new EpisodeStore(root);
+  const attempt = beginWorkflow({
+    state,
+    scope: {
+      serverId: '47:1',
+      agent: 'agy',
+      sessionId: 's1',
+      sessionKind: 'id',
+      sessionSource: 'herdr:antigravity_cli',
+    },
+    paneId: 'w1:p1',
+    workspaceId: 'w1',
+    permission: async () => ({ serverId: '47:1', enabled: true, targets: 'all' as const, autoApprove: true }),
+    signal: new AbortController().signal,
+  });
+  try {
+    const authority = await attempt.ready;
+    assert.ok(authority);
+    const dialog =
+      'Requesting permission for:\n   printf approval-probe\n\nRun this command?\n> 1. Yes, run command\n  2. Yes, and always allow in this conversation\n  3. Yes, and always allow (Persist to settings.json)\n  4. No, cancel\n\n  ↑/↓ Navigate · tab Amend';
+    const herdr = {
+      get: async () => ({
+        pane_id: 'w1:p1',
+        workspace_id: 'w1',
+        agent: 'agy',
+        agent_status: 'idle' as const,
+        agent_session: { agent: 'agy', kind: 'id', source: 'herdr:antigravity_cli', value: 's1' },
+        revision: 259,
+        state_change_seq: 4,
+      }),
+      read: async () => ({ pane_id: 'w1:p1', source: 'detection', revision: 0, text: dialog, truncated: true }),
+      sendKeys: async () => {
+        throw new Error('invalidated authority must not send keys');
+      },
+      prompt: async () => {
+        throw new Error('invalidated authority must not prompt');
+      },
+    };
+    let assessments = 0;
+    const deps = workflowEventDeps(
+      {
+        herdr,
+        store,
+        autoApprove: true,
+        targets: 'all',
+        clock: { now: () => new Date('2026-10-03T12:00:00Z') },
+        decide: async (input) => {
+          assessments++;
+          if (assessments === 1) attempt.close();
+          return assessStop(input, {
+            thresholds: { risky: 0.6, choiceConfidence: 0.45 },
+            now: new Date('2026-10-03T12:00:00Z'),
+            evaluate: async () => ({
+              model: 'jev-1.13.0',
+              usage: {},
+              answers: {
+                waiting_for: {
+                  type: 'choice',
+                  choice: 'approve_command',
+                  probabilities: { approve_command: 0.9, other: 0.1 },
+                  confidence: 0.9,
+                },
+                risky: { type: 'noul', noul: 0.1 },
+              },
+            }),
+          });
+        },
+        handoff: async () => {},
+      },
+      authority,
+      state,
+    );
+    await handleEvent(
+      {
+        type: 'pane.agent_status_changed',
+        pane_id: 'w1:p1',
+        workspace_id: 'w1',
+        agent: 'agy',
+        agent_status: 'idle',
+      },
+      deps,
+    );
+    assert.equal(assessments, 1);
+    assert.equal(await store.approval('agy', 's1'), null);
+  } finally {
+    attempt.close();
+    await attempt.finish();
+  }
+});
