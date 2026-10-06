@@ -33,13 +33,25 @@ export async function deliverProposal(
   stillOwner: () => Promise<boolean>,
   alreadyLocked = false,
   admissionOpen: () => boolean = () => true,
+  dispatch?: (effect: () => Promise<void>) => Promise<void>,
 ): Promise<DeliveryOutcome> {
   if (!admissionOpen()) return 'human';
   if (!alreadyLocked) {
     if (!admissionOpen()) return 'human';
     return (
       (await episode.withEpisodeLock(observation.pane_id, () =>
-        deliverProposal(herdr, observation, proposal, episode, clock, decide, stillOwner, true, admissionOpen),
+        deliverProposal(
+          herdr,
+          observation,
+          proposal,
+          episode,
+          clock,
+          decide,
+          stillOwner,
+          true,
+          admissionOpen,
+          dispatch,
+        ),
       )) ?? 'human'
     );
   }
@@ -165,7 +177,9 @@ export async function deliverProposal(
   if (!admissionOpen() || !stillAuthorizedBeforePrompt) return 'uncertain';
   if (!admissionOpen()) return 'uncertain';
   try {
-    await herdr.prompt(observation.pane_id, action.instruction);
+    const send = () => herdr.prompt(observation.pane_id, action.instruction);
+    if (dispatch) await dispatch(send);
+    else await send();
   } catch {
     return 'uncertain';
   }

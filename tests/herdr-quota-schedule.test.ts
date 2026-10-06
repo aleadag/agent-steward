@@ -1,13 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'bun:test';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:net';
+import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { handleEvent, runVisibleScheduler, type EventDeps } from '../src/herdr-adapter/entry.ts';
-import { reconcileDue, runScheduler } from '../src/herdr-adapter/scheduler.ts';
+import { handleEvent, type EventDeps } from '../src/herdr-adapter/entry.ts';
 import { EpisodeStore } from '../src/herdr-adapter/state.ts';
-import { observeStop, type AgentSnapshot } from '../src/herdr-adapter/observe.ts';
+import type { AgentSnapshot } from '../src/herdr-adapter/observe.ts';
 import type { StopInput, StopResult } from '../src/contracts.ts';
 
 const initial = new Date('2026-09-29T10:00:00Z');
@@ -115,18 +113,17 @@ test('due quota check passes the optional hint without extra assessment or deliv
   const f = await fixture();
   await handleEvent(event, f.deps);
   let calls = 0;
-  await reconcileDue(
-    new Date('2026-09-29T10:05:00Z'),
-    f.store,
-    f.deps.herdr,
-    f.deps.decide,
-    ['w1:p1'],
-    f.deps.handoff,
-    undefined,
-    async () => {
-      calls++;
-      return '2026-09-29T10:08:00Z';
+  await handleEvent(
+    event,
+    {
+      ...f.deps,
+      clock: { now: () => new Date('2026-09-29T10:05:00Z') },
+      quotaHint: async () => {
+        calls++;
+        return '2026-09-29T10:08:00Z';
+      },
     },
+    true,
   );
   const saved = await f.store.retry('w1:p1');
   assert.equal(saved?.next_check_at, '2026-09-29T10:08:00.000Z');
@@ -193,18 +190,17 @@ test('24-hour handoff cannot be extended by a reset hint', async () => {
   assert.ok(record);
   await f.store.record('w1:p1', { ...record, next_check_at: '2026-09-30T10:00:00Z' });
   let hints = 0;
-  await reconcileDue(
-    new Date('2026-09-30T10:00:00Z'),
-    f.store,
-    f.deps.herdr,
-    f.deps.decide,
-    ['w1:p1'],
-    f.deps.handoff,
-    undefined,
-    async () => {
-      hints++;
-      return '2026-10-01T10:00:00Z';
+  await handleEvent(
+    event,
+    {
+      ...f.deps,
+      clock: { now: () => new Date('2026-09-30T10:00:00Z') },
+      quotaHint: async () => {
+        hints++;
+        return '2026-10-01T10:00:00Z';
+      },
     },
+    true,
   );
   assert.equal((await f.store.retry('w1:p1'))?.next_check_at, null);
   assert.equal(hints, 0);
@@ -227,111 +223,4 @@ test('non-quota stop decisions never look up hints', async () => {
   });
   assert.equal(hints, 0);
   assert.equal(f.counts().deliveries, 0);
-});
-
-test('scheduler threads hints to its due-check path', async () => {
-  const f = await fixture();
-  await handleEvent(event, f.deps);
-  const ctrl = new AbortController();
-  let hints = 0;
-  const timer = setTimeout(() => ctrl.abort(), 1000);
-  const observed = await observeStop(reader, 'w1:p1');
-  assert.ok(observed);
-  // The visible runner acquires its own lease; release the fixture's first owner.
-  await f.store.release(f.deps.leaseToken!);
-  await runScheduler({
-    store: f.store,
-    herdr: f.deps.herdr,
-    decide: f.deps.decide,
-    targets: ['w1:p1'],
-    clock: { now: () => new Date('2026-09-29T10:05:00Z') },
-    sessionId: 'server-1',
-    signal: ctrl.signal,
-    quotaHint: async () => {
-      hints++;
-      return '2026-09-29T10:08:00Z';
-    },
-    handoff: async () => {},
-    // Stop after publishing the advanced timer, not during hint resolution.
-  });
-  clearTimeout(timer);
-  assert.equal(hints, 1);
-  assert.equal((await f.store.retry('w1:p1'))?.next_check_at, '2026-09-29T10:08:00.000Z');
-});
-
-test('visible runner supplies a real quota hint using its XDG config and state', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'steward-wiring-'));
-  const server = createServer((socket) => socket.destroy());
-  try {
-    const configHome = join(root, 'config');
-    const stateHome = join(root, 'state');
-    await mkdir(join(configHome, 'agent-steward'), { recursive: true });
-    await mkdir(join(stateHome, 'agent-steward', 'quota'), { recursive: true });
-    await writeFile(
-      join(configHome, 'agent-steward', 'config.json'),
-      JSON.stringify({
-        tools: ['pi'],
-        candidates: [
-          {
-            id: 'one',
-            tool: 'pi',
-            provider: 'openai-codex',
-            model: 'model-one',
-            quota_bucket: 'pi_codex',
-            quota_pool: 'primary',
-            cost: 1,
-            capabilities: 'test',
-            thinking_levels: [{ id: 'default', description: 'test' }],
-          },
-        ],
-      }),
-    );
-    await writeFile(
-      join(stateHome, 'agent-steward', 'quota', 'pi_codex.json'),
-      JSON.stringify({
-        schema_version: 1,
-        source: 'pi_codex',
-        identity_fingerprint: 'a'.repeat(64),
-        windows: [
-          {
-            scope: { type: 'account' },
-            remaining_percent: 0,
-            observed_at: '2026-09-29T09:59:00Z',
-            valid_until: '2026-09-29T10:02:00Z',
-            reset_at: '2026-09-29T10:03:00Z',
-          },
-        ],
-      }),
-    );
-    const socketPath = join(root, 'herdr.sock');
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(socketPath, resolve);
-    });
-    const observed = await observeStop(reader, 'w1:p1');
-    assert.ok(observed);
-    let hint: string | null | undefined;
-    await runVisibleScheduler(
-      {
-        HOME: join(root, 'unused-home'),
-        XDG_CONFIG_HOME: configHome,
-        XDG_STATE_HOME: stateHome,
-        HERDR_SOCKET_PATH: socketPath,
-        HERDR_PLUGIN_CONFIG_DIR: join(root, 'plugin-config'),
-        HERDR_PLUGIN_STATE_DIR: join(root, 'plugin-state'),
-      },
-      async (options) => {
-        assert.ok(options.quotaHint, 'visible runner must wire the production quota hint');
-        hint = await options.quotaHint(observed, initial);
-        return 'stopped';
-      },
-    );
-    assert.equal(hint, '2026-09-29T10:04:00.000Z');
-  } finally {
-    if (server.listening)
-      await new Promise<void>((resolve, reject) => {
-        server.close((error) => (error ? reject(error) : resolve()));
-      });
-    await rm(root, { recursive: true, force: true });
-  }
 });

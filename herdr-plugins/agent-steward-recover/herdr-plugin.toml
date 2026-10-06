@@ -2,7 +2,7 @@ id = "agent-steward-recover"
 name = "Agent Steward recover"
 version = "0.1.0"
 min_herdr_version = "0.9.1"
-description = "Opt-in stopped-agent scheduler with gated recovery prompts and globally configured best-effort approval (off by default). Unsupported Herdr versions must not link this plugin."
+description = "Opt-in stopped-agent event hooks with gated recovery jobs and globally configured best-effort approval (off by default). Unsupported Herdr versions must not link this plugin."
 platforms = ["linux"]
 
 [[events]]
@@ -13,8 +13,14 @@ command = ["sh", "run.sh", "event"]
 on = "pane.exited"
 command = ["sh", "run.sh", "event"]
 
-[[panes]]
-id = "supervisor"
-title = "Agent Steward supervisor"
-placement = "split"
-command = ["sh", "run.sh", "scheduler"]
+[[actions]]
+id = "pause"
+title = "Pause stopped-agent automation"
+contexts = ["workspace"]
+command = ["sh", "run.sh", "pause"]
+
+[[actions]]
+id = "resume"
+title = "Resume stopped-agent automation"
+contexts = ["workspace"]
+command = ["sh", "run.sh", "resume"]

@@ -6,6 +6,7 @@ import type { FileHandle } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { z } from 'zod';
 import { collectDeadGenerations } from './lease-cleanup.ts';
+import { withPrivateGuard } from './private-files.ts';
 
 export type LeaseIdentity = { protocol: 2; token: string; pid: number; session: string };
 export type LeaseHeartbeat = { protocol: 2; token: string; heartbeat: number };
@@ -79,6 +80,8 @@ export class LeaseStateError extends Error {
   }
 }
 
+class HeartbeatReplaced extends LeaseStateError {}
+
 export class SchedulerLeaseStore {
   private readonly io: LeaseIO;
   private readonly alive: (pid: number) => boolean | null;
@@ -99,18 +102,28 @@ export class SchedulerLeaseStore {
       const identity = await this.selector();
       if (identity === null) return { kind: 'absent' };
 
-      await this.generationDirectoriesSafe(identity.token);
-      const generation = this.generationPath(identity.token);
-      const owner = identitySchema.parse(await this.readJson(join(generation, 'owner.json')));
-      const heartbeat = heartbeatSchema.parse(await this.readJson(join(generation, 'heartbeat.json')));
-      if (!sameIdentity(identity, owner) || heartbeat.token !== identity.token) throw errorForState();
+      for (let retry = 0; ; retry++) {
+        try {
+          await this.generationDirectoriesSafe(identity.token);
+          const generation = this.generationPath(identity.token);
+          const owner = identitySchema.parse(await this.readJson(join(generation, 'owner.json')));
+          const heartbeat = heartbeatSchema.parse(await this.readJson(join(generation, 'heartbeat.json'), true));
+          if (!sameIdentity(identity, owner) || heartbeat.token !== identity.token) throw errorForState();
 
-      const releasedBefore = await this.marker(identity);
-      const selectedAgain = await this.selector();
-      if (selectedAgain === null || !sameIdentity(identity, selectedAgain)) throw errorForState();
-      const releasedAfter = await this.marker(identity);
+          const releasedBefore = await this.marker(identity);
+          const selectedAgain = await this.selector();
+          if (selectedAgain === null || !sameIdentity(identity, selectedAgain)) throw errorForState();
+          const releasedAfter = await this.marker(identity);
 
-      return { kind: 'selected', identity, heartbeat, released: releasedBefore || releasedAfter };
+          return { kind: 'selected', identity, heartbeat, released: releasedBefore || releasedAfter };
+        } catch (error) {
+          // Only a private heartbeat inode replacement is retryable. Revalidate
+          // the entire captured generation, never adopt a successor selector.
+          if (!(error instanceof HeartbeatReplaced) || retry >= 2) throw error;
+          const selected = await this.selector();
+          if (!selected || !sameIdentity(identity, selected)) throw errorForState();
+        }
+      }
     } catch (error) {
       if (error instanceof LeaseStateError) throw error;
       throw errorForState();
@@ -532,8 +545,39 @@ export class SchedulerLeaseStore {
     await this.io.unlink(path);
   }
 
+  // Short dispatch reservation shared with release/takeover. A busy reservation
+  // is unconfirmed revocation, never permission to wait on external settlement.
+  async withGenerationGuard<T>(
+    token: string,
+    action: (assertGuard: () => Promise<void>) => Promise<T>,
+  ): Promise<T | null> {
+    await this.generationDirectoriesSafe(token);
+    return withPrivateGuard(
+      this.generationPath(token),
+      'effect-guard',
+      async (assertGuard) => {
+        const check = async () => {
+          await this.generationDirectoriesSafe(token);
+          await assertGuard();
+        };
+        await check();
+        return action(check);
+      },
+      { io: this.io },
+    );
+  }
+
   private async publishMarker(identity: LeaseIdentity): Promise<void> {
     if (!identitySchema.safeParse(identity).success) throw errorForState();
+    const published = await this.withGenerationGuard(identity.token, async (assertGuard) => {
+      await assertGuard();
+      await this.publishMarkerUnderGuard(identity);
+      return true;
+    });
+    if (!published) throw errorForState();
+  }
+
+  private async publishMarkerUnderGuard(identity: LeaseIdentity): Promise<void> {
     await this.generationDirectoriesSafe(identity.token);
     const owner = identitySchema.parse(await this.readJson(join(this.generationPath(identity.token), 'owner.json')));
     if (!sameIdentity(identity, owner)) throw errorForState();
@@ -674,10 +718,10 @@ export class SchedulerLeaseStore {
     await this.directorySafe(generation);
   }
 
-  private async readJson(path: string): Promise<unknown> {
+  private async readJson(path: string, heartbeat = false): Promise<unknown> {
     let handle: FileHandle | undefined;
     let value: unknown;
-    let failed = false;
+    let failure: unknown;
     try {
       const uid = process.getuid?.();
       if (uid === undefined) throw errorForState();
@@ -685,28 +729,31 @@ export class SchedulerLeaseStore {
       if (!before.isFile() || before.uid !== uid || (before.mode & 0o777) !== 0o600) throw errorForState();
       handle = await this.io.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
       const opened = await handle.stat();
-      if (
-        !opened.isFile() ||
-        opened.uid !== uid ||
-        (opened.mode & 0o777) !== 0o600 ||
-        opened.dev !== before.dev ||
-        opened.ino !== before.ino
-      ) {
+      if (!opened.isFile() || opened.uid !== uid || (opened.mode & 0o777) !== 0o600) {
         throw errorForState();
       }
+      if (opened.dev !== before.dev || opened.ino !== before.ino) {
+        throw heartbeat && before.nlink === 1 && opened.nlink === 1 ? new HeartbeatReplaced() : errorForState();
+      }
       value = JSON.parse(await handle.readFile('utf8')) as unknown;
-    } catch {
-      failed = true;
+      if (heartbeat) {
+        const after = await this.io.lstat(path);
+        if (!after.isFile() || after.uid !== uid || (after.mode & 0o777) !== 0o600) throw errorForState();
+        if (after.dev !== opened.dev || after.ino !== opened.ino)
+          throw after.nlink === 1 && opened.nlink === 1 ? new HeartbeatReplaced() : errorForState();
+      }
+    } catch (error) {
+      failure = error;
     } finally {
       if (handle !== undefined) {
         try {
           await handle.close();
         } catch {
-          failed = true;
+          failure = errorForState();
         }
       }
     }
-    if (failed) throw errorForState();
+    if (failure !== undefined) throw failure instanceof HeartbeatReplaced ? failure : errorForState();
     return value;
   }
 

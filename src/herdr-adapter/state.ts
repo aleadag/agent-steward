@@ -1,11 +1,13 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { z } from 'zod';
 import { compareRfc3339Timestamps } from '../timestamps.ts';
 import type { StopInput } from '../contracts.ts';
 import { SchedulerLeaseStore, type LeaseAttempt, type LeaseOptions } from './lease.ts';
+import { assertNoCredentials, configuredApiKeys } from '../privacy.ts';
+import { readPrivateJson, withPrivateGuard, writePrivateJson } from './private-files.ts';
 
 type Retry = StopInput['retry'];
 export type Episode = Retry & {
@@ -80,6 +82,10 @@ const approvalSchema = z.strictObject({
   recorded_at: timestamp,
 });
 
+export function parseEpisode(value: unknown): Episode {
+  return episodeSchema.parse(value);
+}
+
 export class CorruptEpisodeError extends Error {
   constructor() {
     super('invalid episode metadata');
@@ -108,6 +114,11 @@ function alive(pid: number): boolean | null {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ESRCH' ? false : null;
   }
+}
+export async function readEpisodeLockOwner(
+  path: string,
+): Promise<{ pid: number; token: string; session: string; heartbeat: number } | null> {
+  return owner(path);
 }
 async function owner(path: string): Promise<Owner | null> {
   try {
@@ -140,7 +151,7 @@ export class EpisodeStore {
   constructor(
     readonly directory: string,
     private readonly nowMilliseconds: () => number = () => Date.now(),
-    options: LeaseOptions = {},
+    private readonly options: LeaseOptions = {},
   ) {
     this.leases = new SchedulerLeaseStore(directory, () => this.prepare(), nowMilliseconds, options);
   }
@@ -216,6 +227,90 @@ export class EpisodeStore {
     if (episode.pane_id !== pane) throw new Error('episode pane mismatch');
     const metadata = Object.fromEntries(fields.map((field) => [field, episode[field]]));
     await this.atomic(join(this.directory, filename(pane)), metadata);
+  }
+  private sessionPath(agent: string, sessionId: string): string {
+    for (const value of [agent, sessionId]) {
+      identifier.parse(value);
+      // eslint-disable-next-line no-control-regex -- Native identifiers cannot contain controls.
+      if (/[\x00-\x1f\x7f]/.test(value)) throw new CorruptEpisodeError();
+    }
+    assertNoCredentials(
+      [agent, sessionId],
+      configuredApiKeys({
+        TYPESAFE_API_KEY: process.env.TYPESAFE_API_KEY,
+        OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
+      }),
+    );
+    return join(
+      this.directory,
+      `retry-session-${createHash('sha256')
+        .update(JSON.stringify([agent, sessionId]))
+        .digest('hex')}.json`,
+    );
+  }
+  private canonicalEpisode(value: unknown): Episode {
+    const parsed = parseEpisode(value);
+    for (const value of [parsed.session_id, parsed.failure_episode_id, parsed.error_evidence_digest]) {
+      // eslint-disable-next-line no-control-regex -- New canonical identifiers cannot contain ASCII controls.
+      if (/[\x00-\x1f\x7f]/.test(value)) throw new CorruptEpisodeError();
+    }
+    const serialized = assertNoCredentials(
+      parsed,
+      configuredApiKeys({
+        TYPESAFE_API_KEY: process.env.TYPESAFE_API_KEY,
+        OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
+      }),
+    );
+    if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') > 8192) throw new CorruptEpisodeError();
+    return parsed;
+  }
+  async sessionRetry(agent: string, sessionId: string): Promise<Episode | null> {
+    const path = this.sessionPath(agent, sessionId);
+    await this.prepare();
+    try {
+      const episode = this.canonicalEpisode(await readPrivateJson(path, 8192, this.options));
+      if (episode.session_id !== sessionId) throw new CorruptEpisodeError();
+      return episode;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw new CorruptEpisodeError();
+    }
+  }
+  async recordSessionRetry(agent: string, sessionId: string, episode: Episode): Promise<void> {
+    const path = this.sessionPath(agent, sessionId);
+    const parsed = this.canonicalEpisode(episode);
+    if (parsed.session_id !== sessionId) throw new CorruptEpisodeError();
+    await this.prepare();
+    const written = await withPrivateGuard(
+      this.directory,
+      `${basename(path)}.guard`,
+      async () => {
+        const previous = await this.sessionRetry(agent, sessionId);
+        if (
+          previous &&
+          (previous.pane_id !== parsed.pane_id ||
+            previous.failure_episode_id !== parsed.failure_episode_id ||
+            previous.error_evidence_digest !== parsed.error_evidence_digest ||
+            previous.first_observed_at !== parsed.first_observed_at ||
+            previous.attempt_count > parsed.attempt_count ||
+            previous.quota_check_count > parsed.quota_check_count ||
+            (previous.last_attempt_at !== null &&
+              (parsed.last_attempt_at === null ||
+                compareRfc3339Timestamps(previous.last_attempt_at, parsed.last_attempt_at) > 0)) ||
+            (previous.last_quota_check_at !== null &&
+              (parsed.last_quota_check_at === null ||
+                compareRfc3339Timestamps(previous.last_quota_check_at, parsed.last_quota_check_at) > 0)) ||
+            (previous.last_delivery_state !== 'none' && parsed.last_delivery_state === 'none') ||
+            (previous.last_delivery_state === 'human' && parsed.last_delivery_state !== 'human') ||
+            (previous.lifecycle_handoff_sent === true && parsed.lifecycle_handoff_sent !== true))
+        )
+          throw new CorruptEpisodeError();
+        await writePrivateJson(path, parsed, this.options);
+        return true;
+      },
+      this.options,
+    );
+    if (!written) throw new CorruptEpisodeError();
   }
   async approval(agent: string, session: string): Promise<ApprovalAttempt | null> {
     let raw: string;
@@ -331,7 +426,7 @@ export class EpisodeStore {
       }
     }
     const token = randomUUID();
-    await this.atomic(join(path, 'owner.json'), { pid: process.pid, token, session: '', heartbeat: Date.now() });
+    await this.atomic(join(path, 'owner.json'), { pid: process.pid, token, session: pane, heartbeat: Date.now() });
     try {
       return await action();
     } finally {
