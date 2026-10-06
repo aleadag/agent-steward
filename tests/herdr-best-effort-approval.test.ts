@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { approvalMenu } from '../src/herdr-adapter/best-effort-approval.ts';
 import { handleEvent, runEvent, socketReader, type EventDeps } from '../src/herdr-adapter/entry.ts';
 import { beginWorkflow } from '../src/herdr-adapter/authority.ts';
 import { workflowEventDeps } from '../src/herdr-adapter/events.ts';
@@ -512,6 +513,57 @@ for (const [name, text] of [
     }
   });
 }
+
+const agyUnzipMenu = `● Bash(unzip -l sentinel/android/app/build/outputs/apk/...) (ctrl+o to
+expand)
+
+Command
+────────────────────────────────────────────────────────────────────────────
+
+Requesting permission for:
+   unzip -l
+sentinel/android/app/build/outputs/apk/release/app-release-unsigned.ap
+k
+
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation for commands that start with
+'unzip'
+  3. Yes, and always allow for commands that start with 'unzip' (Persist to
+settings.json)
+  4. No, cancel
+
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
+🔧 TOOL ╱ Gemini 3.8 Flash (Medium)
+ctx ░·············· 3.1% · tasks 0`;
+
+test('AGY wrapped unzip permission menu is recognized', () => {
+  const menu = approvalMenu(agyUnzipMenu);
+  assert.ok(menu);
+  assert.equal(menu.kind, 'approve_command');
+  assert.match(menu.action, /unzip -l/);
+});
+
+test('AGY wrapped unzip permission menu can send only 1', async () => {
+  const f = await fixture();
+  try {
+    // observeStop rejects excerpts over 12 lines; keep the wrapped choices.
+    f.changeText(`Requesting permission for:
+   unzip -l
+sentinel/android/app/build/outputs/apk/release/app-release-unsigned.apk
+
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation for commands that start with
+'unzip'
+  3. Yes, and always allow for commands that start with 'unzip' (Persist to settings.json)
+  4. No, cancel`);
+    await f.run();
+    assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+  } finally {
+    await f.cleanup();
+  }
+});
 
 // Catches ignoring a dialog or occupant change after the expensive assessment.
 for (const boundary of ['dialog', 'session', 'control', 'lease', 'shutdown'] as const) {

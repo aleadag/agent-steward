@@ -4,6 +4,44 @@ import { observeStop, type ObservedStop } from './observe.ts';
 import type { EventDeps } from './events.ts';
 import type { ApprovalAttempt } from './state.ts';
 
+function isPermissionChrome(line: string): boolean {
+  if (!line) return true;
+  if (line === 'Command' || line === 'expand)' || /^expand\)$/.test(line)) return true;
+  if (/^(?:●\s*)?Bash\(/.test(line)) return true;
+  if (/ctrl\+o to expand/i.test(line) || /ctrl\+o to$/i.test(line)) return true;
+  if (/^[─━═\-|]+$/.test(line)) return true;
+  return false;
+}
+
+function isPermissionFooter(line: string): boolean {
+  return /^↑\/↓ Navigate(?: · [^?]*)?$/.test(line) || /^(?:🔧 )?TOOL(?:[ ·╱][^?]*)?$/.test(line) || /^ctx\b/.test(line);
+}
+
+function foldPermissionRows(lines: string[]): string[] {
+  const rows: string[] = [];
+  let current: string | null = null;
+  const flush = () => {
+    if (current) rows.push(current);
+    current = null;
+  };
+  for (const line of lines) {
+    if (!line) continue;
+    if (/^(?:>\s*)?\d+\. /.test(line)) {
+      flush();
+      current = line.replace(/^>\s*/, '');
+      continue;
+    }
+    if (current && !current.endsWith('No, cancel') && !isPermissionFooter(line)) {
+      current = `${current} ${line}`;
+      continue;
+    }
+    flush();
+    rows.push(line);
+  }
+  flush();
+  return rows;
+}
+
 // Recognize an explicit one-time control, not a bare "1", yes/no question,
 // persistent grant, trust or setup prompt. Text is best-effort evidence only.
 export function approvalMenu(context: string): { action: string; kind: 'approve_command' | 'approve_edit' } | null {
@@ -13,7 +51,7 @@ export function approvalMenu(context: string): { action: string; kind: 'approve_
   const ones = lines.filter((line) => /^(?:>\s*)?1\./.test(line));
   if (headers.length !== 1 || questions.length !== 1 || ones.length !== 1) return null;
   const header = lines.indexOf('Requesting permission for:');
-  if (header < 0 || lines.slice(0, header).some((line) => line !== '')) return null;
+  if (header < 0 || lines.slice(0, header).some((line) => !isPermissionChrome(line))) return null;
   const question = lines.indexOf(questions[0]!);
   const command = questions[0] === 'Run this command?';
   const control = command ? '1. Yes, run command' : '1. Yes, apply edit';
@@ -22,12 +60,12 @@ export function approvalMenu(context: string): { action: string; kind: 'approve_
   if (one <= question || lines.slice(question + 1, one).some((line) => line !== '')) return null;
   let choice = 1;
   let cancelled = false;
-  for (const line of lines.slice(one)) {
+  for (const line of foldPermissionRows(lines.slice(one))) {
     if (!line) continue;
     if (cancelled) {
       // Unknown suffixes may be another dialog owning the keyboard. Only the
       // recognized navigation/status footer may follow the complete menu.
-      if (!/^↑\/↓ Navigate(?: · [^?]*)?$/.test(line) && !/^(?:🔧 )?TOOL(?:[ ·╱][^?]*)?$/.test(line)) return null;
+      if (!isPermissionFooter(line)) return null;
       continue;
     }
     const row = /^(?:>\s*)?(\d+)\. (Yes, .+|No, cancel)$/.exec(line);
