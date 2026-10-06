@@ -65,9 +65,12 @@ agent-steward router list --json
 agent-steward router show "generated-id" --json
 agent-steward --config ./config.json quota refresh --json
 agent-steward --config ./config.json stop check < stopped-state.json
+agent-steward stop list
+agent-steward stop list --json
+agent-steward stop show "generated-id" --json
 ```
 
-The first `router start` command launches the selected native agent in the foreground; the next returns a JSON route preview without launching. The `--` separator ends option parsing. The `router start --dry-run --` command previews the literal task `--help`; text after the separator is never treated as a CLI option. For doctor, start, stop, quota refresh, and quota show, `--config <path>` can appear before or after command tokens, before the separator. List and show reject `--config`. Each route task is exactly one argument; quote multiword tasks. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
+The first `router start` command launches the selected native agent in the foreground; the next returns a JSON route preview without launching. The `--` separator ends option parsing. The `router start --dry-run --` command previews the literal task `--help`; text after the separator is never treated as a CLI option. For doctor, start, stop, quota refresh, and quota show, `--config <path>` can appear before or after command tokens, before the separator. Router and stop list and show reject `--config`. Each route task is exactly one argument; quote multiword tasks. `stop check` reads one user-prepared version-2 observation from stdin and always writes JSON. It does not discover the stopped agent or create the input file; [`examples/stop.json`](examples/stop.json) shows the input shape.
 
 ### Local installation checks
 
@@ -101,6 +104,14 @@ The ledger is `$XDG_STATE_HOME/agent-steward/router.jsonl`, or `$HOME/.local/sta
 History reads and writes share a local-filesystem lock (`router.jsonl.lock`) and wait up to five seconds for it. Normal errors release the lock, but a forcibly killed process can leave it behind. Remove the empty lock directory with `rmdir` only after confirming no history operation is still running; age alone does not prove a lock is stale.
 
 Records fold by Jev's `request_id`, not a workflow or native session ID. Events are `dry-run`, `launched`, `launch-failed`, `evaluation_failed`, and `exited`. `exited` means the foreground native process returned, not that its assigned job succeeded.
+
+### Local stop history
+
+`stop list` and `stop show` read local stop history without config or Jev, never store pane/context, and are not delivery proof.
+
+`stop list` shows the latest 20 recorded stop assessments; `--limit <n>` changes the display without pruning history. `stop show <request-id>` shows the folded decision fields and latest event. Both commands support `--json` and read local history without loading config, requiring credentials, or calling Jev. A missing ledger gives an empty list; an unknown request ID exits 2 with `agent-steward: not_found` on stderr.
+
+The ledger is `$XDG_STATE_HOME/agent-steward/stop.jsonl`, or `$HOME/.local/state/agent-steward/stop.jsonl` when XDG state is unset. Retained history uses the same 5 MiB rotation rules as route history. Events record credential-checked assessment fields and evaluator usage, never pane IDs, session IDs, context, or instruction text.
 
 ### Foreground native launch (alpha)
 

@@ -25,6 +25,9 @@ agent-steward --config ./config.json quota show --json
 agent-steward quota setup agy
 agent-steward quota hook agy
 agent-steward --config ./config.json stop check < stopped-state.json
+agent-steward stop list
+agent-steward stop list --json
+agent-steward stop show "generated-id" --json
 ```
 
 The `--` separator ends option parsing. Everything after it is one task argument, so `--help` in the `router start --dry-run --` form is task text. Without the separator, give the task as one shell argument, normally by quoting it. The `stopped-state.json` file in the final form is user-prepared; the CLI does not discover or create it. [`examples/stop.json`](../../examples/stop.json) shows its version-2 shape.
@@ -40,6 +43,12 @@ Doctor needs no TTY and performs no network calls, agent launches, native auth-s
 `router list` and `router show` read local history without config, credentials, or Jev. List defaults to 20 folded records; `--limit <n>` changes display only. The ledger ID is Jev's `request_id`, not a workflow or native session ID. `exited` means the native process returned, not that the assigned job succeeded. Missing history yields an empty list; an unknown ID yields `agent-steward: not_found` and exit 2.
 
 Events are stored in `$XDG_STATE_HOME/agent-steward/router.jsonl`, falling back to `$HOME/.local/state/agent-steward/router.jsonl`, with directory mode `0700` and file mode `0600`. History stores credential-checked decision fields and evaluator usage, never tasks/prompts, keys, pane IDs, PIDs, or planned-command displays.
+
+## Inspect recorded stop decisions
+
+`stop list` and `stop show` read local stop history without config or Jev, never store pane/context, and are not delivery proof. List defaults to 20 folded records; `--limit <n>` changes display only. Missing history yields an empty list; an unknown ID yields `agent-steward: not_found` and exit 2.
+
+Events are stored in `$XDG_STATE_HOME/agent-steward/stop.jsonl`, falling back to `$HOME/.local/state/agent-steward/stop.jsonl`, with directory mode `0700` and file mode `0600`. History stores credential-checked stop assessment fields and evaluator usage, never pane IDs, session IDs, context, or instruction text.
 
 ## Show captured quota
 

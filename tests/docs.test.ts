@@ -36,6 +36,8 @@ function parseUsageForm(line: string): Invocation {
   form = form.replace('router start --dry-run -- <task>', 'router start --dry-run -- --help');
   form = form.replace('router list [--limit <n>]', 'router list');
   form = form.replace('router show <request-id> [--json]', 'router show "generated-id" --json');
+  form = form.replace('stop list [--limit <n>]', 'stop list');
+  form = form.replace('stop show <request-id> [--json]', 'stop show "generated-id" --json');
   form = form.replace('stop check < stopped-state.json', 'stop check');
   form = form.replace('doctor [--json]', 'doctor --json');
   form = form.replace('quota refresh [--json]', 'quota refresh --json');
@@ -136,6 +138,9 @@ test('bundled skill command forms match parsed actual CLI help and parser behavi
       'quota-setup-agy',
       'quota-hook-agy',
       'stop',
+      'stop-list',
+      'stop-list',
+      'stop-show',
     ],
   );
   const routes = invocations.filter((item) => item.kind === 'route');
@@ -165,6 +170,10 @@ test('command-form parity detects meaningful invocation drift', () => {
     ['router list --json', 'router list'],
     ['router show generated-id --json', 'router show generated-id'],
     ['router show generated-id', 'router show other-id'],
+    ['stop list --limit 5', 'stop list --limit 6'],
+    ['stop list --json', 'stop list'],
+    ['stop show generated-id --json', 'stop show generated-id'],
+    ['stop show generated-id', 'stop show other-id'],
     ['--config ./config.json quota refresh --json', '--config ./config.json quota refresh'],
     ['--config ./config.json quota refresh', 'quota refresh'],
     ['--config ./config.json stop check', 'stop check'],
@@ -274,6 +283,8 @@ test('skill is harness-agnostic and has no Herdr launcher recipe', () => {
   assert.match(skill, /router list/);
   assert.match(skill, /router show/);
   assert.match(skill, /stop check/);
+  assert.match(skill, /stop list/);
+  assert.match(skill, /stop show/);
   assert.match(skill, /never type the CLI into a shell/i);
 });
 
