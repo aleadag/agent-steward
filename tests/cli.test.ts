@@ -2020,3 +2020,169 @@ test('parse failures default to a JSON envelope and do not leak arguments', asyn
   assert.equal(result(out).reason_code, 'invalid_input');
   assert.doesNotMatch(out.join('') + err.join(''), /sensitive-task/);
 });
+
+test('stop check records assessed history without pane or context', async () => {
+  const { io, out, files } = runtime({
+    env: { HOME: '/isolated/home' },
+    readStdin: async () =>
+      JSON.stringify(
+        stopInput({ context: null, agent: { id: 'agent-1', tool: 'agy', pane_id: 'w3:p1', session_id: null } }),
+      ),
+    post: async () => {
+      throw new Error('must not evaluate');
+    },
+  });
+  assert.equal(await run(['stop', 'check'], io), 2);
+  assert.equal(result(out).reason_code, 'insufficient_context');
+  const text = files.get('/isolated/home/.local/state/agent-steward/stop.jsonl') ?? '';
+  assert.equal(files.has('/isolated/home/.local/state/agent-steward/router.jsonl'), false);
+  assert.doesNotMatch(text, /w3:p1|agent-1|Current prompt|pending_action/);
+  const [event] = text
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  assert.equal(event.event, 'assessed');
+  assert.equal(event.tool, 'agy');
+  assert.equal(event.action, 'manual_review');
+  assert.equal(event.reason_code, 'insufficient_context');
+  assert.equal(event.request_id, 'request-1');
+});
+
+test('stop check omits non-enum tools and survives ledger write failure', async () => {
+  const { io, out, files } = runtime({
+    env: { HOME: '/isolated/home' },
+    readStdin: async () =>
+      JSON.stringify(
+        stopInput({ context: null, agent: { id: 'agent-1', tool: '/not-a-tool', pane_id: 'w3:p1', session_id: null } }),
+      ),
+    appendText: async () => {
+      throw new Error('disk full');
+    },
+  });
+  assert.equal(await run(['stop', 'check'], io), 2);
+  assert.equal(result(out).reason_code, 'insufficient_context');
+  assert.equal(files.size, 0);
+});
+
+test('stop check records evaluated assessment with action and usage without instruction text or not_before', async () => {
+  const { post } = fakePost((wire) => stopAnswer(wire, 'recoverable_api_error', 0.1));
+  const { io, out, files } = runtime({
+    env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
+    readStdin: async () =>
+      JSON.stringify(
+        stopInput({
+          agent: { id: 'agent-1', tool: 'codex', pane_id: 'w1:p1', session_id: null },
+          status: 'blocked',
+        }),
+      ),
+    now: () => new Date('2026-09-29T10:00:00Z'),
+    post,
+  });
+  assert.equal(await run(['stop', 'check'], io), 0);
+  assert.equal(result(out).decision, 'stop_decision');
+  assert.equal(result(out).proposed_action.kind, 'send_recovery_instruction');
+  const text = files.get('/isolated/home/.local/state/agent-steward/stop.jsonl') ?? '';
+  assert.equal(files.has('/isolated/home/.local/state/agent-steward/router.jsonl'), false);
+  assert.doesNotMatch(
+    text,
+    /"instruction"|not_before|preceding operation|Retry the current API operation|w1:p1|agent-1/,
+  );
+  const [event] = text
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  assert.equal(event.event, 'assessed');
+  assert.equal(event.tool, 'codex');
+  assert.equal(event.action, 'send_recovery_instruction');
+  assert.equal(event.reason_code, 'recoverable_api_error');
+  assert.equal(event.request_id, 'request-1');
+  assert.deepEqual(event.usage, { input_tokens: 12, output_tokens: 3 });
+});
+
+test('stop check records failed event on invalid input without leaking stdin', async () => {
+  const secret = 'SUPER_SECRET_PAYLOAD_12345';
+  const { io, out, files } = runtime({
+    env: { HOME: '/isolated/home' },
+    readStdin: async () => `{"request_id":"req-bad","invalid_json": "${secret}", broken`,
+  });
+  assert.equal(await run(['stop', 'check'], io), 1);
+  assert.equal(result(out).schema_version, 2);
+  assert.equal(result(out).reason_code, 'invalid_input');
+  const text = files.get('/isolated/home/.local/state/agent-steward/stop.jsonl') ?? '';
+  assert.doesNotMatch(text, new RegExp(secret));
+  const [event] = text
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  assert.equal(event.event, 'failed');
+  assert.equal(event.reason_code, 'invalid_input');
+  assert.equal(event.request_id, null);
+});
+
+test('stop list and show parse local-only options', () => {
+  assert.deepEqual(parseArgs(['stop', 'list']), { kind: 'stop-list', limit: 20, json: false });
+  assert.deepEqual(parseArgs(['stop', 'list', '--limit', '3', '--json']), { kind: 'stop-list', limit: 3, json: true });
+  assert.deepEqual(parseArgs(['stop', 'show', 'req-1']), { kind: 'stop-show', requestId: 'req-1', json: false });
+  for (const args of [
+    ['--config', 'c.json', 'stop', 'list'],
+    ['stop', 'show', 'req-1', '--config', 'c.json'],
+    ['stop', 'list', '--limit', '0'],
+    ['stop', 'show'],
+  ])
+    assert.throws(() => parseArgs(args));
+});
+
+test('stop list is empty when only router history exists', async () => {
+  const { io, out, err } = runtime({
+    env: { HOME: '/isolated/home' },
+    readTextIfPresent: async (file) =>
+      file.endsWith('router.jsonl')
+        ? '{"schema_version":1,"request_id":"r1","recorded_at":"2026-10-06T00:00:00.000Z","event":"dry-run"}\n'
+        : null,
+  });
+  assert.equal(await run(['stop', 'list'], io), 0);
+  assert.equal(out.join(''), '');
+  assert.equal(await run(['stop', 'show', 'r1'], io), 2);
+  assert.equal(err.join(''), 'agent-steward: not_found\n');
+});
+
+test('router list is empty when only stop history exists', async () => {
+  const { io, out, err } = runtime({
+    env: { HOME: '/isolated/home' },
+    readTextIfPresent: async (file) =>
+      file.endsWith('stop.jsonl')
+        ? '{"schema_version":1,"request_id":"s1","recorded_at":"2026-10-06T00:00:00.000Z","event":"assessed","reason_code":"done"}\n'
+        : null,
+  });
+  assert.equal(await run(['router', 'list'], io), 0);
+  assert.equal(out.join(''), '');
+  assert.equal(await run(['router', 'show', 's1'], io), 2);
+  assert.equal(err.join(''), 'agent-steward: not_found\n');
+});
+
+test('stop list --json and stop show inspect recorded stop check history', async () => {
+  const { io, out } = runtime({
+    env: { HOME: '/isolated/home' },
+    readStdin: async () =>
+      JSON.stringify(
+        stopInput({
+          request_id: 'req-check-1',
+          context: null,
+          agent: { id: 'agent-1', tool: 'codex', pane_id: 'w1:p1', session_id: null },
+        }),
+      ),
+  });
+  assert.equal(await run(['stop', 'check'], io), 2);
+  out.length = 0;
+
+  assert.equal(await run(['stop', 'list', '--json'], io), 0);
+  const listed = JSON.parse(out.join(''));
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].request_id, 'req-check-1');
+  out.length = 0;
+
+  assert.equal(await run(['stop', 'show', 'req-check-1'], io), 0);
+  const shown = JSON.parse(out.join(''));
+  assert.equal(shown.request_id, 'req-check-1');
+  assert.equal(shown.event, 'assessed');
+});

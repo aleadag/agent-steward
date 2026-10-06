@@ -19,6 +19,7 @@ import { assertLiveTask, buildNativeLaunch } from './launch.ts';
 import type { NativeLaunch } from './launch.ts';
 import { appendEvent, readLedger, formatLedgerRecords } from './ledger.ts';
 import type { LedgerEventKind, LedgerRuntime } from './ledger.ts';
+import { appendStopEvent, stopTool, readStopLedger, formatStopLedgerRecords } from './stop-ledger.ts';
 import type { AgyHookResult } from './agy-hook.ts';
 
 export type Invocation =
@@ -29,6 +30,8 @@ export type Invocation =
   | { kind: 'route'; config?: string; task: string; dryRun: boolean; json: boolean }
   | { kind: 'list'; limit: number; json: boolean }
   | { kind: 'show'; requestId: string; json: boolean }
+  | { kind: 'stop-list'; limit: number; json: boolean }
+  | { kind: 'stop-show'; requestId: string; json: boolean }
   | { kind: 'stop'; config?: string }
   | { kind: 'quota-refresh'; config?: string; json: boolean }
   | { kind: 'quota-show'; config?: string; json: boolean };
@@ -78,6 +81,9 @@ Usage:
   agent-steward quota setup agy
   agent-steward quota hook agy
   agent-steward [--config <path>] stop check < stopped-state.json
+  agent-steward stop list [--limit <n>]
+  agent-steward stop list --json
+  agent-steward stop show <request-id> [--json]
 
 Live router start requires terminal input and output and launches the selected native agent in the foreground.
 Live starts do not support --json. Dry-run prints a route preview without launching; --json returns that preview as JSON.
@@ -93,6 +99,7 @@ Routing reads snapshots only. Show/refresh/setup/hook need no Jev key or caller 
 Doctor checks local config, PATH, required executables and evaluator key presence only.
 Doctor does not read native auth stores, contact providers, launch agents or change files.
 Stop check reads JSON from stdin and writes a version-2 JSON result.
+Stop list/show read local stop history without config or Jev, never store pane/context, and are not delivery proof.
 `;
 
 const DIAGNOSTICS: Record<string, string> = {
@@ -164,6 +171,35 @@ export function parseArgs(argv: readonly string[]): Invocation {
     if (kind === 'list') return { kind, limit, json };
     if (requestId === undefined) invalidInput();
     return { kind: 'show', requestId, json };
+  }
+
+  if (commandTokens[0] === 'stop' && (commandTokens[1] === 'list' || commandTokens[1] === 'show')) {
+    if (config !== undefined || separator >= 0) invalidInput();
+    const kind = commandTokens[1];
+    let json = false;
+    let limit = 20;
+    let requestId: string | undefined;
+    let hasLimit = false;
+    for (let index = 2; index < commandTokens.length; index++) {
+      const token = commandTokens[index]!;
+      if (token === '--json') {
+        if (json) invalidInput();
+        json = true;
+      } else if (kind === 'list' && token === '--limit') {
+        if (hasLimit) invalidInput();
+        hasLimit = true;
+        const value = commandTokens[++index];
+        if (value === undefined || !/^[1-9]\d*$/.test(value)) invalidInput();
+        limit = Number(value);
+        if (!Number.isSafeInteger(limit)) invalidInput();
+      } else if (kind === 'show' && !token.startsWith('-') && token.trim() && requestId === undefined) {
+        requestId = token;
+      } else invalidInput();
+    }
+    if (help) return { kind: 'help' };
+    if (kind === 'list') return { kind: 'stop-list', limit, json };
+    if (requestId === undefined) invalidInput();
+    return { kind: 'stop-show', requestId, json };
   }
 
   if (commandTokens[0] === 'doctor') {
@@ -499,6 +535,39 @@ function renderQuota(buckets: Awaited<ReturnType<typeof inspectQuota>>, now: Dat
   return `${lines.join('\n')}\n`;
 }
 
+async function recordStopHistory(
+  runtime: Runtime,
+  result: StopResult | ErrorResult,
+  tool: string | undefined,
+): Promise<void> {
+  try {
+    const knownTool = tool === undefined ? undefined : stopTool(tool);
+    if (result.decision === 'stop_decision') {
+      await appendStopEvent(runtime, {
+        schema_version: 1,
+        request_id: result.request_id,
+        recorded_at: runtime.now().toISOString(),
+        event: 'assessed',
+        ...(knownTool === undefined ? {} : { tool: knownTool }),
+        action: result.proposed_action.kind,
+        reason_code: result.reason_code,
+        ...(result.evaluation?.usage === undefined ? {} : { usage: result.evaluation.usage }),
+      });
+    } else {
+      await appendStopEvent(runtime, {
+        schema_version: 1,
+        request_id: result.request_id,
+        recorded_at: runtime.now().toISOString(),
+        event: 'failed',
+        ...(knownTool === undefined ? {} : { tool: knownTool }),
+        reason_code: result.reason_code,
+      });
+    }
+  } catch {
+    /* history is best-effort */
+  }
+}
+
 export async function run(argv: readonly string[], runtime: Runtime): Promise<number> {
   let invocation: Invocation;
   try {
@@ -534,6 +603,27 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
         const listed = records.slice(0, invocation.limit);
         if (invocation.json) runtime.stdout(`${JSON.stringify(listed)}\n`);
         else if (listed.length > 0) runtime.stdout(formatLedgerRecords(listed, runtime.now()));
+      } else {
+        const record = records.find((record) => record.request_id === invocation.requestId);
+        if (record === undefined) {
+          runtime.stderr('agent-steward: not_found\n');
+          return 2;
+        }
+        runtime.stdout(invocation.json ? `${JSON.stringify(record)}\n` : `${JSON.stringify(record, null, 2)}\n`);
+      }
+      return 0;
+    } catch (error) {
+      return emitError(runtime, error, null, readOptionalApiKey(runtime), true);
+    }
+  }
+
+  if (invocation.kind === 'stop-list' || invocation.kind === 'stop-show') {
+    try {
+      const records = await readStopLedger(runtime);
+      if (invocation.kind === 'stop-list') {
+        const listed = records.slice(0, invocation.limit);
+        if (invocation.json) runtime.stdout(`${JSON.stringify(listed)}\n`);
+        else if (listed.length > 0) runtime.stdout(formatStopLedgerRecords(listed, runtime.now()));
       } else {
         const record = records.find((record) => record.request_id === invocation.requestId);
         if (record === undefined) {
@@ -670,8 +760,8 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
   let routeDecisionKnown = false;
   const humanRoute = invocation.kind === 'route' && !invocation.json;
   let stage: FailureDiagnostics['stage'] = 'input';
+  let stopInput: StopInput | undefined;
   try {
-    let stopInput: StopInput | undefined;
     if (invocation.kind === 'stop') {
       stopInput = await readStopInput(
         runtime,
@@ -749,6 +839,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
         safeResult = safeStopError(safeFailure, requestId, apiKey);
       }
       emitJson(runtime, safeResult);
+      await recordStopHistory(runtime, safeResult, stopInput?.agent.tool);
       return decisionExitCode(safeResult);
     }
 
@@ -811,7 +902,9 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       error instanceof StewardError && error.diagnostics !== undefined ? error.diagnostics : { stage },
     );
     if (invocation.kind === 'stop') {
-      emitJson(runtime, safeStopError(failure, requestId, apiKey));
+      const safeResult = safeStopError(failure, requestId, apiKey);
+      emitJson(runtime, safeResult);
+      await recordStopHistory(runtime, safeResult, stopInput?.agent.tool);
       return 1;
     }
     try {
