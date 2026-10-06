@@ -177,12 +177,12 @@ export function validateEvaluation(raw: unknown, questions: Questions): Evaluati
     const maximum = Math.max(...probabilities);
     if (maximum === 0) throw invalidResponse('schema', { ...context, option_count: options.length });
     const choicePresent = Object.hasOwn(answer.probabilities, answer.choice);
-    if (!choicePresent || answer.probabilities[answer.choice] !== maximum) {
+    if (!choicePresent) {
       throw invalidResponse('choice_mismatch', {
         ...context,
         expected: maximum,
-        actual: choicePresent ? answer.probabilities[answer.choice]! : null,
-        choice_present: choicePresent,
+        actual: null,
+        choice_present: false,
         option_count: options.length,
         maximum_count: probabilities.filter((value) => value === maximum).length,
       });
@@ -193,7 +193,7 @@ export function validateEvaluation(raw: unknown, questions: Questions): Evaluati
 
 export function choiceWinner(
   answer: import('./contracts.ts').ChoiceAnswer,
-  order: readonly string[],
+  _order: readonly string[],
 ): {
   winner: string;
   tied: boolean;
@@ -202,9 +202,33 @@ export function choiceWinner(
   if (probabilities.length === 0) throw invalidResponse();
   const maximum = Math.max(...probabilities);
   const maxima = Object.keys(answer.probabilities).filter((key) => answer.probabilities[key] === maximum);
-  const winner = order.find((key) => Object.hasOwn(answer.probabilities, key) && answer.probabilities[key] === maximum);
-  if (winner === undefined) throw invalidResponse();
-  return { winner, tied: maxima.length > 1 };
+  if (!Object.hasOwn(answer.probabilities, answer.choice)) throw invalidResponse();
+  return { winner: answer.choice, tied: maxima.length > 1 };
+}
+
+export function labeledChoiceMismatch(
+  answer: import('./contracts.ts').ChoiceAnswer,
+  evaluationIndex: number,
+  questionIndex = 0,
+): FailureDiagnostics | undefined {
+  const probabilities = Object.values(answer.probabilities);
+  if (probabilities.length === 0 || !Object.hasOwn(answer.probabilities, answer.choice)) return undefined;
+  const maximum = Math.max(...probabilities);
+  const actual = answer.probabilities[answer.choice]!;
+  if (actual === maximum) return undefined;
+  return {
+    stage: 'response',
+    kind: 'choice_mismatch',
+    details: {
+      evaluation_index: evaluationIndex,
+      question_index: questionIndex,
+      expected: maximum,
+      actual,
+      choice_present: true,
+      option_count: probabilities.length,
+      maximum_count: probabilities.filter((value) => value === maximum).length,
+    },
+  };
 }
 
 function mapInputError(error: unknown): never {

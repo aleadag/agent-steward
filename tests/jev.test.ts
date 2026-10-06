@@ -165,18 +165,25 @@ test('evaluation validation rejects incomplete, extra, or wrong-type answer sets
     assertStewardCode(() => validateEvaluation(value, requestedQuestions()), 'invalid_response');
 });
 
-test('evaluation validation requires exact choice options and a maximal returned choice', () => {
+test('evaluation validation requires exact choice options and a known returned choice', () => {
   const good = validResponse();
   choiceIn(good, 'pair').probabilities = { alpha: 0.75, beta: 0.25, extra: 0 };
   const missing = validResponse();
   choiceIn(missing, 'pair').probabilities = { alpha: 1 };
-  const nonMaximum = validResponse();
-  choiceIn(nonMaximum, 'pair').choice = 'beta';
   const unknownChoice = validResponse();
   choiceIn(unknownChoice, 'pair').choice = 'invented';
-  for (const value of [good, missing, nonMaximum, unknownChoice]) {
+  for (const value of [good, missing, unknownChoice]) {
     assertStewardCode(() => validateEvaluation(value, requestedQuestions()), 'invalid_response');
   }
+});
+
+test('evaluation validation accepts a present non-maximal labeled choice', () => {
+  const response = validResponse();
+  choiceIn(response, 'pair').choice = 'beta';
+  const parsed = validateEvaluation(response, requestedQuestions());
+  assert.equal(choiceIn(parsed, 'pair').choice, 'beta');
+  assert.equal(choiceIn(parsed, 'pair').probabilities.beta, 0.25);
+  assert.equal(choiceIn(parsed, 'pair').probabilities.alpha, 0.75);
 });
 
 test('choice scores reject all-zero, out-of-range and nonfinite values', () => {
@@ -311,10 +318,9 @@ test('confidence, Noul risk, resolved model, usage and token counters are all va
   for (const value of bad) assertStewardCode(() => validateEvaluation(value, requestedQuestions()), 'invalid_response');
 });
 
-test('choice ties use supplied order even when integer-like keys enumerate differently', () => {
-  const answer = choiceAnswer({ 2: 0.5, 10: 0.5 }, 0.8, '2');
-  assert.deepEqual(choiceWinner(answer, ['10', '2']), { winner: '10', tied: true });
-  assert.deepEqual(choiceWinner(choiceAnswer({ 2: 0.8, 10: 0.2 }), ['10', '2']), { winner: '2', tied: false });
+test('choice ranking follows the labeled choice when it is not the maximum', () => {
+  const answer = choiceAnswer({ alpha: 0.31, beta: 0.3 }, 0.9, 'beta');
+  assert.deepEqual(choiceWinner(answer, ['alpha', 'beta']), { winner: 'beta', tied: false });
 });
 
 test('prototype-like question and option IDs survive API and evaluation contract parsing', () => {
@@ -553,7 +559,7 @@ test('response diagnostics identify failed checks without exposing response valu
     [
       'choice_mismatch',
       (value: Record<string, unknown>) => {
-        rawAnswer(value, 'pair').choice = 'beta';
+        rawAnswer(value, 'pair').choice = 'invented';
       },
     ],
   ] as const) {

@@ -40,23 +40,25 @@ test('all-zero score diagnostics report question position without exposing label
   assert.deepEqual(result?.details, { question_index: 1, option_count: 2 });
 });
 
-test('choice diagnostics distinguish lower probability, missing choice and tied maxima', () => {
-  for (const [probabilities, choice, actual, present, maximumCount] of [
-    [{ private_alpha: 0.75, private_beta: 0.25 }, 'private_beta', 0.25, true, 1],
-    [{ private_alpha: 0.75, private_beta: 0.25 }, 'private_unknown', null, false, 1],
-    [{ private_alpha: 0.5, private_beta: 0.5 }, 'private_unknown', null, false, 2],
+test('choice diagnostics distinguish missing choice and tied maxima', () => {
+  for (const [probabilities, maximumCount] of [
+    [{ private_alpha: 0.75, private_beta: 0.25 }, 1],
+    [{ private_alpha: 0.5, private_beta: 0.5 }, 2],
   ] as const) {
-    const result = diagnostics(response(probabilities, choice));
+    const result = diagnostics(response(probabilities, 'private_unknown'));
     assert.equal(result?.kind, 'choice_mismatch');
     assert.deepEqual(result?.details, {
       question_index: 1,
       expected: maximumCount === 2 ? 0.5 : 0.75,
-      actual,
-      choice_present: present,
+      actual: null,
+      choice_present: false,
       option_count: 2,
       maximum_count: maximumCount,
     });
   }
+  assert.doesNotThrow(() =>
+    validateEvaluation(response({ private_alpha: 0.75, private_beta: 0.25 }, 'private_beta'), questions),
+  );
   for (const choice of ['private_alpha', 'private_beta']) {
     assert.doesNotThrow(() =>
       validateEvaluation(response({ private_alpha: 0.5, private_beta: 0.5 }, choice), questions),
@@ -100,7 +102,7 @@ test('both provider adapters preserve check details and index successive HTTP ev
         return {
           status: 200,
           body: JSON.stringify(
-            calls === 1 ? response({ private_alpha: 0.79, private_beta: 0.2 }) : response(undefined, 'private_beta'),
+            calls === 1 ? response({ private_alpha: 0.79, private_beta: 0.2 }) : response(undefined, 'private_unknown'),
           ),
         };
       },
@@ -115,8 +117,8 @@ test('both provider adapters preserve check details and index successive HTTP ev
         evaluation_index: 1,
         question_index: 1,
         expected: 0.75,
-        actual: 0.25,
-        choice_present: true,
+        actual: null,
+        choice_present: false,
         option_count: 2,
         maximum_count: 1,
       });
@@ -156,7 +158,7 @@ test('local input rejection does not advance the HTTP evaluation index', async (
   const evaluate = makeEvaluator({
     model: 'test-model',
     apiKey: 'SyntheticPrivateKey',
-    post: async () => ({ status: 200, body: JSON.stringify(response(undefined, 'private_beta')) }),
+    post: async () => ({ status: 200, body: JSON.stringify(response(undefined, 'private_unknown')) }),
   });
   await assert.rejects(
     evaluate({ task: 'SyntheticPrivateKey' }, questions),

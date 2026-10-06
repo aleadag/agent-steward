@@ -200,7 +200,7 @@ test('custom thresholds and probability endpoints are applied exactly', async ()
   });
 });
 
-test('tied maxima require review and stable local order chooses the recorded classification', async () => {
+test('tied maxima require review and labeled choice is the recorded classification', async () => {
   const probabilities = Object.fromEntries(
     WAITING_FOR.map((key) => [key, key === 'approve_command' || key === 'approve_edit' ? 0.5 : 0]),
   );
@@ -215,8 +215,26 @@ test('tied maxima require review and stable local order chooses the recorded cla
   });
   assert.deepEqual(
     [result.proposed_action.kind, result.reason_code, result.waiting_for],
-    ['manual_review', 'unclear_waiting_state', 'approve_command'],
+    ['manual_review', 'unclear_waiting_state', 'approve_edit'],
   );
+});
+
+test('non-maximal labeled waiting_for is followed when the maximum is unique', async () => {
+  const probabilities = Object.fromEntries(
+    WAITING_FOR.map((key) => [key, key === 'approve_command' ? 0.3 : key === 'approve_edit' ? 0.31 : 0]),
+  );
+  const result = await assessStopDecision(stopInput(), {
+    now,
+    thresholds: { risky: 0.6, choiceConfidence: 0.45 },
+    evaluate: async () =>
+      evaluation({
+        waiting_for: choice(probabilities, 1, 'approve_command'),
+        risky: { type: 'noul', noul: 0.01 },
+      }),
+  });
+  assert.equal(result.proposed_action.kind, 'approve_request');
+  assert.equal(result.reason_code, 'low_risk');
+  assert.equal(result.waiting_for, 'approve_command');
 });
 
 test('low-confidence non-approval classification remains manual review', async () => {
@@ -561,8 +579,8 @@ test('injected evaluator results are revalidated; any incomplete response reject
       }),
     ],
     [
-      'returned choice is not maximal',
-      evaluation({ waiting_for: { ...validWaiting, choice: 'other' }, risky: validRisk }),
+      'returned choice is unknown',
+      evaluation({ waiting_for: { ...validWaiting, choice: 'invented' }, risky: validRisk }),
     ],
     ['missing model', { answers: valid.answers, usage: { input_tokens: 1 } }],
     ['missing usage', { model: 'jev-1.13.0', answers: valid.answers }],

@@ -405,12 +405,8 @@ const StopDecisionResultSchema = z
         const tied = maximumChoices.length > 1;
         const ambiguousTie =
           tied && result.proposed_action.kind === 'manual_review' && result.reason_code === 'unclear_waiting_state';
-        const choiceMatches = tied ? ambiguousTie : waitingAnswer.choice === result.waiting_for;
-        if (
-          waitingAnswer.probabilities[result.waiting_for] !== maximum ||
-          waitingAnswer.probabilities[waitingAnswer.choice] !== maximum ||
-          !choiceMatches
-        ) {
+        const choiceMatches = waitingAnswer.choice === result.waiting_for;
+        if (!choiceMatches || (tied && !ambiguousTie)) {
           context.addIssue({
             code: 'custom',
             path: ['waiting_for'],

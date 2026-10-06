@@ -655,7 +655,7 @@ test('version-2 stop results enforce action, reason, classification, and metric 
       risky: { type: 'noul', noul: risk },
     });
   const ambiguousManual = {
-    ...evaluatedResult(actions.manual, 'unclear_waiting_state', 'approve_command', { risk_probability: null }),
+    ...evaluatedResult(actions.manual, 'unclear_waiting_state', 'credentials', { risk_probability: null }),
     evaluation: tiedEvaluation('approve_command', 'credentials', 'credentials'),
   };
   const validResults = [

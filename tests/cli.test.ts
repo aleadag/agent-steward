@@ -955,6 +955,42 @@ test('router CLI uses the quota classification clock for both Jev reset countdow
   assert.equal(Object.hasOwn(result(out).quota.windows[0], 'seconds_until_reset'), false);
 });
 
+test('non-maximal labeled pair is selected and records choice_mismatch on the success event', async () => {
+  const cfg = routeConfig([candidate({ id: 'alpha' }), candidate({ id: 'beta' })]);
+  const { post } = fakePost((wire) => {
+    const question = wire.questions.pair;
+    assert.ok(question?.type === 'choice');
+    return jevResponse({
+      pair: choiceAnswer({ alpha: 0.31, beta: 0.3 }, 0.9, 'beta'),
+    });
+  });
+  const { io, out, err } = runtime({
+    env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'test-key' },
+    readText: async (path) => (path === CONFIG_PATH ? JSON.stringify(cfg) : JSON.stringify(snapshot([]))),
+    post,
+  });
+  assert.equal(await run(['router', 'start', 'task', '--dry-run', '--json'], io), 0);
+  const selected = result(out);
+  assert.equal(selected.decision, 'selected');
+  assert.equal(selected.selected.candidate_id, 'beta');
+  assert.equal(Object.hasOwn(selected, 'diagnostics'), false);
+  assert.deepEqual(err, ['agent-steward: choice_mismatch\n']);
+  out.length = 0;
+  assert.equal(await run(['router', 'show', 'generated-1', '--json'], io), 0);
+  const shown = result(out);
+  assert.equal(shown.event, 'dry-run');
+  assert.equal(shown.diagnostics.kind, 'choice_mismatch');
+  assert.deepEqual(shown.diagnostics.details, {
+    evaluation_index: 0,
+    question_index: 0,
+    expected: 0.31,
+    actual: 0.3,
+    choice_present: true,
+    option_count: 2,
+    maximum_count: 1,
+  });
+});
+
 test('numeric response details survive route failures, history and launcher reporting', async () => {
   const cfg = routeConfig([
     candidate({
@@ -969,7 +1005,6 @@ test('numeric response details survive route failures, history and launcher repo
   for (const [failureCall, kind, absent] of [
     [1, 'schema', false],
     [2, 'schema', false],
-    [2, 'choice_mismatch', false],
     [2, 'choice_mismatch', true],
   ] as const) {
     const logged: unknown[] = [];

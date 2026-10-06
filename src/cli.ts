@@ -11,7 +11,7 @@ import { refreshQuota } from './quota-refresh.ts';
 import type { QuotaRefreshIO } from './quota-refresh.ts';
 import { assertNoCredentials, configuredApiKeys } from './privacy.ts';
 import type { CredentialKeys } from './privacy.ts';
-import { makeEvaluator } from './jev.ts';
+import { labeledChoiceMismatch, makeEvaluator } from './jev.ts';
 import type { Evaluate, HttpPost, Questions } from './jev.ts';
 import { route } from './routing.ts';
 import { assessStop } from './triage.ts';
@@ -277,6 +277,22 @@ function safeStopError(error: unknown, requestId: string | null, apiKey: Credent
 
 function emitJson(runtime: Runtime, value: Result | StopResult): void {
   runtime.stdout(`${JSON.stringify(value)}\n`);
+}
+
+function selectedChoiceMismatch(result: SelectedResult): FailureDiagnostics | undefined {
+  const pair = result.evaluations.pair.answers.pair;
+  if (pair?.type === 'choice') {
+    const warning = labeledChoiceMismatch(pair, 0);
+    if (warning !== undefined) return warning;
+  }
+  const effort = result.evaluations.effort;
+  if ('kind' in effort) return undefined;
+  const answer = effort.answers.effort;
+  return answer?.type === 'choice' ? labeledChoiceMismatch(answer, 1) : undefined;
+}
+
+function emitChoiceMismatchWarning(runtime: Runtime, warning: FailureDiagnostics | undefined): void {
+  if (warning !== undefined) runtime.stderr('agent-steward: choice_mismatch\n');
 }
 
 function jsonValue(value: unknown): string {
@@ -639,8 +655,10 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     selected?: SelectedResult,
     exitCode?: number,
     failure?: ErrorResult,
+    warning?: FailureDiagnostics,
   ): Promise<void> => {
     if (requestId === null) return;
+    const diagnostics = failure?.diagnostics ?? warning;
     await appendEvent(runtime, {
       schema_version: 1,
       request_id: requestId,
@@ -659,12 +677,8 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
             usage: selected.evaluations.pair.usage,
           }),
       ...(exitCode === undefined ? {} : { exit_code: exitCode }),
-      ...(failure === undefined
-        ? {}
-        : {
-            reason_code: failure.reason_code,
-            ...(failure.diagnostics === undefined ? {} : { diagnostics: failure.diagnostics }),
-          }),
+      ...(failure === undefined ? {} : { reason_code: failure.reason_code }),
+      ...(diagnostics === undefined ? {} : { diagnostics }),
     });
   };
   let routeDecisionKnown = false;
@@ -748,6 +762,10 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
             : new StewardError('credential_detected');
         safeResult = safeStopError(safeFailure, requestId, apiKey);
       }
+      if (safeResult.decision === 'stop_decision' && safeResult.evaluation !== null) {
+        const waiting = safeResult.evaluation.answers.waiting_for;
+        if (waiting?.type === 'choice') emitChoiceMismatchWarning(runtime, labeledChoiceMismatch(waiting, 0));
+      }
       emitJson(runtime, safeResult);
       return decisionExitCode(safeResult);
     }
@@ -766,6 +784,8 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     }
 
     routeDecisionKnown = true;
+    const warning = safeResult.decision === 'selected' ? selectedChoiceMismatch(safeResult) : undefined;
+    emitChoiceMismatchWarning(runtime, warning);
     if (!invocation.dryRun && safeResult.decision === 'selected') {
       stage = 'launch';
       const command = buildNativeLaunch(safeResult.planned_command, invocation.task);
@@ -777,7 +797,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
         `account requested/unverified: ${jsonValue(safeResult.selected.quota_bucket)}\n`;
       assertNoCredentials(summary, apiKey);
       runtime.stderr(summary);
-      await recordEvent('launched', safeResult);
+      await recordEvent('launched', safeResult, undefined, undefined, warning);
       let exitCode: number;
       try {
         exitCode = await runtime.launch(command);
@@ -789,7 +809,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       await recordEvent('exited', undefined, exitCode);
       return exitCode;
     }
-    if (safeResult.decision === 'selected') await recordEvent('dry-run', safeResult);
+    if (safeResult.decision === 'selected') await recordEvent('dry-run', safeResult, undefined, undefined, warning);
     else if (safeResult.decision === 'error') {
       safeResult = { ...safeResult, diagnostics: { stage } };
       safeResult = safeError(new StewardError(safeResult.reason_code, safeResult.diagnostics), requestId, apiKey);

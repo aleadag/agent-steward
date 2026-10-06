@@ -410,21 +410,21 @@ test('agy rejects any invalid configured native effort before evaluation', async
   assert.equal(calls, 0);
 });
 
-test('configured order breaks exact ties even for numeric-like IDs', async () => {
+test('labeled choice wins exact pair ties even for numeric-like IDs', async () => {
   const first = candidate({ id: '10' });
   const second = candidate({ id: '2' });
   const cfg = config({ candidates: [first, second] });
   const result = await route(
     routeInput(cfg, async (_state, questions) =>
-      validateEvaluation(selectedPairAnswer({ 10: 0.5, 2: 0.5 }, 0), questions),
+      validateEvaluation(selectedPairAnswer({ 10: 0.5, 2: 0.5 }, 0, '2'), questions),
     ),
   );
 
-  assert.equal(result.selected.candidate_id, '10');
+  assert.equal(result.selected.candidate_id, '2');
   assert.deepEqual(result.evaluations.effort, { kind: 'fixed', level: 'low' });
 });
 
-test('configured order breaks exact effort ties even for numeric-like IDs', async () => {
+test('labeled choice wins exact effort ties even for numeric-like IDs', async () => {
   const cfg = config({
     candidates: [
       candidate({
@@ -441,11 +441,11 @@ test('configured order breaks exact effort ties even for numeric-like IDs', asyn
       calls++;
       return calls === 1
         ? validateEvaluation(selectedPairAnswer({ 'codex-astra': 1 }), questions)
-        : validateEvaluation(selectedEffortAnswer({ 10: 0.5, 2: 0.5 }, 0), questions);
+        : validateEvaluation(selectedEffortAnswer({ 10: 0.5, 2: 0.5 }, 0, '2'), questions);
     }),
   );
 
-  assert.equal(result.selected.thinking_level, '10');
+  assert.equal(result.selected.thinking_level, '2');
 });
 
 test('prototype-like candidate IDs remain valid record keys', async () => {
