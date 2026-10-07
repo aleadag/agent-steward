@@ -175,11 +175,13 @@ test('approval needs blocked status and an identifiable pending action, not term
   assert.equal(idle.proposed_action.kind, 'manual_review');
 });
 
-test('completion only becomes no_action when the adapter reports a settled done state', async () => {
+test('classified completion is accepted at idle or done, not while blocked', async () => {
   const unsettled = await assess('completed', { status: 'blocked' });
-  const settled = await assess('completed', { status: 'done' });
   assert.deepEqual([unsettled.proposed_action.kind, unsettled.reason_code], ['manual_review', 'unclear_waiting_state']);
-  assert.deepEqual([settled.proposed_action.kind, settled.reason_code], ['no_action', 'completed']);
+  for (const status of ['idle', 'done'] as const) {
+    const settled = await assess('completed', { status });
+    assert.deepEqual([settled.proposed_action.kind, settled.reason_code], ['no_action', 'completed']);
+  }
 });
 
 test('missing meaningful context stays local even when action hints are present', async () => {

@@ -69,6 +69,8 @@ export type EventDeps = {
   sessionValid?: () => Promise<boolean>;
   admissionOpen?: () => boolean;
   recoveryAllowed?: (observed: ObservedStop) => Promise<boolean>;
+  completeRecovery?: (observed: ObservedStop) => Promise<void>;
+  recoveryHandoff?: () => Promise<void>;
   observationAllowed?: (observed: ObservedStop) => boolean;
   dispatchEffect?: (kind: 'approval' | 'recovery', effect: () => Promise<void>) => Promise<void>;
 };
@@ -250,7 +252,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
             await deps.store.record(event.pane_id!, {
               ...existing,
               next_check_at: null,
-              last_delivery_state: 'human',
+              last_delivery_state: existing.last_delivery_state === 'uncertain' ? 'uncertain' : 'human',
               lifecycle_handoff_sent: true,
             });
             if (!admissionOpen()) return;
@@ -271,7 +273,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
         await deps.store.record(event.pane_id!, {
           ...existing,
           next_check_at: null,
-          last_delivery_state: 'human',
+          last_delivery_state: existing.last_delivery_state === 'uncertain' ? 'uncertain' : 'human',
         });
         if (!admissionOpen()) return;
       }
@@ -282,9 +284,11 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     if (!due && (await handleBestEffortApproval(observed, deps, stillOwner))) return;
     if (!admissionOpen()) return;
     let history = existing;
+    let recoveryPermitted = true;
     if (deps.recoveryAllowed) {
       if (!admissionOpen()) return;
-      if (!(await deps.recoveryAllowed(observed))) return;
+      recoveryPermitted = await deps.recoveryAllowed(observed);
+      if (!recoveryPermitted && !deps.completeRecovery) return;
       if (!admissionOpen()) return;
       try {
         history = await deps.store.retry(event.pane_id!);
@@ -315,7 +319,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
         await deps.store.record(observed.pane_id, {
           ...(history as Episode),
           next_check_at: null,
-          last_delivery_state: 'human',
+          last_delivery_state: history.last_delivery_state === 'uncertain' ? 'uncertain' : 'human',
         });
         if (!admissionOpen()) return;
       }
@@ -335,7 +339,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       await notify('observation_unavailable');
       return;
     }
-    if (history && history.failure_episode_id !== observed.current_episode_id) {
+    if (!deps.completeRecovery && history && history.failure_episode_id !== observed.current_episode_id) {
       // A sequence/revision/status change, even with identical or different historical
       // detection text, cannot prove a fresh failure. Keep the same-session caps.
       const moved = observed.workspace_id !== observed.pane_id.split(':')[0];
@@ -360,7 +364,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       }
       return;
     }
-    if (history && (history as Episode).last_delivery_state !== 'none') return;
+    if (!deps.completeRecovery && history && (history as Episode).last_delivery_state !== 'none') return;
     const recognizedMenu = approvalMenu(observed.context);
     const partialMenu = !recognizedMenu && observed.context.includes('Requesting permission for:');
     if ((recognizedMenu && (due || !deps.autoApprove)) || partialMenu) {
@@ -374,7 +378,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
         await deps.store.record(observed.pane_id, {
           ...history,
           next_check_at: null,
-          last_delivery_state: 'human',
+          last_delivery_state: history.last_delivery_state === 'uncertain' ? 'uncertain' : 'human',
         });
         if (!admissionOpen()) return;
       }
@@ -382,6 +386,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       return;
     }
     if (
+      !deps.completeRecovery &&
       history &&
       (history as Episode).next_check_at &&
       deps.clock.now().getTime() >= Date.parse(history.first_observed_at) + 24 * 60 * 60_000
@@ -397,7 +402,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       await deps.store.record(observed.pane_id, {
         ...(history as Episode),
         next_check_at: null,
-        last_delivery_state: 'human',
+        last_delivery_state: history.last_delivery_state === 'uncertain' ? 'uncertain' : 'human',
       });
       if (!admissionOpen()) return;
       await notify('human_review_required');
@@ -408,6 +413,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     if (
       !due &&
       (history as Episode | null)?.next_check_at &&
+      (!deps.completeRecovery || history!.failure_episode_id === observed.current_episode_id) &&
       Date.parse((history as Episode).next_check_at!) > deps.clock.now().getTime()
     )
       return;
@@ -415,7 +421,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     if (!Number.isFinite(now.getTime())) return;
     const retry: Retry = history
       ? {
-          failure_episode_id: history.failure_episode_id,
+          failure_episode_id: deps.completeRecovery ? observed.current_episode_id : history.failure_episode_id,
           first_observed_at: history.first_observed_at,
           attempt_count: history.attempt_count,
           last_attempt_at: history.last_attempt_at,
@@ -491,6 +497,8 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       return;
     }
     if (!admissionOpen()) return;
+    if (deps.completeRecovery && !(await stillOwner())) return;
+    if (!admissionOpen()) return;
     let result: StopResult;
     try {
       result = StopResultSchema.parse(await deps.decide(input.data));
@@ -503,6 +511,33 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     if (result.decision !== 'stop_decision' || result.request_id !== input.data.request_id) {
       await quarantine('decision_failed');
       return;
+    }
+    if (deps.completeRecovery) {
+      if (
+        result.proposed_action.kind === 'no_action' &&
+        result.reason_code === 'completed' &&
+        result.waiting_for === 'completed' &&
+        (observed.status === 'idle' || observed.status === 'done')
+      ) {
+        const fresh = await observeStop(deps.herdr, observed.pane_id);
+        if (!admissionOpen()) return;
+        if (fresh?.current_episode_id === observed.current_episode_id && (await stillOwner()))
+          await deps.completeRecovery(observed);
+        return;
+      }
+      // Classification is never permission to replay an attempted snapshot, erase
+      // uncertainty, or bypass cancellation/unsafe association provenance.
+      if (!recoveryPermitted) {
+        await deps.recoveryHandoff?.();
+        return;
+      }
+      if (
+        history &&
+        (history.last_delivery_state === 'uncertain' ||
+          history.lifecycle_handoff_sent ||
+          (history.failure_episode_id === observed.current_episode_id && history.last_delivery_state !== 'none'))
+      )
+        return;
     }
     if (result.proposed_action.kind === 'manual_review' || result.proposed_action.kind === 'approve_request') {
       await quarantine('human_review_required');
@@ -517,6 +552,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     if (
       due &&
       history &&
+      history.failure_episode_id === observed.current_episode_id &&
       action.kind === 'send_recovery_instruction' &&
       (history as Episode).next_check_at !== action.not_before
     ) {
@@ -531,7 +567,14 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     const base = Date.parse(checked.last_quota_check_at ?? checked.first_observed_at);
     const fallback = Math.min(base + delay, deadline);
     // The CLI classifies this as quota; it cannot supply reset proof or dictate this timer.
-    let next = quota && Number.isFinite(fallback) && fallback > now.getTime() ? new Date(fallback).toISOString() : null;
+    let next =
+      action.kind === 'send_recovery_instruction' && deps.completeRecovery
+        ? Date.parse(action.not_before) > now.getTime()
+          ? action.not_before
+          : null
+        : quota && Number.isFinite(fallback) && fallback > now.getTime()
+          ? new Date(fallback).toISOString()
+          : null;
     if (quota && !next) {
       await quarantine('human_review_required');
       return;
@@ -557,6 +600,8 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     }
     const record: Episode = {
       ...retry,
+      ...(history?.workflow_episode_id ? { workflow_episode_id: history.workflow_episode_id } : {}),
+      ...(history?.completion_observation_id ? { completion_observation_id: history.completion_observation_id } : {}),
       ...(due && quota ? inputRetry : {}),
       pane_id: observed.pane_id,
       session_id: observed.session_id,
@@ -656,6 +701,16 @@ export function workflowEventDeps(base: EventDeps, authority: WorkflowAuthority,
       retryDepth--;
     }
   };
+  let associationDenied = false;
+  const legacy = {
+    directory: episodes.directory,
+    withEpisodeLock: async <T>(key: string, action: () => Promise<T>): Promise<T | null> =>
+      key === retryKey && retryDepth > 0 ? action() : episodes.withEpisodeLock(key, action),
+    sessionRetry: (agent: string, sessionId: string) => episodes.sessionRetry(agent, sessionId),
+    hasRetryHead: (agent: string, sessionId: string) => episodes.hasRetryHead(agent, sessionId),
+    recordSessionRetry: (agent: string, sessionId: string, episode: Episode) =>
+      episodes.recordSessionRetry(agent, sessionId, episode),
+  } as EpisodeStore;
   return {
     ...base,
     autoApprove: base.autoApprove === true && authority.permission.autoApprove,
@@ -682,14 +737,19 @@ export function workflowEventDeps(base: EventDeps, authority: WorkflowAuthority,
         if (pane !== authority.paneId || retry.pane_id !== pane || retry.session_id !== authority.scope.sessionId)
           throw new Error('workflow subject mismatch');
         await authority.dispatch('recovery', async () => {
-          await episodes.recordSessionRetry(authority.scope.agent, authority.scope.sessionId, retry);
+          const previous = await state.sessionRetry(authority.scope);
+          if (!previous || previous.failure_episode_id !== retry.failure_episode_id)
+            await episodes.advanceSessionRetry(authority.scope.agent, authority.scope.sessionId, retry, previous);
+          else await episodes.recordSessionRetry(authority.scope.agent, authority.scope.sessionId, retry);
+          const selected = await state.sessionRetry(authority.scope);
+          if (!selected || selected.failure_episode_id !== retry.failure_episode_id) throw new CorruptEpisodeError();
           await state.publishPendingRecoveryProvenance(
             authority.scope,
             authority.ticket,
             authority.generation,
             authority.paneId,
             authority.workspaceId,
-            retry,
+            selected,
           );
         });
       },
@@ -716,7 +776,43 @@ export function workflowEventDeps(base: EventDeps, authority: WorkflowAuthority,
         });
       },
     },
+    completeRecovery: async (observed) => {
+      if (
+        !authority.admissionOpen() ||
+        !(await authority.valid()) ||
+        (await state.recoveryQuarantined(authority.scope, true))
+      )
+        return;
+      const adopted = await state.adoptLegacyRetry(legacy, authority.scope, observed, authority, true);
+      if (adopted !== 'adopted' || !authority.admissionOpen()) return;
+      const previous = await state.sessionRetry(authority.scope);
+      if (!previous || previous.pane_id !== observed.pane_id) return;
+      const fresh = await observeStop(base.herdr, observed.pane_id);
+      if (!authority.admissionOpen() || fresh?.current_episode_id !== observed.current_episode_id) return;
+      if (previous.failure_episode_id === observed.current_episode_id) {
+        await authority.dispatch('recovery', () =>
+          episodes.recordSessionRetry(authority.scope.agent, authority.scope.sessionId, {
+            ...previous,
+            next_check_at: null,
+          }),
+        );
+        return;
+      }
+      await authority.dispatch('completion', () =>
+        episodes.completeSessionRetry(
+          authority.scope.agent,
+          authority.scope.sessionId,
+          observed.current_episode_id,
+          previous,
+        ),
+      );
+    },
+    recoveryHandoff: async () => {
+      if (associationDenied && authority.admissionOpen() && (await authority.valid()) && authority.admissionOpen())
+        await base.handoff('human_review_required');
+    },
     recoveryAllowed: async (observed) => {
+      associationDenied = false;
       if (!(await authority.valid())) return false;
       if (
         observed.pane_id !== authority.paneId ||
@@ -730,25 +826,18 @@ export function workflowEventDeps(base: EventDeps, authority: WorkflowAuthority,
       const binding = await state.binding(authority.scope);
       if (binding && binding.historyPaneId !== observed.pane_id) return false;
       const history = await state.sessionRetry(authority.scope);
+      if (
+        history?.last_delivery_state === 'human' &&
+        history.attempt_count !== 0 &&
+        !(await episodes.hasRetryHead(authority.scope.agent, authority.scope.sessionId))
+      )
+        return false;
       if (await state.recoveryQuarantined(authority.scope)) {
         if (history) return false;
       } else if (history) return true;
-      const adopted = await state.adoptLegacyRetry(
-        {
-          directory: episodes.directory,
-          withEpisodeLock: async <T>(key: string, action: () => Promise<T>): Promise<T | null> =>
-            key === retryKey && retryDepth > 0 ? action() : episodes.withEpisodeLock(key, action),
-          sessionRetry: (agent: string, sessionId: string) => episodes.sessionRetry(agent, sessionId),
-          recordSessionRetry: (agent: string, sessionId: string, episode: Episode) =>
-            episodes.recordSessionRetry(agent, sessionId, episode),
-        } as EpisodeStore,
-        authority.scope,
-        observed,
-        authority,
-      );
+      const adopted = await state.adoptLegacyRetry(legacy, authority.scope, observed, authority);
       if (adopted === 'quarantined') {
-        if (authority.admissionOpen() && (await authority.valid()) && authority.admissionOpen())
-          await base.handoff('human_review_required');
+        associationDenied = true;
         return false;
       }
       return authority.valid();

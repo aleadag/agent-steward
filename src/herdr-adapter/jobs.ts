@@ -4,7 +4,7 @@ import { reserveJobSlot, type JobSlot, type WorkflowAuthority } from './authorit
 import { appendDiagnostic, type DiagnosticEvent } from './diagnostics.ts';
 import { handleEvent, workflowEventDeps, type EventDeps } from './events.ts';
 import { observeStop } from './observe.ts';
-import type { Episode, EpisodeStore } from './state.ts';
+import { workflowEpisodeId, type Episode, type EpisodeStore } from './state.ts';
 import type { WorkflowBinding, WorkflowResult, WorkflowState } from './workflow-state.ts';
 
 export type JobOptions = {
@@ -147,7 +147,7 @@ export async function runEpisodeJob(options: JobOptions): Promise<WorkflowResult
         ...current,
         phase: 'pending',
         reason: null,
-        failureEpisodeId: episode.failure_episode_id,
+        failureEpisodeId: workflowEpisodeId(episode),
         historyPaneId: episode.pane_id,
       };
       await options.state.recordBinding(pending, options.authority);
@@ -244,13 +244,32 @@ export async function runEpisodeJob(options: JobOptions): Promise<WorkflowResult
       },
     };
     while (await valid()) {
+      const changed = slot!.historyChanged;
       const episode = await options.state.sessionRetry(scope);
       if (!open()) return 'stopped';
       if (!recoverable(episode)) return 'finished';
       const deadline = new Date(episode.next_check_at!);
       const now = options.deps.clock.now().getTime();
       if (!Number.isFinite(deadline.getTime()) || !Number.isFinite(now)) return markHuman('observation_unavailable');
-      if (deadline.getTime() > now) await wait(deadline, controller.signal);
+      if (deadline.getTime() > now) {
+        const waiting = new AbortController();
+        const interrupt = () => waiting.abort();
+        changed.addEventListener('abort', interrupt, { once: true });
+        controller.signal.addEventListener('abort', interrupt, { once: true });
+        if (changed.aborted || controller.signal.aborted) interrupt();
+        try {
+          const interrupted = new Promise<void>((resolve) => {
+            if (waiting.signal.aborted) resolve();
+            else waiting.signal.addEventListener('abort', () => resolve(), { once: true });
+          });
+          await Promise.race([wait(deadline, waiting.signal), interrupted]);
+        } finally {
+          changed.removeEventListener('abort', interrupt);
+          controller.signal.removeEventListener('abort', interrupt);
+          waiting.abort();
+        }
+        if (changed.aborted) continue;
+      }
       if (!(await valid())) return 'stopped';
       // The full foreground is raced below. Every continuation still fences the
       // next operation; a race does not cancel the losing promise's continuation.

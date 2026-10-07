@@ -335,7 +335,7 @@ test('pending last approval validation cannot invoke keys after another instance
 });
 
 for (const provenance of ['paused', 'terminal', 'association', 'old-server'] as const)
-  test(`ordinary recovery refuses canonical ${provenance} provenance before decision or write`, async () => {
+  test(`ordinary recovery classifies but refuses canonical ${provenance} provenance before write`, async () => {
     const root = await mkdtemp(join(tmpdir(), 'steward-final-provenance-'));
     const state = new WorkflowState(root);
     const first = start(state, true);
@@ -430,7 +430,7 @@ for (const provenance of ['paused', 'terminal', 'association', 'old-server'] as 
           state,
         ),
       );
-      assert.equal(decisions, 0);
+      assert.equal(decisions, 1);
       assert.equal(prompts, 0);
       assert.deepEqual(await episodes.sessionRetry('agy', 's1'), before);
       let keys = 0,
@@ -550,7 +550,7 @@ test('pause before pending-binding publication cannot resurrect the canceled dea
     await handleEvent(event, depsFor(resumed));
     const after = await episodes.sessionRetry('agy', 's1');
     assert.equal(prompts, 0);
-    assert.equal(decisions, beforeDecisions);
+    assert.equal(decisions, beforeDecisions + 1);
     assert.equal(after?.last_delivery_state, 'none');
     assert.equal(after?.attempt_count, 0);
     assert.deepEqual(after?.next_check_at, pending.next_check_at);
@@ -694,7 +694,7 @@ for (const kind of ['association-guard', 'quarantine-marker', 'malformed-referen
           state,
         ),
       );
-      assert.equal(decisions, 0);
+      assert.equal(decisions, 1);
       assert.equal(prompts, 0);
       assert.deepEqual(handoffs, ['human_review_required']);
       assert.equal(await episodes.sessionRetry('agy', 's1'), null);
