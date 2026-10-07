@@ -70,17 +70,21 @@ export type ApprovalAttempt = {
   agent: string;
   session_id: string;
   digest: string;
-  state: 'human' | 'uncertain' | 'delivered';
+  state: 'human' | 'uncertain' | 'delivered' | 'not_sent';
+  not_sent_reason?: 'observation_changed' | 'delivery_not_started';
   recorded_at: string;
 };
-const approvalSchema = z.strictObject({
-  pane_id: z.string().regex(/^w[A-Za-z0-9]+:p[A-Za-z0-9]+$/),
-  agent: identifier,
-  session_id: identifier,
-  digest: z.string().regex(/^[0-9a-f]{64}$/),
-  state: z.enum(['human', 'uncertain', 'delivered']),
-  recorded_at: timestamp,
-});
+const approvalSchema = z
+  .strictObject({
+    pane_id: z.string().regex(/^w[A-Za-z0-9]+:p[A-Za-z0-9]+$/),
+    agent: identifier,
+    session_id: identifier,
+    digest: z.string().regex(/^[0-9a-f]{64}$/),
+    state: z.enum(['human', 'uncertain', 'delivered', 'not_sent']),
+    not_sent_reason: z.enum(['observation_changed', 'delivery_not_started']).optional(),
+    recorded_at: timestamp,
+  })
+  .refine((attempt) => (attempt.state === 'not_sent') === (attempt.not_sent_reason !== undefined));
 
 export function parseEpisode(value: unknown): Episode {
   return episodeSchema.parse(value);

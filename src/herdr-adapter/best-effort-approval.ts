@@ -119,7 +119,7 @@ export async function handleBestEffortApproval(
           return true;
         }
         // Footer/revision/sequence changes alone are not a fresh permission menu.
-        if (previous.digest === digest) return true;
+        if (previous.digest === digest && previous.state !== 'not_sent') return true;
       }
       const now = deps.clock.now();
       if (!Number.isFinite(now.getTime())) return true;
@@ -178,6 +178,34 @@ export async function handleBestEffortApproval(
           result.waiting_for === menu.kind
         );
       };
+      let transportStarted = false;
+      const recordNotSent = async (reason: NonNullable<ApprovalAttempt['not_sent_reason']>) => {
+        if (transportStarted || record.state !== 'uncertain') return;
+        try {
+          if (!(await owns())) return;
+          const fresh = await observeStop(deps.herdr, observed.pane_id);
+          if (
+            !fresh ||
+            fresh.workspace_id !== observed.workspace_id ||
+            fresh.agent !== observed.agent ||
+            fresh.session_id !== observed.session_id ||
+            fresh.session_kind !== observed.session_kind ||
+            fresh.session_source !== observed.session_source ||
+            (deps.observationAllowed && !deps.observationAllowed(fresh)) ||
+            !(await owns())
+          )
+            return;
+          // Both locks remain held. This invocation knows the transport was
+          // never called; crashes or lost authority leave the marker uncertain.
+          await deps.store.recordApproval!(observed.pane_id, {
+            ...record,
+            state: 'not_sent',
+            not_sent_reason: reason,
+          });
+        } catch {
+          // Failure to publish no-send evidence must retain quarantine.
+        }
+      };
       try {
         if (
           !(await matchingObservation()) ||
@@ -196,17 +224,22 @@ export async function handleBestEffortApproval(
         record.state = 'uncertain';
         await deps.store.recordApproval!(observed.pane_id, record);
         if (!(await matchingObservation()) || !(await owns())) {
+          await recordNotSent('observation_changed');
           await human();
           return true;
         }
         // Herdr cannot make the last observation and keypress atomic. Global enablement
         // explicitly accepts that race; do not label this native request-binding proof.
-        const send = () => deps.herdr.sendKeys!(observed.pane_id, ['1']);
+        const send = () => {
+          transportStarted = true;
+          return deps.herdr.sendKeys!(observed.pane_id, ['1']);
+        };
         if (deps.dispatchEffect) await deps.dispatchEffect('approval', send);
         else await send();
         if (!(await owns())) return true;
         await deps.store.recordApproval!(observed.pane_id, { ...record, state: 'delivered' });
       } catch {
+        await recordNotSent('delivery_not_started');
         await human();
       }
       return true;

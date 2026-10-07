@@ -234,6 +234,9 @@ async function scopedApproval() {
     handoffs,
     run,
     attempt,
+    changePane: (changes: Partial<AgentSnapshot>) => {
+      current = { ...current, ...changes };
+    },
     cleanup: async () => {
       attempt.close();
       await attempt.finish();
@@ -589,6 +592,143 @@ for (const boundary of ['dialog', 'session', 'control', 'lease', 'shutdown'] as 
   });
 }
 
+for (const boundary of ['focus', 'dialog'] as const) {
+  test(`${boundary} change after the uncertain prewrite records no send and permits fresh assessment`, async () => {
+    const f = await fixture();
+    try {
+      f.changePane({ agent_status: 'done' });
+      const record = f.store.recordApproval.bind(f.store);
+      let changed = false;
+      f.store.recordApproval = async (pane, attempt) => {
+        await record(pane, attempt);
+        if (attempt.state !== 'uncertain' || changed) return;
+        changed = true;
+        if (boundary === 'focus') f.changePane({ agent_status: 'idle', state_change_seq: 5 });
+        else f.changeText(dialog('printf changed-probe'));
+      };
+      await f.run();
+      assert.equal(f.inputs.length, 2);
+      assert.deepEqual(f.keys, []);
+      const saved = await f.store.approval('agy', 's1');
+      assert.equal(saved?.state, 'not_sent');
+      assert.equal(saved?.not_sent_reason, 'observation_changed');
+      assert.equal(JSON.stringify(saved).includes('approval-probe'), false);
+
+      // Persisted no-send evidence must survive a store reopen, but is not
+      // approval: the fresh event still needs both policy assessments.
+      f.deps.store = new EpisodeStore(f.store.directory);
+      await f.run();
+      assert.equal(f.inputs.length, 4);
+      assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+      assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
+      await f.run();
+      assert.equal(f.inputs.length, 4);
+      assert.equal(f.keys.length, 1);
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
+test('fresh policy rejection after a known no-send attempt still prevents input', async () => {
+  const f = await fixture();
+  try {
+    const record = f.store.recordApproval.bind(f.store);
+    f.store.recordApproval = async (pane, attempt) => {
+      await record(pane, attempt);
+      if (attempt.state === 'uncertain') f.changePane({ state_change_seq: 5 });
+    };
+    await f.run();
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'not_sent');
+    f.setRisk(0.9);
+    await f.run();
+    assert.equal(f.inputs.length, 3);
+    assert.deepEqual(f.keys, []);
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'human');
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('dispatch rejection before transport invocation records no send', async () => {
+  const f = await fixture();
+  try {
+    f.deps.dispatchEffect = async () => {
+      throw new Error('effect not admitted');
+    };
+    await f.run();
+    assert.equal(f.inputs.length, 2);
+    assert.deepEqual(f.keys, []);
+    const saved = await f.store.approval('agy', 's1');
+    assert.equal(saved?.state, 'not_sent');
+    assert.equal(saved?.not_sent_reason, 'delivery_not_started');
+    f.deps.dispatchEffect = async (_kind, effect) => effect();
+    await f.run();
+    assert.equal(f.inputs.length, 4);
+    assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('no-send metadata rejects missing reasons and reasons on uncertain attempts', async () => {
+  const f = await fixture();
+  try {
+    f.deps.dispatchEffect = async () => {
+      throw new Error('effect not admitted');
+    };
+    await f.run();
+    const saved = await f.store.approval('agy', 's1');
+    assert.ok(saved);
+    assert.equal(saved.state, 'not_sent');
+    await assert.rejects(f.store.recordApproval('w1:p1', { ...saved, not_sent_reason: undefined }));
+    await assert.rejects(f.store.recordApproval('w1:p1', { ...saved, state: 'uncertain' }));
+    assert.deepEqual(await f.store.approval('agy', 's1'), saved);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('dispatch error after transport invocation keeps session uncertainty', async () => {
+  const f = await fixture();
+  try {
+    f.deps.dispatchEffect = async (_kind, effect) => {
+      await effect();
+      throw new Error('dispatch acknowledgment lost');
+    };
+    await f.run();
+    assert.equal(f.inputs.length, 2);
+    assert.equal(f.keys.length, 1);
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'uncertain');
+    await f.run();
+    assert.equal(f.inputs.length, 2);
+    assert.equal(f.keys.length, 1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('failed no-send publication retains uncertainty and never retries', async () => {
+  const f = await fixture();
+  try {
+    const record = f.store.recordApproval.bind(f.store);
+    f.store.recordApproval = async (pane, attempt) => {
+      if (attempt.state === 'not_sent') throw new Error('publication failed');
+      await record(pane, attempt);
+      if (attempt.state === 'uncertain') f.changePane({ state_change_seq: 5 });
+    };
+    await f.run();
+    assert.equal(f.inputs.length, 2);
+    assert.deepEqual(f.keys, []);
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'uncertain');
+    await f.run();
+    assert.equal(f.inputs.length, 2);
+    assert.deepEqual(f.keys, []);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 for (const boundary of ['session', 'lease', 'shutdown'] as const) {
   test(`${boundary} loss after the uncertain prewrite prevents input`, async () => {
     const f = await fixture();
@@ -847,6 +987,51 @@ test('scoped status hook approves a complete menu without a global supervisor le
     assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
     assert.deepEqual(f.handoffs, []);
     assert.equal(await f.store.retry('w1:p1'), null);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('scoped authority publishes no-send evidence after a focus change and permits fresh assessment', async () => {
+  const f = await scopedApproval();
+  try {
+    f.changePane({ agent_status: 'done' });
+    const record = f.deps.store.recordApproval!;
+    let changed = false;
+    f.deps.store.recordApproval = async (pane, attempt) => {
+      await record(pane, attempt);
+      if (attempt.state === 'uncertain' && !changed) {
+        changed = true;
+        f.changePane({ agent_status: 'idle', state_change_seq: 5 });
+      }
+    };
+    await f.run();
+    assert.equal(f.inputs.length, 2);
+    assert.deepEqual(f.keys, []);
+    const saved = await f.store.approval('agy', 's1');
+    assert.equal(saved?.state, 'not_sent');
+    assert.equal(saved?.not_sent_reason, 'observation_changed');
+    await f.run();
+    assert.equal(f.inputs.length, 4);
+    assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('scoped authority revocation after the uncertain prewrite retains quarantine', async () => {
+  const f = await scopedApproval();
+  try {
+    const record = f.deps.store.recordApproval!;
+    f.deps.store.recordApproval = async (pane, attempt) => {
+      await record(pane, attempt);
+      if (attempt.state === 'uncertain') f.attempt.close();
+    };
+    await f.run();
+    assert.equal(f.inputs.length, 2);
+    assert.deepEqual(f.keys, []);
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'uncertain');
   } finally {
     await f.cleanup();
   }
