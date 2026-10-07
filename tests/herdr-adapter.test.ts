@@ -207,7 +207,7 @@ test('rejected detection or unsupported identity emits only a local handoff and 
     [agent(), output({ source: 'recent', text: 'Old terminal history\nCurrent API failure: request timed out' })],
     [agent(), output({ text: 'api_key=supersecretvalue1234' })],
     [agent(), output({ text: 'x'.repeat(4096) })],
-    [agent(), output({ text: 'x\n'.repeat(13) })],
+    [agent(), output({ text: 'x\n'.repeat(17) })],
     [agent(), output({ truncated: 'unknown' })],
     [agent(), output({ text: '' })],
     [agent({ agent: 'claude' }), output()],
@@ -562,7 +562,7 @@ test('Pi 0.9.1 excerpt rejects changed occupants and sequences even when read re
 test('Pi 0.9.1 excerpt rejects oversized bytes, extra actual lines, credentials and malformed read metadata', async () => {
   for (const read of [
     piRead({ text: 'é'.repeat(1025) }),
-    piRead({ text: piExcerpt + '13th line\n' }),
+    piRead({ text: piExcerpt + 'extra line\n'.repeat(5) }),
     piRead({ text: 'api_key=supersecretvalue1234\n' }),
     piRead({ text: 'Bearer abcdefghijklmnopqrstuvwxyz\n' }),
     piRead({ source: 'recent' }),
@@ -734,11 +734,24 @@ test('session agent must match the pane agent before observation', async () => {
   assert.equal(await observeStop(fakeHerdr(pane), 'w1:p1'), null);
 });
 
-test('explicit 12-line/2048-byte detection limits accept boundary without clipping', async () => {
-  const within = 'a'.repeat(2037) + '\n'.repeat(11);
-  const observed = await observeStop(fakeHerdr(agent(), output({ text: within })), 'w1:p1');
-  assert.ok(observed);
-  assert.equal(observed.context, within);
+test('explicit 16-line/2048-byte detection limits accept boundary without clipping', async () => {
+  for (const within of ['a'.repeat(2032) + '\n'.repeat(15) + 'b', 'a'.repeat(2031) + '\n'.repeat(15) + 'b\n']) {
+    const observed = await observeStop(fakeHerdr(agent(), output({ text: within })), 'w1:p1');
+    assert.ok(observed);
+    assert.equal(observed.context, within);
+  }
+});
+
+test('17-line detection reads are rejected with or without a final newline', async () => {
+  for (const text of ['x\n'.repeat(16) + 'x', 'x\n'.repeat(17)]) {
+    assert.equal(await observeStop(fakeHerdr(agent(), output({ text })), 'w1:p1'), null);
+  }
+});
+
+test('16-line reads retain the UTF-8 byte cap and scan credentials on the final line', async () => {
+  for (const text of ['é'.repeat(1017) + '\n'.repeat(15), 'x\n'.repeat(15) + 'api_key=supersecretvalue1234']) {
+    assert.equal(await observeStop(fakeHerdr(agent(), output({ text })), 'w1:p1'), null);
+  }
 });
 
 test('normalizeEvent accepts dotted and underscored status and exit hooks', async () => {

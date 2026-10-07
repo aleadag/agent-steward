@@ -550,7 +550,7 @@ test('AGY wrapped unzip permission menu is recognized', () => {
 test('AGY wrapped unzip permission menu can send only 1', async () => {
   const f = await fixture();
   try {
-    // observeStop rejects excerpts over 12 lines; keep the wrapped choices.
+    // observeStop rejects excerpts over 16 lines; keep the wrapped choices.
     f.changeText(`Requesting permission for:
    unzip -l
 sentinel/android/app/build/outputs/apk/release/app-release-unsigned.apk
@@ -567,6 +567,80 @@ Run this command?
     await f.cleanup();
   }
 });
+
+const agyStatixMenu = `Command
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Requesting permission for:
+   statix check packages/cc-connect/default.nix packages/karabiner-driverkit-virtualhiddevice/default.nix packages/newsgoat/default.nix
+packages/nix-cleanup/default.nix packages/nix-whereis/default.nix packages/run-bg-alias/default.nix packages/vitaly/default.nix
+packages/wpsoffice-cn-fcitx/default.nix packages/herdr-beads/default.nix
+
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation for commands that start with 'statix'
+  3. Yes, and always allow for commands that start with 'statix' (Persist to settings.json)
+  4. No, cancel
+
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
+🔧 TOOL ╱ Gemini 3.8 Flash (High)  │   ctx ░·············· 3.7% · artifacts 0 · subagents 0 · tasks 0 · sandbox off`;
+
+for (const [name, screen, context, action] of [
+  [
+    'wrapped statix permission header',
+    agyStatixMenu,
+    agyStatixMenu,
+    'statix check packages/cc-connect/default.nix packages/karabiner-driverkit-virtualhiddevice/default.nix packages/newsgoat/default.nix\n' +
+      'packages/nix-cleanup/default.nix packages/nix-whereis/default.nix packages/run-bg-alias/default.nix packages/vitaly/default.nix\n' +
+      'packages/wpsoffice-cn-fcitx/default.nix packages/herdr-beads/default.nix',
+  ],
+  [
+    'compact permission menu without older transcript',
+    'Earlier explanation\nOlder output\n\nCommand\n---\n\n' + dialog(),
+    '---\n\n' + dialog(),
+    'printf approval-probe',
+  ],
+] as const) {
+  test(`bounded socket detection retains the ${name} and assesses it`, async () => {
+    const f = await fixture();
+    const path = join(f.store.directory, 'herdr.sock');
+    const pane = await f.herdr.get();
+    const server = createServer((socket) => {
+      let data = '';
+      socket.on('data', (chunk) => {
+        data += chunk;
+        if (!data.includes('\n')) return;
+        const { id, method, params } = JSON.parse(data.slice(0, data.indexOf('\n')));
+        const result =
+          method === 'agent.get'
+            ? { type: 'agent_info', agent: pane }
+            : {
+                type: 'pane_read',
+                read: {
+                  pane_id: pane.pane_id,
+                  source: 'detection',
+                  revision: 0,
+                  text: screen.split('\n').slice(-params.lines).join('\n'),
+                  truncated: true,
+                },
+              };
+        socket.end(JSON.stringify({ id, result }) + '\n');
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(path, resolve));
+    try {
+      f.deps.herdr = { ...f.herdr, ...socketReader(path) };
+      await f.run();
+      assert.equal(f.inputs.length, 2);
+      assert.equal(f.inputs[0]?.context, context);
+      assert.equal(f.inputs[0]?.pending_action?.action, action);
+      assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await f.cleanup();
+    }
+  });
+}
 
 // Catches ignoring a dialog or occupant change after the expensive assessment.
 for (const boundary of ['dialog', 'session', 'control', 'lease', 'shutdown'] as const) {
