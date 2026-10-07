@@ -1,5 +1,7 @@
 # Unreleased
 
+- Diagnose why automatic approval stopped with `stop show <request-or-attempt-id> --json`. New records include classification, confidence, risk, both approval assessments, the stopping gate, cleanup outcome, and duplicate-skip reason. Retained skips preserve their original diagnostic summary across rotation; no command, screen, or raw provider content is logged. Approval and retry rules are unchanged. See [local stop history](README.md#local-stop-history).
+
 - The optional Herdr adapter now classifies fresh stops after earlier recovery handoffs. Fresh classified completion at `idle` or `done` lets later failures use a new bounded retry budget; screen changes alone do not reset it. Uncertain delivery, cancellation and attempted-snapshot protections remain in place; see the [recovery policy and limits](README.md#optional-herdr-adapter-not-activated).
 
 - Added `stop list` and `stop show` commands for inspecting local stopped-agent assessment history. Stop list/show read local stop history without config or Jev, never store pane/context, and are not delivery proof.
