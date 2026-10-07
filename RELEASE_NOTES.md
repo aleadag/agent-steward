@@ -1,5 +1,7 @@
 # Unreleased
 
+- The optional Herdr adapter now classifies fresh stops after earlier recovery handoffs. Fresh classified completion at `idle` or `done` lets later failures use a new bounded retry budget; screen changes alone do not reset it. Uncertain delivery, cancellation and attempted-snapshot protections remain in place; see the [recovery policy and limits](README.md#optional-herdr-adapter-not-activated).
+
 - Added `stop list` and `stop show` commands for inspecting local stopped-agent assessment history. Stop list/show read local stop history without config or Jev, never store pane/context, and are not delivery proof.
 
 - The optional Herdr recover plugin now runs from status and exit events with pause/resume metadata actions. There is no supervisor pane, startup worker, or menu polling. A recovery or quota proposal can promote the current event command into one temporary job (at most eight per Herdr server). Live plugin registry, config, and socket identity are checked at admission and again before later authorization. Old global supervisor state is retained and blocks migration while live or unverifiable. Socket reads now use a 2-second total/stream/held bound (64 KiB) rather than the previous 3-second idle timeout. This note does not claim live AGY verification.
