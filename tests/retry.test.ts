@@ -65,7 +65,7 @@ test('recovery deliveries use episode-anchored 30s, 2m, and 8m deadlines then es
       kind: 'send_recovery_instruction',
       not_before: notBefore,
       instruction:
-        'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.',
+        'Continue the interrupted task from the last unfinished step. Before repeating the preceding operation, check whether it succeeded; do not repeat completed actions. If the same failure is still current, retry the operation once. If the task is already complete, report that.',
     });
   }
   const fractional = input({
@@ -82,14 +82,14 @@ test('recovery deliveries use episode-anchored 30s, 2m, and 8m deadlines then es
     kind: 'send_recovery_instruction',
     not_before: '2026-09-29T10:00:30.123456Z',
     instruction:
-      'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.',
+      'Continue the interrupted task from the last unfinished step. Before repeating the preceding operation, check whether it succeeded; do not repeat completed actions. If the same failure is still current, retry the operation once. If the task is already complete, report that.',
   });
   const overdue = input();
   assert.deepEqual(retryProposal(overdue, 'recoverable_api_error', new Date('2026-09-29T11:00:00Z')), {
     kind: 'send_recovery_instruction',
     not_before: '2026-09-29T10:00:30.000Z',
     instruction:
-      'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.',
+      'Continue the interrupted task from the last unfinished step. Before repeating the preceding operation, check whether it succeeded; do not repeat completed actions. If the same failure is still current, retry the operation once. If the task is already complete, report that.',
   });
   const exhausted = input({
     retry: {
@@ -110,7 +110,7 @@ test('ready done and idle errors preserve bounded recovery and quota proposals',
       kind: 'send_recovery_instruction',
       not_before: '2026-09-29T10:00:30.000Z',
       instruction:
-        'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.',
+        'Continue the interrupted task from the last unfinished step. Before repeating the preceding operation, check whether it succeeded; do not repeat completed actions. If the same failure is still current, retry the operation once. If the task is already complete, report that.',
     });
     assert.deepEqual(retryProposal(input({ status }), 'quota_limit', now), {
       kind: 'wait_for_quota',

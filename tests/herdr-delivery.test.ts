@@ -41,7 +41,7 @@ const recovery = (input: Pick<StopInput, 'request_id'>): RecoveryResult => ({
     kind: 'send_recovery_instruction',
     not_before: at,
     instruction:
-      'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.',
+      'Continue the interrupted task from the last unfinished step. Before repeating the preceding operation, check whether it succeeded; do not repeat completed actions. If the same failure is still current, retry the operation once. If the task is already complete, report that.',
   },
   reason_code: 'recoverable_api_error',
   waiting_for: 'recoverable_api_error',

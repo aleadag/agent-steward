@@ -620,7 +620,7 @@ test('version-2 stop results enforce action, reason, classification, and metric 
       kind: 'send_recovery_instruction',
       not_before: '2026-09-29T10:00:30Z',
       instruction:
-        'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.',
+        'Continue the interrupted task from the last unfinished step. Before repeating the preceding operation, check whether it succeeded; do not repeat completed actions. If the same failure is still current, retry the operation once. If the task is already complete, report that.',
     },
     quota: { kind: 'wait_for_quota', not_before: '2026-09-29T12:01:00Z' },
     manual: { kind: 'manual_review' },
@@ -733,6 +733,14 @@ test('version-2 stop results enforce action, reason, classification, and metric 
     { ...validResults[10], proposed_action: { ...actions.quota, instruction: 'send a new command' } },
     { ...recovery, proposed_action: { ...actions.recover, not_before: 'tomorrow' } },
     { ...recovery, proposed_action: { ...actions.recover, instruction: 'run arbitrary command' } },
+    {
+      ...recovery,
+      proposed_action: {
+        ...actions.recover,
+        instruction:
+          'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.',
+      },
+    },
   ];
   for (const [index, value] of invalidResults.entries()) {
     assert.equal(StopResultSchema.safeParse(value).success, false, `invalid result ${index} should fail`);

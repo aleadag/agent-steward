@@ -10,7 +10,7 @@ import type { AgentSnapshot } from '../src/herdr-adapter/observe.ts';
 const pkg = process.env.AGENT_STEWARD_PACKAGE;
 const at = '2026-09-29T10:00:30Z';
 const instruction =
-  'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.';
+  'Continue the interrupted task from the last unfinished step. Before repeating the preceding operation, check whether it succeeded; do not repeat completed actions. If the same failure is still current, retry the operation once. If the task is already complete, report that.';
 const decision = (input: Pick<StopInput, 'request_id'>): StopResult => ({
   schema_version: 2,
   request_id: input.request_id,

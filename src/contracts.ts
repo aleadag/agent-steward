@@ -331,7 +331,7 @@ export const ErrorResultSchema = z.strictObject({
   diagnostics: FailureDiagnosticsSchema.optional(),
 });
 const StopRecoveryInstructionSchema = z.literal(
-  'Check whether the preceding operation succeeded. If it did, do nothing. If the same failure is still current, retry the operation once.',
+  'Continue the interrupted task from the last unfinished step. Before repeating the preceding operation, check whether it succeeded; do not repeat completed actions. If the same failure is still current, retry the operation once. If the task is already complete, report that.',
 );
 const StopProposedActionSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('approve_request') }),
