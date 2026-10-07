@@ -13,6 +13,8 @@ import { WorkflowState } from '../src/herdr-adapter/workflow-state.ts';
 import { assessStop } from '../src/triage.ts';
 import { observeStop, type AgentSnapshot } from '../src/herdr-adapter/observe.ts';
 import type { Evaluation, StopInput } from '../src/contracts.ts';
+import { readStopLedger, type StopLedgerEvent } from '../src/stop-ledger.ts';
+import { createRuntime } from '../src/main.ts';
 
 const at = '2026-10-03T12:00:00Z';
 const dialog = (command = 'printf approval-probe') =>
@@ -63,6 +65,7 @@ async function fixture(enabled = true) {
   const keys: [string, string[]][] = [];
   const inputs: StopInput[] = [];
   const handoffs: string[] = [];
+  const diagnostics: StopLedgerEvent[] = [];
   let risk = 0.1;
   let confidence = 0.9;
   let admission = true;
@@ -104,6 +107,9 @@ async function fixture(enabled = true) {
     handoff: async (reason) => {
       handoffs.push(reason);
     },
+    approvalDiagnostic: async (event) => {
+      diagnostics.push(event);
+    },
   };
   const run = () =>
     handleEvent(
@@ -123,6 +129,7 @@ async function fixture(enabled = true) {
     keys,
     inputs,
     handoffs,
+    diagnostics,
     run,
     changeText: (next: string) => {
       text = next;
@@ -148,6 +155,251 @@ async function fixture(enabled = true) {
     },
   };
 }
+
+test('approval diagnostics correlate both assessments, delivery, and a skipped duplicate without content', async () => {
+  const f = await fixture();
+  try {
+    await f.run();
+    const event = f.diagnostics[0]!;
+    assert.equal(event.approval?.gate, 'delivered');
+    assert.deepEqual(
+      event.approval?.assessments.map((assessment) => assessment.request_id),
+      f.inputs.map((input) => input.request_id),
+    );
+    assert.equal(event.approval?.checkpoint, 'delivery_record');
+    assert.equal(event.approval?.assessments[0]?.waiting_for, 'approve_command');
+    assert.equal(event.approval?.assessments[0]?.waiting_confidence, 0.9);
+    assert.equal(event.approval?.assessments[0]?.risk_probability, 0.1);
+    assert.equal((await f.store.approval('agy', 's1'))?.attempt_id, event.request_id);
+    await f.run();
+    assert.equal(f.diagnostics[1]?.request_id, event.request_id);
+    assert.equal(f.diagnostics[1]?.approval_skip, 'previous_delivered');
+    assert.equal(f.inputs.length, 2);
+    assert.equal(f.keys.length, 1);
+    assert.doesNotMatch(JSON.stringify(f.diagnostics), /printf|approval-probe|w1:p1|herdr:antigravity_cli|"s1"/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+for (const [name, setup, gate, count] of [
+  ['high risk', (f: Awaited<ReturnType<typeof fixture>>) => f.setRisk(0.9), 'assessment_rejected', 1],
+  [
+    'classification mismatch',
+    (f: Awaited<ReturnType<typeof fixture>>) => f.setWaiting('approve_edit'),
+    'classification_mismatch',
+    1,
+  ],
+  [
+    'observation changes after first assessment',
+    (f: Awaited<ReturnType<typeof fixture>>) => {
+      const decide = f.deps.decide;
+      f.deps.decide = async (input) => {
+        const result = await decide(input);
+        f.changePane({ state_change_seq: 5 });
+        return result;
+      };
+    },
+    'observation_changed',
+    1,
+  ],
+  [
+    'evaluator failure',
+    (f: Awaited<ReturnType<typeof fixture>>) => {
+      f.deps.decide = async () => {
+        throw new Error('private upstream output');
+      };
+    },
+    'evaluator_failed',
+    1,
+  ],
+] as const) {
+  test(`approval diagnostics explain ${name} without changing human handoff`, async () => {
+    const f = await fixture();
+    try {
+      setup(f);
+      await f.run();
+      const event = f.diagnostics[0]!;
+      assert.equal(event.approval?.gate, gate);
+      assert.equal(event.approval?.checkpoint, gate === 'observation_changed' ? 'after_assessment_1' : 'assessment_1');
+      assert.equal(event.approval?.assessments.length, count);
+      assert.deepEqual(f.keys, []);
+      assert.doesNotMatch(JSON.stringify(event), /private upstream output|printf|w1:p1/);
+      if (gate !== 'evaluator_failed') {
+        await f.run();
+        assert.equal(f.diagnostics[1]?.approval_skip, 'previous_human');
+        assert.equal(f.diagnostics[1]?.request_id, event.request_id);
+      }
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
+for (const failure of ['prewrite', 'final_read', 'cleanup_write'] as const) {
+  test(`no-send cleanup preserves the primary ${failure} gate and separately reports cleanup`, async () => {
+    const f = await fixture();
+    try {
+      const record = f.store.recordApproval.bind(f.store);
+      let finalRead = false;
+      f.store.recordApproval = async (pane, attempt) => {
+        if (failure === 'prewrite' && attempt.state === 'uncertain') throw new Error('private write error');
+        if (failure === 'cleanup_write' && attempt.state === 'not_sent') throw new Error('private cleanup error');
+        await record(pane, attempt);
+        if (attempt.state === 'uncertain') finalRead = true;
+      };
+      const read = f.herdr.read;
+      f.herdr.read = async () => {
+        if (finalRead) {
+          finalRead = false;
+          return { pane_id: 'w1:p1', source: 'detection', revision: 0, text: '', truncated: true };
+        }
+        return read();
+      };
+      await f.run();
+      const diagnostic = f.diagnostics[0]?.approval;
+      assert.equal(diagnostic?.gate, failure === 'prewrite' ? 'record_failed' : 'observation_unavailable');
+      assert.equal(diagnostic?.checkpoint, failure === 'prewrite' ? 'prewrite' : 'before_delivery');
+      assert.equal(diagnostic?.no_send_cleanup?.outcome, failure === 'cleanup_write' ? 'record_failed' : 'recorded');
+      assert.equal(
+        (await f.store.approval('agy', 's1'))?.state,
+        failure === 'cleanup_write' ? 'uncertain' : 'not_sent',
+      );
+      assert.equal(f.inputs.length, 2);
+      assert.deepEqual(f.keys, []);
+      assert.doesNotMatch(JSON.stringify(f.diagnostics), /private write error|private cleanup error/);
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
+test('second policy rejection retains the first approval and the second risk judgment', async () => {
+  const f = await fixture();
+  try {
+    const decide = f.deps.decide;
+    f.deps.decide = async (input) => {
+      const result = await decide(input);
+      f.setRisk(0.9);
+      return result;
+    };
+    await f.run();
+    const diagnostic = f.diagnostics[0]?.approval;
+    assert.equal(diagnostic?.gate, 'assessment_rejected');
+    assert.equal(diagnostic?.checkpoint, 'assessment_2');
+    assert.deepEqual(
+      diagnostic?.assessments.map((assessment) => assessment.reason_code),
+      ['low_risk', 'high_risk'],
+    );
+    assert.deepEqual(f.keys, []);
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'human');
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('revocation after assessment is diagnosed without writing new approval metadata or input', async () => {
+  const f = await fixture();
+  try {
+    const decide = f.deps.decide;
+    f.deps.decide = async (input) => {
+      const result = await decide(input);
+      f.stopAdmission();
+      return result;
+    };
+    await f.run();
+    assert.equal(f.diagnostics[0]?.approval?.gate, 'ownership_lost');
+    assert.equal(f.diagnostics[0]?.approval?.assessments.length, 1);
+    assert.equal(await f.store.approval('agy', 's1'), null);
+    assert.deepEqual(f.keys, []);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('uncertain transport is diagnosed and duplicate quarantine remains linked to the original attempt', async () => {
+  const f = await fixture();
+  try {
+    const send = f.herdr.sendKeys;
+    f.herdr.sendKeys = async (pane, keys) => {
+      await send(pane, keys);
+      throw new Error('private lost acknowledgment');
+    };
+    await f.run();
+    const event = f.diagnostics[0]!;
+    assert.equal(event.approval?.gate, 'uncertain_delivery');
+    assert.equal(event.approval?.transport_started, true);
+    assert.equal(event.approval?.checkpoint, 'delivery');
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'uncertain');
+    f.changeText(dialog('printf different-probe'));
+    await f.run();
+    assert.equal(f.diagnostics[1]?.approval_skip, 'uncertain_session');
+    assert.equal(f.diagnostics[1]?.request_id, event.request_id);
+    assert.equal(f.keys.length, 1);
+    assert.doesNotMatch(JSON.stringify(f.diagnostics), /private lost acknowledgment|different-probe/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('structured evaluator errors retain safe transport diagnostics in the approval attempt', async () => {
+  const f = await fixture();
+  try {
+    f.deps.decide = async (input) => ({
+      schema_version: 2,
+      request_id: input.request_id,
+      decision: 'error',
+      reason_code: 'evaluation_failed',
+      message: 'private upstream body',
+      diagnostics: { stage: 'evaluation', kind: 'http', http_status: 503, duration_ms: 100 },
+    });
+    await f.run();
+    const diagnostic = f.diagnostics[0]?.approval;
+    assert.equal(diagnostic?.gate, 'evaluator_failed');
+    assert.equal(diagnostic?.assessments[0]?.diagnostics?.http_status, 503);
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'human');
+    assert.deepEqual(f.keys, []);
+    assert.doesNotMatch(JSON.stringify(f.diagnostics), /private upstream body/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('a stalled diagnostic sink has a bounded wait after delivery and never retries input', async () => {
+  const f = await fixture();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    f.deps.approvalDiagnostic = async () => new Promise(() => {});
+    await Promise.race([
+      f.run(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('diagnostics stalled approval handler')), 4000);
+      }),
+    ]);
+    assert.equal(f.inputs.length, 2);
+    assert.equal(f.keys.length, 1);
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
+  } finally {
+    clearTimeout(timer);
+    await f.cleanup();
+  }
+});
+
+test('diagnostic sink failure cannot prevent guarded approval or cause input retries', async () => {
+  const f = await fixture();
+  try {
+    f.deps.approvalDiagnostic = async () => {
+      throw new Error('diagnostic disk unavailable');
+    };
+    await f.run();
+    await f.run();
+    assert.equal(f.inputs.length, 2);
+    assert.equal(f.keys.length, 1);
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
+  } finally {
+    await f.cleanup();
+  }
+});
 
 const partialMenu = 'Requesting permission for:\n   printf approval-probe\n\nRun this command?\n> 1. Yes, run command';
 
@@ -972,6 +1224,7 @@ test('configured event entrypoint sends literal agent send-keys once through Her
   try {
     assert.equal((await socketReader(socket).list?.())?.[0]?.pane_id, 'w1:p1');
     const env = {
+      XDG_STATE_HOME: join(root, 'cli-state'),
       HERDR_SOCKET_PATH: socket,
       HERDR_BIN_PATH: binary,
       HERDR_PLUGIN_ID: 'agent-steward-recover',
@@ -988,8 +1241,18 @@ test('configured event entrypoint sends literal agent send-keys once through Her
     };
     await runEvent(env, f.deps.decide);
     assert.equal(await readFile(argv, 'utf8'), 'agent\nsend-keys\nw1:p1\n1\n');
+    const ledger = createRuntime();
+    ledger.env = { XDG_STATE_HOME: env.XDG_STATE_HOME };
+    const [attempt] = await readStopLedger(ledger);
+    assert.equal(attempt?.approval?.gate, 'delivered');
+    assert.equal(attempt?.approval?.assessments.length, 2);
+    assert.doesNotMatch(JSON.stringify(attempt), /printf|w1:p1|"s1"/);
     await runEvent(env, f.deps.decide);
     assert.equal(await readFile(argv, 'utf8'), 'agent\nsend-keys\nw1:p1\n1\n');
+    const [skipped] = await readStopLedger(ledger);
+    assert.equal(skipped?.request_id, attempt?.request_id);
+    assert.equal(skipped?.approval_skip, 'previous_delivered');
+    assert.equal(skipped?.approval?.gate, 'delivered');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(root, { recursive: true, force: true });

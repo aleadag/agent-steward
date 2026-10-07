@@ -13,6 +13,7 @@ import type { HerdrReader } from './observe.ts';
 import type { StopInput, StopResult } from '../contracts.ts';
 import type { WorkflowAuthority } from './authority.ts';
 import type { WorkflowState } from './workflow-state.ts';
+import type { StopLedgerEvent } from '../stop-ledger.ts';
 
 export type Event = {
   type?: string;
@@ -60,6 +61,7 @@ export type EventDeps = {
   autoApprove?: boolean;
   quotaHint?: QuotaHint;
   decide: (input: StopInput) => Promise<unknown>;
+  approvalDiagnostic?: (event: StopLedgerEvent) => Promise<void>;
   store: Store;
   clock: { now: () => Date };
   targets: readonly string[] | 'all';

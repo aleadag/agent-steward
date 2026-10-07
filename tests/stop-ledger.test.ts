@@ -81,6 +81,139 @@ const baseStopEvent: StopLedgerEvent = {
   reason_code: 'insufficient_context',
 };
 
+test('stop ledger retains bounded assessment and evaluator failure diagnostics alongside older records', async () => {
+  const files = new Map<string, string>();
+  const { rt } = memoryRuntime(files, { XDG_STATE_HOME: '/isolated/state' });
+  await appendStopEvent(rt, baseStopEvent);
+  const event = {
+    ...baseStopEvent,
+    request_id: 'diagnosed',
+    waiting_for: 'approve_command',
+    waiting_confidence: 0.9,
+    risk_probability: 0.1,
+    diagnostics: { stage: 'evaluation', kind: 'http', http_status: 503, duration_ms: 100 },
+  } as StopLedgerEvent;
+  await appendStopEvent(rt, event);
+  assert.deepEqual(await readStopLedger(rt), [event, baseStopEvent]);
+});
+
+test('stop ledger folds duplicate suppression without erasing the original gate or assessments', async () => {
+  const files = new Map<string, string>();
+  const { rt } = memoryRuntime(files, { XDG_STATE_HOME: '/isolated/state' });
+  const id = '10000000-0000-4000-8000-000000000001';
+  const event = {
+    ...baseStopEvent,
+    request_id: id,
+    event: 'approval',
+    reason_code: 'observation_changed',
+    approval: {
+      attempt_id: id,
+      gate: 'observation_changed',
+      transport_started: false,
+      assessments: [
+        {
+          request_id: '20000000-0000-4000-8000-000000000001',
+          action: 'approve_request',
+          reason_code: 'low_risk',
+          waiting_for: 'approve_command',
+          waiting_confidence: 0.9,
+          risk_probability: 0.1,
+        },
+      ],
+    },
+  } as StopLedgerEvent;
+  await appendStopEvent(rt, event);
+  await appendStopEvent(rt, {
+    ...baseStopEvent,
+    request_id: id,
+    event: 'approval_skipped',
+    reason_code: 'previous_human',
+    approval_skip: 'previous_human',
+  } as StopLedgerEvent);
+  const [record] = await readStopLedger(rt);
+  assert.deepEqual(record?.approval, event.approval);
+  assert.equal(record?.approval_skip, 'previous_human');
+});
+
+test('retained approval skips carry the original diagnostic snapshot across two rotations', async () => {
+  const files = new Map<string, string>();
+  const { rt } = memoryRuntime(files, { XDG_STATE_HOME: '/isolated/state' });
+  const file = stopLedgerFile(rt.env);
+  const id = '10000000-0000-4000-8000-000000000001';
+  const event: StopLedgerEvent = {
+    ...baseStopEvent,
+    request_id: id,
+    event: 'approval',
+    reason_code: 'assessment_rejected',
+    approval: {
+      attempt_id: id,
+      gate: 'assessment_rejected',
+      transport_started: false,
+      recorded_at: '2026-10-01T00:00:00Z',
+      assessments: [
+        {
+          request_id: '20000000-0000-4000-8000-000000000001',
+          action: 'manual_review',
+          reason_code: 'high_risk',
+          waiting_for: 'approve_command',
+          waiting_confidence: 0.9,
+          risk_probability: 0.9,
+        },
+      ],
+    },
+  };
+  await appendStopEvent(rt, event);
+  for (let generation = 0; generation < 2; generation++) {
+    const current = files.get(file)!;
+    files.set(file, current + ' '.repeat(rotationLimit - Buffer.byteLength(current)));
+    await appendStopEvent(rt, {
+      ...baseStopEvent,
+      request_id: id,
+      event: 'approval_skipped',
+      reason_code: 'previous_human',
+      approval_skip: 'previous_human',
+    });
+  }
+  const [retained] = await readStopLedger(rt);
+  assert.deepEqual(retained?.approval, event.approval);
+  assert.equal(retained?.approval_skip, 'previous_human');
+  assert.ok(Buffer.byteLength(files.get(file)!) < 4096);
+});
+
+test('a legacy skip explicitly reports missing original diagnostics', async () => {
+  const files = new Map<string, string>();
+  const { rt } = memoryRuntime(files, { XDG_STATE_HOME: '/isolated/state' });
+  await appendStopEvent(rt, {
+    ...baseStopEvent,
+    event: 'approval_skipped',
+    approval_skip: 'previous_human',
+    reason_code: 'previous_human',
+  });
+  assert.equal((await readStopLedger(rt))[0]?.approval_diagnostics_missing, true);
+});
+
+test('stop ledger diagnostic schemas reject raw content, unbounded arrays and invalid metrics', async () => {
+  const files = new Map<string, string>();
+  const { rt } = memoryRuntime(files, { XDG_STATE_HOME: '/isolated/state' });
+  for (const extra of [
+    { waiting_for: 'private command' },
+    { waiting_confidence: 2 },
+    { risk_probability: -1 },
+    { diagnostics: { stage: 'evaluation', response: 'raw body' } },
+    {
+      approval: {
+        attempt_id: '10000000-0000-4000-8000-000000000001',
+        gate: 'private upstream output',
+        transport_started: false,
+        assessments: [],
+      },
+    },
+  ]) {
+    await assert.rejects(appendStopEvent(rt, { ...baseStopEvent, ...extra } as StopLedgerEvent), StewardError);
+  }
+  assert.equal(files.size, 0);
+});
+
 test('stopTool accepts only routing tool identifiers', () => {
   assert.equal(stopTool('agy'), 'agy');
   assert.equal(stopTool('pi'), 'pi');

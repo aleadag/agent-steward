@@ -6,6 +6,7 @@ import type { Config, Evaluation, SelectedResult, StopInput } from '../src/contr
 import type { HttpPost, Questions } from '../src/jev.ts';
 import type { NativeLaunch } from '../src/launch.ts';
 import { config, candidate, choiceAnswer, jevResponse, snapshot, windowFact } from './helpers.ts';
+import { appendStopEvent } from '../src/stop-ledger.ts';
 
 type JevWire = { model: string; state: unknown; questions: Questions };
 type PostAnswer = (wire: JevWire, index: number) => unknown;
@@ -2132,6 +2133,9 @@ test('stop check records evaluated assessment with action and usage without inst
   assert.equal(event.reason_code, 'recoverable_api_error');
   assert.equal(event.request_id, 'request-1');
   assert.deepEqual(event.usage, { input_tokens: 12, output_tokens: 3 });
+  assert.equal(event.waiting_for, 'recoverable_api_error');
+  assert.equal(event.waiting_confidence, 0.9);
+  assert.equal(event.risk_probability, 0.1);
 });
 
 test('stop check records failed event on invalid input without leaking stdin', async () => {
@@ -2220,4 +2224,95 @@ test('stop list --json and stop show inspect recorded stop check history', async
   const shown = JSON.parse(out.join(''));
   assert.equal(shown.request_id, 'req-check-1');
   assert.equal(shown.event, 'assessed');
+  assert.equal(shown.waiting_for, 'other');
+  assert.equal(shown.waiting_confidence, null);
+  assert.equal(shown.risk_probability, null);
+});
+
+test('stop show links an assessment to both approval assessments and the original rejected gate after a skip', async () => {
+  const id = '20000000-0000-4000-8000-000000000001';
+  const second = '20000000-0000-4000-8000-000000000002';
+  const attempt = '10000000-0000-4000-8000-000000000001';
+  const { post } = fakePost((wire) => stopAnswer(wire, 'approve_command', 0.1));
+  const { io, out } = runtime({
+    env: { HOME: '/isolated/home', TYPESAFE_API_KEY: 'test-key' },
+    readStdin: async () => JSON.stringify(stopInput({ request_id: id })),
+    post,
+  });
+  assert.equal(await run(['stop', 'check'], io), 0);
+  const summary = {
+    action: 'approve_request' as const,
+    reason_code: 'low_risk' as const,
+    waiting_for: 'approve_command' as const,
+    waiting_confidence: 0.9,
+    risk_probability: 0.1,
+  };
+  await appendStopEvent(io, {
+    schema_version: 1,
+    request_id: attempt,
+    recorded_at: NOW.toISOString(),
+    event: 'approval',
+    reason_code: 'observation_changed',
+    approval: {
+      attempt_id: attempt,
+      recorded_at: '2026-10-01T00:00:00Z',
+      gate: 'observation_changed',
+      transport_started: false,
+      checkpoint: 'after_assessment_2',
+      assessments: [
+        { request_id: id, ...summary },
+        { request_id: second, ...summary },
+      ],
+    },
+  });
+  await appendStopEvent(io, {
+    schema_version: 1,
+    request_id: attempt,
+    recorded_at: NOW.toISOString(),
+    event: 'approval_skipped',
+    reason_code: 'previous_human',
+    approval_skip: 'previous_human',
+  });
+  out.length = 0;
+  io.post = async () => {
+    throw new Error('show must not reevaluate');
+  };
+  io.env.TYPESAFE_API_KEY = undefined;
+  assert.equal(await run(['stop', 'show', id, '--json'], io), 0);
+  const shown = JSON.parse(out.join(''));
+  assert.equal(shown.request_id, id);
+  assert.equal(shown.waiting_for, 'approve_command');
+  assert.equal(shown.waiting_confidence, 0.9);
+  assert.equal(shown.risk_probability, 0.1);
+  assert.equal(shown.approval.attempt_id, attempt);
+  assert.equal(shown.approval.gate, 'observation_changed');
+  assert.equal(shown.approval.assessments.length, 2);
+  assert.equal(shown.approval_skip, 'previous_human');
+  out.length = 0;
+  assert.equal(await run(['stop', 'show', attempt], io), 0);
+  assert.equal(JSON.parse(out.join('')).approval.gate, 'observation_changed');
+  out.length = 0;
+  assert.equal(await run(['stop', 'show', second, '--json'], io), 0);
+  const recovered = JSON.parse(out.join(''));
+  assert.equal(recovered.request_id, second);
+  assert.equal(recovered.assessment_record_missing, true);
+  assert.equal(recovered.recorded_at, '2026-10-01T00:00:00Z');
+  assert.equal(recovered.recorded_at_source, 'approval_attempt');
+  assert.equal(recovered.approval.assessments.length, 2);
+});
+
+test('stop show preserves sanitized evaluator failure details without raw response content', async () => {
+  const { io, out, files } = runtime({
+    env: { HOME: '/isolated/home', TYPESAFE_API_KEY: 'test-key' },
+    post: async () => ({ status: 503, body: 'private provider response' }),
+  });
+  assert.equal(await run(['stop', 'check'], io), 1);
+  const expected = result(out).diagnostics;
+  assert.equal(expected.http_status, 503);
+  out.length = 0;
+  assert.equal(await run(['stop', 'show', 'request-1', '--json'], io), 0);
+  const shown = JSON.parse(out.join(''));
+  assert.equal(shown.event, 'failed');
+  assert.deepEqual(shown.diagnostics, expected);
+  assert.doesNotMatch([...files.values()].join(''), /private provider response|Current prompt|test-key/);
 });

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { StopInputSchema, StopResultSchema } from '../contracts.ts';
+import { StewardError, StopInputSchema, StopResultSchema } from '../contracts.ts';
+import { ApprovalDiagnosticSchema, stopTool, type ApprovalDiagnostic } from '../stop-ledger.ts';
 import { observeStop, type ObservedStop } from './observe.ts';
 import type { EventDeps } from './events.ts';
 import type { ApprovalAttempt } from './state.ts';
@@ -89,160 +90,298 @@ export async function handleBestEffortApproval(
   if (deps.observationAllowed && !deps.observationAllowed(observed)) return true;
   const menu = approvalMenu(observed.context);
   if (!menu) return false;
+  let attemptId: string = randomUUID();
+  let gate: ApprovalDiagnostic['gate'] = 'control_unavailable';
+  let skip: 'previous_human' | 'previous_delivered' | 'uncertain_session' | undefined;
+  let transportStarted = false;
+  let checkpoint: NonNullable<ApprovalDiagnostic['checkpoint']> = 'initial';
+  let originalRecordedAt: string | undefined;
+  let noSendCleanup: ApprovalDiagnostic['no_send_cleanup'];
+  const assessments: ApprovalDiagnostic['assessments'] = [];
+  const report = async () => {
+    if (!deps.approvalDiagnostic) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const approval = skip
+        ? undefined
+        : ApprovalDiagnosticSchema.parse({
+            attempt_id: attemptId,
+            recorded_at: originalRecordedAt ?? new Date().toISOString(),
+            ...(noSendCleanup ? { no_send_cleanup: noSendCleanup } : {}),
+            gate,
+            checkpoint,
+            transport_started: transportStarted,
+            assessments,
+          });
+      const write = deps.approvalDiagnostic({
+        schema_version: 1,
+        request_id: attemptId,
+        recorded_at: new Date().toISOString(),
+        event: skip ? 'approval_skipped' : 'approval',
+        reason_code: skip ?? gate,
+        ...(stopTool(observed.agent) ? { tool: stopTool(observed.agent) } : {}),
+        ...(approval ? { approval } : { approval_skip: skip }),
+      });
+      await Promise.race([
+        write,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, 2000);
+        }),
+      ]);
+    } catch {
+      // Diagnostics never grant authority, change the outcome, or retry input.
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   const admissionOpen = deps.admissionOpen ?? (() => true);
-  const owns = async () => admissionOpen() && (await stillOwner()) && admissionOpen();
+  const owns = async () => {
+    const owned = admissionOpen() && (await stillOwner()) && admissionOpen();
+    if (!owned) gate = 'ownership_lost';
+    return owned;
+  };
   const human = async () => {
     if (admissionOpen()) await deps.handoff('human_review_required');
   };
   // All callers must hold the same per-pane lock, with persistent write metadata.
   if (!deps.store.withEpisodeLock || !deps.store.approval || !deps.store.recordApproval || !deps.herdr.sendKeys) {
     await human();
+    await report();
     return true;
   }
   return (
     (await deps.store.withEpisodeLock(`approval:${JSON.stringify([observed.agent, observed.session_id])}`, async () => {
-      if (!(await owns())) return true;
-      let previous;
       try {
-        previous = await deps.store.approval!(observed.agent, observed.session_id);
-      } catch {
-        await human();
-        return true;
-      }
-      if (!admissionOpen()) return true;
-      const digest = createHash('sha256')
-        .update(JSON.stringify([observed.agent, menu]))
-        .digest('hex');
-      if (previous?.session_id === observed.session_id) {
-        if (previous.state === 'uncertain') {
-          await human();
-          return true;
-        }
-        // Footer/revision/sequence changes alone are not a fresh permission menu.
-        if (previous.digest === digest && previous.state !== 'not_sent') return true;
-      }
-      const now = deps.clock.now();
-      if (!Number.isFinite(now.getTime())) return true;
-      const record: ApprovalAttempt = {
-        pane_id: observed.pane_id,
-        agent: observed.agent,
-        session_id: observed.session_id,
-        digest,
-        state: 'human',
-        recorded_at: now.toISOString(),
-      };
-      const matchingObservation = async () => {
-        if (!(await owns())) return false;
-        const fresh = await observeStop(deps.herdr, observed.pane_id);
-        return (
-          admissionOpen() &&
-          fresh?.current_episode_id === observed.current_episode_id &&
-          (!deps.observationAllowed || deps.observationAllowed(fresh))
-        );
-      };
-      const input = () =>
-        StopInputSchema.parse({
-          schema_version: 2,
-          request_id: randomUUID(),
-          agent: {
-            id: observed.session_id,
-            tool: observed.agent,
-            pane_id: observed.pane_id,
-            session_id: observed.session_id,
-          },
-          // An explicit permission menu is logically blocked even when Herdr reports idle.
-          // Raw Herdr status remains part of the unchanged-observation delivery checks.
-          status: 'blocked',
-          context: observed.context,
-          pending_action: { action: menu.action },
-          current_episode_id: observed.current_episode_id,
-          automatic_approval_forbidden: false,
-          retry: {
-            failure_episode_id: observed.current_episode_id,
-            first_observed_at: now.toISOString(),
-            attempt_count: 0,
-            last_attempt_at: null,
-            quota_check_count: 0,
-            last_quota_check_at: null,
-          },
-        });
-      const approved = async () => {
-        const request = input();
-        if (!admissionOpen()) return false;
-        const result = StopResultSchema.parse(await deps.decide(request));
-        return (
-          admissionOpen() &&
-          result.decision === 'stop_decision' &&
-          result.request_id === request.request_id &&
-          result.proposed_action.kind === 'approve_request' &&
-          result.waiting_for === menu.kind
-        );
-      };
-      let transportStarted = false;
-      const recordNotSent = async (reason: NonNullable<ApprovalAttempt['not_sent_reason']>) => {
-        if (transportStarted || record.state !== 'uncertain') return;
+        gate = 'ownership_lost';
+        if (!(await owns())) return true;
+        let previous;
         try {
-          if (!(await owns())) return;
-          const fresh = await observeStop(deps.herdr, observed.pane_id);
-          if (
-            !fresh ||
-            fresh.workspace_id !== observed.workspace_id ||
-            fresh.agent !== observed.agent ||
-            fresh.session_id !== observed.session_id ||
-            fresh.session_kind !== observed.session_kind ||
-            fresh.session_source !== observed.session_source ||
-            (deps.observationAllowed && !deps.observationAllowed(fresh)) ||
-            !(await owns())
-          )
-            return;
-          // Both locks remain held. This invocation knows the transport was
-          // never called; crashes or lost authority leave the marker uncertain.
-          await deps.store.recordApproval!(observed.pane_id, {
-            ...record,
-            state: 'not_sent',
-            not_sent_reason: reason,
-          });
+          gate = 'state_unavailable';
+          previous = await deps.store.approval!(observed.agent, observed.session_id);
         } catch {
-          // Failure to publish no-send evidence must retain quarantine.
-        }
-      };
-      try {
-        if (
-          !(await matchingObservation()) ||
-          !(await approved()) ||
-          !(await matchingObservation()) ||
-          !(await approved()) ||
-          !(await matchingObservation())
-        ) {
-          if (await owns()) await deps.store.recordApproval!(observed.pane_id, record);
           await human();
           return true;
         }
-        if (!(await owns())) return true;
-        // Commit ambiguity before the key. Never replay after timeout or a lost ack,
-        // including across changed prompts and supervisor restarts in this session.
-        record.state = 'uncertain';
-        await deps.store.recordApproval!(observed.pane_id, record);
-        if (!(await matchingObservation()) || !(await owns())) {
-          await recordNotSent('observation_changed');
-          await human();
+        if (!admissionOpen()) {
+          gate = 'ownership_lost';
           return true;
         }
-        // Herdr cannot make the last observation and keypress atomic. Global enablement
-        // explicitly accepts that race; do not label this native request-binding proof.
-        const send = () => {
-          transportStarted = true;
-          return deps.herdr.sendKeys!(observed.pane_id, ['1']);
+        const digest = createHash('sha256')
+          .update(JSON.stringify([observed.agent, menu]))
+          .digest('hex');
+        if (previous?.session_id === observed.session_id) {
+          if (previous.state === 'uncertain') {
+            attemptId = previous.attempt_id ?? attemptId;
+            skip = 'uncertain_session';
+            await human();
+            return true;
+          }
+          // Footer/revision/sequence changes alone are not a fresh permission menu.
+          if (previous.digest === digest && previous.state !== 'not_sent') {
+            attemptId = previous.attempt_id ?? attemptId;
+            skip = previous.state === 'human' ? 'previous_human' : 'previous_delivered';
+            return true;
+          }
+        }
+        const now = deps.clock.now();
+        if (!Number.isFinite(now.getTime())) {
+          gate = 'clock_invalid';
+          return true;
+        }
+        originalRecordedAt = now.toISOString();
+        const record: ApprovalAttempt = {
+          pane_id: observed.pane_id,
+          agent: observed.agent,
+          session_id: observed.session_id,
+          digest,
+          state: 'human',
+          attempt_id: attemptId,
+          recorded_at: now.toISOString(),
         };
-        if (deps.dispatchEffect) await deps.dispatchEffect('approval', send);
-        else await send();
-        if (!(await owns())) return true;
-        await deps.store.recordApproval!(observed.pane_id, { ...record, state: 'delivered' });
-      } catch {
-        await recordNotSent('delivery_not_started');
-        await human();
+        let observationCount = 0;
+        const matchingObservation = async () => {
+          checkpoint =
+            (['initial', 'after_assessment_1', 'after_assessment_2', 'before_delivery'] as const)[observationCount++] ??
+            'before_delivery';
+          if (!(await owns())) return false;
+          gate = 'observation_unavailable';
+          const fresh = await observeStop(deps.herdr, observed.pane_id);
+          const matches =
+            admissionOpen() &&
+            fresh?.current_episode_id === observed.current_episode_id &&
+            (!deps.observationAllowed || deps.observationAllowed(fresh));
+          if (!matches)
+            gate = admissionOpen() ? (fresh ? 'observation_changed' : 'observation_unavailable') : 'ownership_lost';
+          return matches;
+        };
+        const input = () =>
+          StopInputSchema.parse({
+            schema_version: 2,
+            request_id: randomUUID(),
+            agent: {
+              id: observed.session_id,
+              tool: observed.agent,
+              pane_id: observed.pane_id,
+              session_id: observed.session_id,
+            },
+            // An explicit permission menu is logically blocked even when Herdr reports idle.
+            // Raw Herdr status remains part of the unchanged-observation delivery checks.
+            status: 'blocked',
+            context: observed.context,
+            pending_action: { action: menu.action },
+            current_episode_id: observed.current_episode_id,
+            automatic_approval_forbidden: false,
+            retry: {
+              failure_episode_id: observed.current_episode_id,
+              first_observed_at: now.toISOString(),
+              attempt_count: 0,
+              last_attempt_at: null,
+              quota_check_count: 0,
+              last_quota_check_at: null,
+            },
+          });
+        const approved = async () => {
+          checkpoint = assessments.length === 0 ? 'assessment_1' : 'assessment_2';
+          const request = input();
+          if (!admissionOpen()) {
+            gate = 'ownership_lost';
+            return false;
+          }
+          let result;
+          try {
+            result = StopResultSchema.parse(await deps.decide(request));
+          } catch (error) {
+            gate = 'evaluator_failed';
+            assessments.push({
+              request_id: request.request_id,
+              reason_code: error instanceof StewardError ? error.code : 'evaluation_failed',
+              ...(error instanceof StewardError && error.diagnostics ? { diagnostics: error.diagnostics } : {}),
+            });
+            throw error;
+          }
+          if (result.decision === 'error') {
+            gate = 'evaluator_failed';
+            assessments.push({
+              request_id: request.request_id,
+              reason_code: result.reason_code,
+              ...(result.diagnostics ? { diagnostics: result.diagnostics } : {}),
+            });
+            return false;
+          }
+          assessments.push({
+            request_id: request.request_id,
+            action: result.proposed_action.kind,
+            reason_code: result.reason_code,
+            waiting_for: result.waiting_for,
+            waiting_confidence: result.waiting_confidence,
+            risk_probability: result.risk_probability,
+          });
+          if (!admissionOpen()) {
+            gate = 'ownership_lost';
+            return false;
+          }
+          if (result.request_id !== request.request_id) {
+            gate = 'request_mismatch';
+            return false;
+          }
+          if (result.proposed_action.kind !== 'approve_request') {
+            gate = 'assessment_rejected';
+            return false;
+          }
+          if (result.waiting_for !== menu.kind) {
+            gate = 'classification_mismatch';
+            return false;
+          }
+          return true;
+        };
+        const recordNotSent = async (reason: NonNullable<ApprovalAttempt['not_sent_reason']>) => {
+          if (transportStarted || record.state !== 'uncertain') return;
+          const stoppingGate = gate;
+          let outcome: NonNullable<ApprovalDiagnostic['no_send_cleanup']>['outcome'] = 'observation_unavailable';
+          try {
+            if (!(await owns())) return;
+            const fresh = await observeStop(deps.herdr, observed.pane_id);
+            if (
+              !fresh ||
+              fresh.workspace_id !== observed.workspace_id ||
+              fresh.agent !== observed.agent ||
+              fresh.session_id !== observed.session_id ||
+              fresh.session_kind !== observed.session_kind ||
+              fresh.session_source !== observed.session_source ||
+              (deps.observationAllowed && !deps.observationAllowed(fresh)) ||
+              !(await owns())
+            )
+              return;
+            // Both locks remain held. This invocation knows the transport was
+            // never called; crashes or lost authority leave the marker uncertain.
+            outcome = 'record_failed';
+            await deps.store.recordApproval!(observed.pane_id, {
+              ...record,
+              state: 'not_sent',
+              not_sent_reason: reason,
+            });
+            outcome = 'recorded';
+          } catch {
+            // Failure to publish no-send evidence must retain quarantine.
+          } finally {
+            if (outcome === 'observation_unavailable' && gate === 'ownership_lost') outcome = 'ownership_lost';
+            noSendCleanup = { reason, outcome };
+            gate = stoppingGate;
+          }
+        };
+        try {
+          if (
+            !(await matchingObservation()) ||
+            !(await approved()) ||
+            !(await matchingObservation()) ||
+            !(await approved()) ||
+            !(await matchingObservation())
+          ) {
+            if (await owns()) {
+              const rejectedGate = gate;
+              gate = 'record_failed';
+              await deps.store.recordApproval!(observed.pane_id, record);
+              gate = rejectedGate;
+            }
+            await human();
+            return true;
+          }
+          if (!(await owns())) return true;
+          // Commit ambiguity before the key. Never replay after timeout or a lost ack,
+          // including across changed prompts and supervisor restarts in this session.
+          record.state = 'uncertain';
+          checkpoint = 'prewrite';
+          gate = 'record_failed';
+          await deps.store.recordApproval!(observed.pane_id, record);
+          if (!(await matchingObservation()) || !(await owns())) {
+            await recordNotSent('observation_changed');
+            await human();
+            return true;
+          }
+          // Herdr cannot make the last observation and keypress atomic. Global enablement
+          // explicitly accepts that race; do not label this native request-binding proof.
+          gate = 'delivery_not_started';
+          const send = () => {
+            transportStarted = true;
+            checkpoint = 'delivery';
+            gate = 'uncertain_delivery';
+            return deps.herdr.sendKeys!(observed.pane_id, ['1']);
+          };
+          if (deps.dispatchEffect) await deps.dispatchEffect('approval', send);
+          else await send();
+          if (!(await owns())) return true;
+          checkpoint = 'delivery_record';
+          gate = 'record_failed';
+          await deps.store.recordApproval!(observed.pane_id, { ...record, state: 'delivered' });
+          gate = 'delivered';
+        } catch {
+          await recordNotSent('delivery_not_started');
+          await human();
+        }
+        return true;
+      } finally {
+        await report();
       }
-      return true;
     })) ?? true
   );
 }

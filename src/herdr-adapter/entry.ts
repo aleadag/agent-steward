@@ -5,7 +5,9 @@ import { connect } from 'node:net';
 import { isAbsolute, join } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
-import { StopResultSchema } from '../contracts.ts';
+import { StewardError, StopResultSchema } from '../contracts.ts';
+import { appendStopEvent } from '../stop-ledger.ts';
+import { createRuntime } from '../main.ts';
 import { readFileText } from '../io.ts';
 import { beginWorkflow } from './authority.ts';
 import type { HerdrControl } from './deliver.ts';
@@ -236,11 +238,15 @@ export async function decideWithCli(
     });
     child.stdin.end(JSON.stringify(input));
   });
-  if (exit !== 0 && exit !== 2 && exit !== 3) throw new Error('stop check failed');
   let result: StopResult;
   try {
-    result = StopResultSchema.parse(JSON.parse(data));
-  } catch {
+    const decoded: unknown = JSON.parse(data);
+    result = StopResultSchema.parse(decoded);
+    if (result.decision === 'error' && result.request_id === input.request_id)
+      throw new StewardError(result.reason_code, result.diagnostics);
+    if (exit !== 0 && exit !== 2 && exit !== 3) throw new Error('stop check failed');
+  } catch (error) {
+    if (error instanceof StewardError) throw error;
     throw new Error('invalid stop check response');
   }
   if (result.decision === 'error' || result.request_id !== input.request_id)
@@ -657,9 +663,17 @@ export async function runEvent(
     const authority = await attempt.ready;
     if (!authority) return abort.signal.aborted || attempt.signal.aborted ? 'stopped' : 'not_admitted';
     const episodes = new EpisodeStore(env.HERDR_PLUGIN_STATE_DIR!);
+    const diagnosticRuntime = createRuntime();
+    diagnosticRuntime.env = {
+      HOME: env.HOME,
+      XDG_STATE_HOME: env.XDG_STATE_HOME,
+      TYPESAFE_API_KEY: env.TYPESAFE_API_KEY,
+      OPENROUTER_API_KEY: env.OPENROUTER_API_KEY,
+    };
     const base: EventDeps = {
       herdr,
       decide,
+      approvalDiagnostic: (event) => appendStopEvent(diagnosticRuntime, event),
       store: {
         active: async () => true,
         retry: (paneId) => episodes.retry(paneId),

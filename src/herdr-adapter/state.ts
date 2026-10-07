@@ -102,6 +102,7 @@ export type ApprovalAttempt = {
   digest: string;
   state: 'human' | 'uncertain' | 'delivered' | 'not_sent';
   not_sent_reason?: 'observation_changed' | 'delivery_not_started';
+  attempt_id?: string;
   recorded_at: string;
 };
 const approvalSchema = z
@@ -112,6 +113,7 @@ const approvalSchema = z
     digest: z.string().regex(/^[0-9a-f]{64}$/),
     state: z.enum(['human', 'uncertain', 'delivered', 'not_sent']),
     not_sent_reason: z.enum(['observation_changed', 'delivery_not_started']).optional(),
+    attempt_id: z.uuid().optional(),
     recorded_at: timestamp,
   })
   .refine((attempt) => (attempt.state === 'not_sent') === (attempt.not_sent_reason !== undefined));

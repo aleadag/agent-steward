@@ -567,6 +567,9 @@ async function recordStopHistory(
         ...(knownTool === undefined ? {} : { tool: knownTool }),
         action: result.proposed_action.kind,
         reason_code: result.reason_code,
+        waiting_for: result.waiting_for,
+        waiting_confidence: result.waiting_confidence,
+        risk_probability: result.risk_probability,
         ...(result.evaluation?.usage === undefined ? {} : { usage: result.evaluation.usage }),
       });
     } else {
@@ -577,6 +580,7 @@ async function recordStopHistory(
         event: 'failed',
         ...(knownTool === undefined ? {} : { tool: knownTool }),
         reason_code: result.reason_code,
+        ...(result.diagnostics === undefined ? {} : { diagnostics: result.diagnostics }),
       });
     }
   } catch {
@@ -642,11 +646,37 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
         else if (listed.length > 0) runtime.stdout(formatStopLedgerRecords(listed, runtime.now()));
       } else {
         const record = records.find((record) => record.request_id === invocation.requestId);
-        if (record === undefined) {
+        const attempt = records.find((candidate) =>
+          candidate.approval?.assessments.some((assessment) => assessment.request_id === invocation.requestId),
+        );
+        const summary = attempt?.approval?.assessments.find(
+          (assessment) => assessment.request_id === invocation.requestId,
+        );
+        const retained =
+          record ??
+          (summary && attempt
+            ? {
+                schema_version: 1,
+                recorded_at: attempt.approval?.recorded_at ?? attempt.recorded_at,
+                recorded_at_source: attempt.approval?.recorded_at ? 'approval_attempt' : 'latest_attempt_event',
+                tool: attempt.tool,
+                event: summary.action ? 'assessed' : 'failed',
+                ...summary,
+                assessment_record_missing: true,
+              }
+            : undefined);
+        if (retained === undefined) {
           runtime.stderr('agent-steward: not_found\n');
           return 2;
         }
-        runtime.stdout(invocation.json ? `${JSON.stringify(record)}\n` : `${JSON.stringify(record, null, 2)}\n`);
+        const shown = attempt
+          ? {
+              ...retained,
+              approval: attempt.approval,
+              ...(attempt.approval_skip ? { approval_skip: attempt.approval_skip } : {}),
+            }
+          : retained;
+        runtime.stdout(invocation.json ? `${JSON.stringify(shown)}\n` : `${JSON.stringify(shown, null, 2)}\n`);
       }
       return 0;
     } catch (error) {

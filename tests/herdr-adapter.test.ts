@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'bun:test';
-import { mkdtemp, mkdir, writeFile, cp, chmod, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, cp, chmod, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +11,7 @@ import type { HerdrControl } from '../src/herdr-adapter/deliver.ts';
 import type { EventDeps } from '../src/herdr-adapter/entry.ts';
 import type { AgentSnapshot, HerdrReader, ReadSnapshot } from '../src/herdr-adapter/observe.ts';
 import type { Episode } from '../src/herdr-adapter/state.ts';
-import type { StopInput, StopResult } from '../src/contracts.ts';
+import { StewardError, type StopInput, type StopResult } from '../src/contracts.ts';
 import { deferred, within } from './herdr-lease-helpers.ts';
 
 type TestHandoffReason = Parameters<EventDeps['handoff']>[0];
@@ -493,6 +493,33 @@ process.stdout.write(JSON.stringify({schema_version:2,request_id:input.request_i
     await assert.rejects(adapter.decideWithCli(input, script));
   }
   await assert.rejects(adapter.decideWithCli(input, join(base, 'no-script.mjs')));
+});
+
+test('decision subprocess preserves correlated structured failure diagnostics but never its message', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'steward-cli-diagnostics-'));
+  const script = join(base, 'fake.mjs');
+  try {
+    const adapter = await import('../src/herdr-adapter/entry.ts');
+    const { deps, calls } = fixture();
+    await handleEvent(event, deps);
+    const input = firstCall(calls);
+    await writeFile(
+      script,
+      `let data = ''; for await (const chunk of process.stdin) data += chunk;
+const input = JSON.parse(data);
+process.stdout.write(JSON.stringify({schema_version:2,request_id:input.request_id,decision:'error',reason_code:'evaluation_failed',message:'private upstream body',diagnostics:{stage:'evaluation',kind:'http',http_status:503,duration_ms:100}}));
+process.exitCode=1;\n`,
+    );
+    await assert.rejects(adapter.decideWithCli(input, script), (error: unknown) => {
+      assert.ok(error instanceof StewardError);
+      assert.equal(error.code, 'evaluation_failed');
+      assert.deepEqual(error.diagnostics, { stage: 'evaluation', kind: 'http', http_status: 503, duration_ms: 100 });
+      assert.doesNotMatch(error.message, /private upstream body/);
+      return true;
+    });
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
 });
 
 test('stalled stop check is killed at a short test deadline and handed off without a record', async () => {
