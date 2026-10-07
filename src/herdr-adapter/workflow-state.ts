@@ -6,7 +6,7 @@ import { SchedulerLeaseStore, type LeaseOptions } from './lease.ts';
 import { assertNoCredentials, configuredApiKeys } from '../privacy.ts';
 import type { ObservedStop } from './observe.ts';
 import { readPrivateJson, withPrivateGuard, writePrivateJson } from './private-files.ts';
-import { EpisodeStore, parseEpisode, readEpisodeLockOwner, type Episode } from './state.ts';
+import { EpisodeStore, parseEpisode, readEpisodeLockOwner, workflowEpisodeId, type Episode } from './state.ts';
 
 export type WorkflowScope = {
   serverId: string;
@@ -322,7 +322,11 @@ export class WorkflowState {
           }
           if (previous && requested.phase === 'observing' && previous.generation === requested.generation) {
             selected = previous;
-          } else if (previous && (previous.phase !== 'observing' || previous.failureEpisodeId !== null)) {
+          } else if (
+            previous &&
+            (previous.phase !== 'observing' || previous.failureEpisodeId !== null) &&
+            !(await this.store.hasRetryHead(requested.scope.agent, requested.scope.sessionId))
+          ) {
             if (requested.phase === 'observing') selected = previous;
             else {
               if (
@@ -336,7 +340,7 @@ export class WorkflowState {
             selected = {
               ...requested,
               historyPaneId: episode.pane_id,
-              failureEpisodeId: episode.failure_episode_id,
+              failureEpisodeId: workflowEpisodeId(episode),
             };
           }
           if (requested.phase !== 'observing') {
@@ -344,7 +348,8 @@ export class WorkflowState {
             if (
               reference &&
               (reference.historyPaneId !== requested.historyPaneId ||
-                reference.failureEpisodeId !== requested.failureEpisodeId)
+                (reference.failureEpisodeId !== requested.failureEpisodeId &&
+                  !(await this.store.hasRetryHead(requested.scope.agent, requested.scope.sessionId))))
             )
               throw new Error('canonical binding mismatch');
           }
@@ -354,7 +359,7 @@ export class WorkflowState {
               !recoverable(episode) ||
               episode.pane_id !== selected.historyPaneId ||
               episode.pane_id !== selected.paneId ||
-              episode.failure_episode_id !== selected.failureEpisodeId ||
+              workflowEpisodeId(episode) !== selected.failureEpisodeId ||
               (await this.recoveryQuarantined(requested.scope)))
           )
             throw new Error('unavailable canonical history');
@@ -493,7 +498,7 @@ export class WorkflowState {
     return reference;
   }
 
-  async recoveryQuarantined(scope: WorkflowScope): Promise<boolean> {
+  async recoveryQuarantined(scope: WorkflowScope, forCompletion = false): Promise<boolean> {
     validateWorkflowScope(scope);
     await this.store.prepare();
     const prefix = `retry-session-${hash(JSON.stringify([scope.agent, scope.sessionId]))}`;
@@ -514,15 +519,23 @@ export class WorkflowState {
         })
         .parse(await readPrivateJson(marker, 8192, this.options));
       if (value.agent !== scope.agent || value.sessionId !== scope.sessionId) throw new Error('invalid association');
-      return true;
+      if (!forCompletion && !(await this.store.hasRetryHead(scope.agent, scope.sessionId))) return true;
     } catch (error) {
       if (!isMissing(error)) return true;
     }
     try {
       const reference = await this.reference(scope);
-      if (!reference) return false;
+      const selected = await this.store.sessionRetry(scope.agent, scope.sessionId);
+      const hasHead = await this.store.hasRetryHead(scope.agent, scope.sessionId);
+      if (!reference) return hasHead && selected !== null;
+      if (hasHead && selected && reference.failureEpisodeId !== workflowEpisodeId(selected)) return true;
       if (
-        reference.phase === 'terminal' ||
+        (reference.phase === 'terminal' &&
+          (reference.reason === 'canceled' ||
+            reference.reason === 'lost' ||
+            (!forCompletion &&
+              !(await this.store.hasRetryHead(scope.agent, scope.sessionId)) &&
+              (await this.store.sessionRetry(scope.agent, scope.sessionId))?.last_delivery_state !== 'delivered'))) ||
         reference.scope.sessionSource !== scope.sessionSource ||
         reference.scope.sessionKind !== scope.sessionKind ||
         !(await this.matches({
@@ -552,6 +565,7 @@ export class WorkflowState {
       valid(): Promise<boolean>;
       admissionOpen(): boolean;
     },
+    completed = false,
   ): Promise<'absent' | 'adopted' | 'quarantined'> {
     type Result = 'absent' | 'adopted' | 'quarantined';
     return new Promise((resolve) => {
@@ -650,7 +664,20 @@ export class WorkflowState {
             };
             try {
               const current = await episodes.sessionRetry(scope.agent, scope.sessionId);
-              if (await this.recoveryQuarantined(scope)) return 'quarantined';
+              if (await this.recoveryQuarantined(scope, completed)) return 'quarantined';
+              if (completed && current)
+                return current.pane_id === observed.pane_id &&
+                  current.last_delivery_state !== 'uncertain' &&
+                  !(
+                    current.last_delivery_state === 'human' &&
+                    current.attempt_count !== 0 &&
+                    !(await episodes.hasRetryHead(scope.agent, scope.sessionId))
+                  ) &&
+                  !current.lifecycle_handoff_sent &&
+                  !expired
+                  ? 'adopted'
+                  : 'quarantined';
+              if (!current && (await episodes.hasRetryHead(scope.agent, scope.sessionId))) return 'absent';
               if (current)
                 return recoverable(current) &&
                   current.failure_episode_id === observed.current_episode_id &&
@@ -707,9 +734,13 @@ export class WorkflowState {
                   if (
                     matches.length !== 1 ||
                     legacy.pane_id !== observed.pane_id ||
-                    legacy.failure_episode_id !== observed.current_episode_id ||
-                    legacy.error_evidence_digest !== observed.error_evidence_digest ||
-                    !recoverable(legacy)
+                    (completed
+                      ? legacy.last_delivery_state !== 'human' ||
+                        legacy.attempt_count !== 0 ||
+                        legacy.lifecycle_handoff_sent
+                      : legacy.failure_episode_id !== observed.current_episode_id ||
+                        legacy.error_evidence_digest !== observed.error_evidence_digest ||
+                        !recoverable(legacy))
                   )
                     return quarantine();
                   await effect(() => episodes.recordSessionRetry(scope.agent, scope.sessionId, legacy));
@@ -833,7 +864,7 @@ export class WorkflowState {
     workspaceId: string,
     episode: Episode,
   ): Promise<void> {
-    if (!recoverable(episode)) return;
+    if (episode.last_delivery_state !== 'none' || episode.lifecycle_handoff_sent) return;
     const selected = parseBinding({
       protocol: 1,
       scope,
@@ -842,7 +873,7 @@ export class WorkflowState {
       paneId,
       workspaceId,
       historyPaneId: episode.pane_id,
-      failureEpisodeId: episode.failure_episode_id,
+      failureEpisodeId: workflowEpisodeId(episode),
       phase: 'pending',
       reason: null,
     });
@@ -856,9 +887,10 @@ export class WorkflowState {
       const existing = await this.reference(scope);
       if (
         existing &&
-        (existing.phase === 'terminal' ||
+        ((existing.phase === 'terminal' && (existing.reason === 'canceled' || existing.reason === 'lost')) ||
           existing.epoch !== ticket.epoch ||
-          existing.failureEpisodeId !== selected.failureEpisodeId ||
+          (existing.failureEpisodeId !== selected.failureEpisodeId &&
+            !(await this.store.hasRetryHead(scope.agent, scope.sessionId))) ||
           existing.historyPaneId !== selected.historyPaneId)
       )
         return;

@@ -181,11 +181,12 @@ test('canonical session writes cannot reset anchors, counters or uncertainty acr
       { ...original, failure_episode_id: 'e2' },
       { ...original, first_observed_at: '2026-09-29T09:00:00Z' },
       { ...original, last_delivery_state: 'none' as const },
+      { ...original, last_delivery_state: 'human' as const, next_check_at: null },
     ])
       await assert.rejects(store.recordSessionRetry('agy', 's1', changed));
     assert.deepEqual(await store.sessionRetry('agy', 's1'), original);
-    await store.recordSessionRetry('agy', 's1', { ...original, last_delivery_state: 'human', next_check_at: null });
-    assert.equal((await store.sessionRetry('agy', 's1'))?.last_delivery_state, 'human');
+    await store.recordSessionRetry('agy', 's1', { ...original, next_check_at: null });
+    assert.equal((await store.sessionRetry('agy', 's1'))?.last_delivery_state, 'uncertain');
   } finally {
     await rm(store.directory, { recursive: true, force: true });
   }

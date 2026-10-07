@@ -176,7 +176,7 @@ export async function assessStop(
     });
   }
   if (waitingFor === 'completed') {
-    if (validInput.status !== 'done') {
+    if (validInput.status !== 'idle' && validInput.status !== 'done') {
       return decisionResult({
         requestId,
         action: { kind: 'manual_review' },

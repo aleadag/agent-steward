@@ -1429,7 +1429,7 @@ for (const association of ['ambiguous', 'corrupt', 'closed_after_association', '
       await within(running);
       assert.equal(await f.store.sessionRetry('agy', 's1'), null);
       assert.equal(await f.state.recoveryQuarantined(f.authority.scope), true);
-      assert.equal(decisions, 0);
+      assert.equal(decisions, ['ambiguous', 'corrupt'].includes(association) ? 1 : 0);
       assert.deepEqual(f.herdr.writes(), []);
       assert.deepEqual(handoffs, held ? [] : ['human_review_required']);
       if (association !== 'corrupt') assert.deepEqual(await f.store.retry('w1:p1'), legacy);

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { appendDiagnostic, type DiagnosticEvent } from './diagnostics.ts';
-import { EpisodeStore, parseEpisode, type Episode } from './state.ts';
+import { EpisodeStore, parseEpisode, workflowEpisodeId, type Episode } from './state.ts';
 import { assertNoCredentials, configuredApiKeys } from '../privacy.ts';
 import type { LeaseAttempt, SchedulerLeaseStore } from './lease.ts';
 import {
@@ -30,7 +30,11 @@ export type WorkflowAuthority = {
   readonly signal: AbortSignal;
   admissionOpen(): boolean;
   valid(): Promise<boolean>;
-  dispatch(kind: 'approval' | 'recovery', effect: () => Promise<void>, proof?: EffectProof): Promise<void>;
+  dispatch(
+    kind: 'approval' | 'recovery' | 'completion',
+    effect: () => Promise<void>,
+    proof?: EffectProof,
+  ): Promise<void>;
 };
 export type WorkflowAttempt = {
   readonly ready: Promise<WorkflowAuthority | null>;
@@ -52,6 +56,7 @@ export type AuthorityOptions = {
 };
 export type JobSlot = {
   readonly signal: AbortSignal;
+  readonly historyChanged: AbortSignal;
   valid(): Promise<boolean>;
   // Caller holds pane -> retry-session locks. Only this admitted writer may
   // advance the captured history proof, including uncertainty before input.
@@ -257,7 +262,7 @@ export function beginWorkflow(options: AuthorityOptions): WorkflowAttempt {
             revalidate: async () =>
               (kind !== 'approval' || permission.autoApprove === true) &&
               (await authority.valid()) &&
-              (kind !== 'recovery' || !(await options.state.recoveryQuarantined(scope))) &&
+              (kind === 'approval' || !(await options.state.recoveryQuarantined(scope, kind === 'completion'))) &&
               (!proof || (await proof.valid())),
             reserve: proof ? (action) => proof.reserve(action) : undefined,
           });
@@ -408,6 +413,7 @@ export function reserveJobSlot(state: WorkflowState, authority: WorkflowAuthorit
   let bindingProof: WorkflowBinding | undefined;
   let historyProof: Episode | undefined;
   let writing: Episode | undefined;
+  let historyChanged = new AbortController();
   const episodes = new EpisodeStore(state.directory);
   const pendingMatches = async (): Promise<boolean> => {
     // A renewal can read the old side of our write and resume after it commits.
@@ -416,6 +422,14 @@ export function reserveJobSlot(state: WorkflowState, authority: WorkflowAuthorit
     const previousWrite = writing;
     const binding = await state.binding(authority.scope);
     const episode = await state.sessionRetry(authority.scope);
+    const successor =
+      bindingProof !== undefined &&
+      previousProof !== undefined &&
+      episode !== null &&
+      episode.failure_episode_id !== previousProof.failure_episode_id &&
+      episode.workflow_episode_id === bindingProof.failureEpisodeId &&
+      (await episodes.hasRetryHead(authority.scope.agent, authority.scope.sessionId)) &&
+      isDeepStrictEqual(episode, await episodes.sessionRetry(authority.scope.agent, authority.scope.sessionId));
     const matches =
       binding !== null &&
       binding.phase === 'pending' &&
@@ -425,12 +439,13 @@ export function reserveJobSlot(state: WorkflowState, authority: WorkflowAuthorit
       binding.generation === authority.generation &&
       episode !== null &&
       binding.historyPaneId === episode.pane_id &&
-      binding.failureEpisodeId === episode.failure_episode_id &&
+      binding.failureEpisodeId === workflowEpisodeId(episode) &&
       (bindingProof
         ? isDeepStrictEqual(binding, bindingProof) &&
-          [previousProof, previousWrite, historyProof, writing].some(
+          ([previousProof, previousWrite, historyProof, writing].some(
             (proof) => proof !== undefined && isDeepStrictEqual(episode, proof),
-          )
+          ) ||
+            successor)
         : episode.last_delivery_state === 'none' &&
           episode.next_check_at !== null &&
           episode.lifecycle_handoff_sent !== true) &&
@@ -438,6 +453,11 @@ export function reserveJobSlot(state: WorkflowState, authority: WorkflowAuthorit
     if (matches && !bindingProof) {
       bindingProof = binding!;
       historyProof = episode!;
+    } else if (matches && successor) {
+      historyProof = episode;
+      const changed = historyChanged;
+      historyChanged = new AbortController();
+      changed.abort();
     }
     return matches;
   };
@@ -523,10 +543,23 @@ export function reserveJobSlot(state: WorkflowState, authority: WorkflowAuthorit
       const dispatch = (effect: () => Promise<void>) => authority.dispatch('recovery', effect, proof);
       return {
         signal: lifetime.controller.signal,
+        get historyChanged() {
+          return historyChanged.signal;
+        },
         valid,
         dispatch,
         record: async (episode) => {
-          const next = parseEpisode(episode);
+          const next = parseEpisode({
+            ...episode,
+            ...(historyProof?.workflow_episode_id
+              ? { workflow_episode_id: historyProof.workflow_episode_id }
+              : historyProof && episode.failure_episode_id !== historyProof.failure_episode_id
+                ? { workflow_episode_id: workflowEpisodeId(historyProof) }
+                : {}),
+            ...(historyProof?.completion_observation_id
+              ? { completion_observation_id: historyProof.completion_observation_id }
+              : {}),
+          });
           if (
             writing ||
             !(await valid()) ||
@@ -534,14 +567,19 @@ export function reserveJobSlot(state: WorkflowState, authority: WorkflowAuthorit
             !lifetime.open() ||
             next.pane_id !== bindingProof!.historyPaneId ||
             next.session_id !== authority.scope.sessionId ||
-            next.failure_episode_id !== bindingProof!.failureEpisodeId
+            workflowEpisodeId(next) !== bindingProof!.failureEpisodeId
           )
             throw new Error('lost job authority');
           // Heartbeats may observe either side of this already-admitted atomic
           // write, never an arbitrary terminal record or a different history.
           writing = next;
           try {
-            await dispatch(() => episodes.recordSessionRetry(authority.scope.agent, authority.scope.sessionId, next));
+            await dispatch(async () => {
+              const previous = await episodes.sessionRetry(authority.scope.agent, authority.scope.sessionId);
+              if (previous && previous.failure_episode_id !== next.failure_episode_id)
+                await episodes.advanceSessionRetry(authority.scope.agent, authority.scope.sessionId, next, previous);
+              else await episodes.recordSessionRetry(authority.scope.agent, authority.scope.sessionId, next);
+            });
             historyProof = next;
           } catch (error) {
             lifetime.close();

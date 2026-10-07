@@ -643,7 +643,7 @@ test('non-quota decisions never look up hints or start a job wait', async () => 
   }
 });
 
-test('unchanged episode evidence continues; changed evidence hands off without input', async () => {
+test('unchanged or changed ready evidence is reclassified and shares the unresolved retry budget', async () => {
   for (const changed of [false, true]) {
     const f = await world({ waiting: 'recoverable_api_error', text: apiText });
     const { wait, entered, wake } = jobWait();
@@ -665,15 +665,9 @@ test('unchanged episode evidence continues; changed evidence hands off without i
       wake();
       assert.equal(await within(running), 'finished');
       const after = await f.state.sessionRetry(f.authority.scope);
-      if (changed) {
-        assert.equal(after?.last_delivery_state, 'human');
-        assert.equal(after?.next_check_at, null);
-        assert.equal(f.counts.prompt, 0);
-        assert.ok(f.handoffs.includes('human_review_required') || f.handoffs.includes('observation_unavailable'));
-      } else {
-        assert.equal(after?.last_delivery_state, 'delivered');
-        assert.equal(f.counts.prompt, 1);
-      }
+      assert.equal(after?.last_delivery_state, 'delivered');
+      assert.equal(after?.attempt_count, 1);
+      assert.equal(f.counts.prompt, 1);
     } finally {
       wake();
       await f.cleanup();
