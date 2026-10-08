@@ -1,5 +1,7 @@
 # Unreleased
 
+- The optional Herdr adapter can now recognize wrapped shell-loop permission menus whose headers were clipped from shorter reads. Detection reads expand from 12 to 16 and then 24 lines only while the header is missing and permission controls remain visible. The 2 KiB limit, credential checks, and approval gates are unchanged; see the [adapter limits](README.md#optional-herdr-adapter-not-activated).
+
 - Recovery prompts now explicitly ask agents to continue interrupted tasks instead of doing nothing after a successful operation. They still require checking prior success before repeating actions, allow one retry of the same failure, and ask agents to report when the task is already complete. Retry budgets and delivery checks are unchanged; see the [recovery policy](README.md#optional-herdr-adapter-not-activated).
 
 - Diagnose why automatic approval stopped with `stop show <request-or-attempt-id> --json`. New records include classification, confidence, risk, both approval assessments, the stopping gate, cleanup outcome, and duplicate-skip reason. Retained skips preserve their original diagnostic summary across rotation; no command, screen, or raw provider content is logged. Approval and retry rules are unchanged. See [local stop history](README.md#local-stop-history).
