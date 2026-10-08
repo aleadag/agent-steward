@@ -12,7 +12,7 @@ import { WorkflowState, type WorkflowScope } from '../src/herdr-adapter/workflow
 import { assessStop } from '../src/triage.ts';
 import type { Evaluation } from '../src/jev.ts';
 import { runEpisodeJob } from '../src/herdr-adapter/jobs.ts';
-import { deferred, within } from './herdr-lease-helpers.ts';
+import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
 
 async function fixture(agent: 'pi' | 'codex' | 'agy' = 'pi') {
   const root = await mkdtemp(join(tmpdir(), 'steward-generic-recovery-'));

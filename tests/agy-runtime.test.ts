@@ -237,7 +237,7 @@ test('private IPC permissions, late-delivery rejection and owned session cleanup
       const metadata = JSON.parse(await fs.readFile(observer, 'utf8'));
       assert.equal(metadata.socketMode, 0o600);
       assert.equal(metadata.directoryMode, 0o700);
-      assert.equal(metadata.cwd, paths.workdir);
+      assert.equal(metadata.cwd, await fs.realpath(paths.workdir));
       await assert.rejects(fs.lstat(metadata.socketPath));
       assert.throws(() => process.kill(metadata.pid, 0));
       assert.equal(unrelated.exitCode, null);

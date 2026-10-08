@@ -14,7 +14,7 @@ import { EpisodeStore, type Episode } from '../src/herdr-adapter/state.ts';
 import { workflowSession, WorkflowState, type WorkflowScope } from '../src/herdr-adapter/workflow-state.ts';
 import type { Evaluation } from '../src/contracts.ts';
 import { assessStop } from '../src/triage.ts';
-import { deferred, within } from './herdr-lease-helpers.ts';
+import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
 
 const MAX_LOG = 1_048_576;
 const roots: string[] = [];

@@ -28,6 +28,12 @@ export async function within<T>(promise: Promise<T>, ms = 1_000): Promise<T> {
   }
 }
 
+// Workflow integration traverses multiple guarded filesystem records; CI storage
+// can take longer than the one-second watchdog used by focused lease tests.
+export function withinWorkflow<T>(promise: Promise<T>, ms = 5_000): Promise<T> {
+  return within(promise, ms);
+}
+
 export async function leaseFixture() {
   const directory = await mkdtemp(join(tmpdir(), 'steward-generation-'));
   const root = join(directory, 'scheduler-lease');

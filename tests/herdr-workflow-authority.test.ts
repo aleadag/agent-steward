@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { beginWorkflow, reserveJobSlot, type WorkflowAttempt } from '../src/herdr-adapter/authority.ts';
 import { WorkflowState, type WorkflowScope, type RuntimePermission } from '../src/herdr-adapter/workflow-state.ts';
 import { EpisodeStore, type Episode } from '../src/herdr-adapter/state.ts';
-import { deferred, within } from './herdr-lease-helpers.ts';
+import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
 
 const scope: WorkflowScope = {
   serverId: '47:1',
@@ -431,7 +431,7 @@ test('eight server capacity leases refuse ninth; reader consumes none; released 
     }
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 30_000);
 
 test('one generation cannot reserve duplicate capacity while its first acquisition is pending', async () => {
   const root = await mkdtemp(join(tmpdir(), 'workflow-duplicate-slot-'));

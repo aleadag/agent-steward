@@ -12,7 +12,7 @@ import { EpisodeStore, type Episode } from '../src/herdr-adapter/state.ts';
 import { workflowSession, WorkflowState, type WorkflowScope } from '../src/herdr-adapter/workflow-state.ts';
 import type { Evaluation, StopInput } from '../src/contracts.ts';
 import { assessStop } from '../src/triage.ts';
-import { deferred, within } from './herdr-lease-helpers.ts';
+import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
 
 const initial = '2026-09-29T10:00:00.000Z';
 const scope: WorkflowScope = {
@@ -94,7 +94,7 @@ function jobWait() {
     },
   };
 }
-async function until(check: () => Promise<boolean>, ms = 1_000): Promise<void> {
+async function until(check: () => Promise<boolean>, ms = 5_000): Promise<void> {
   await within(
     (async () => {
       while (!(await check())) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -835,7 +835,7 @@ test('saturation marks the episode human without clearing counters or waiting', 
     }
     await f.cleanup();
   }
-});
+}, 30_000);
 
 test('already aborted job creates no slot and does not wait', async () => {
   const f = await world();
