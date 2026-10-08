@@ -100,7 +100,7 @@ export async function observeStop(herdr: HerdrReader, paneId: string): Promise<O
   // Never clip an oversized read: doing so might omit a credential.
   const lines = read.text.split('\n');
   const lineCount = lines.length - (read.text.endsWith('\n') ? 1 : 0);
-  if (!read.text.trim() || Buffer.byteLength(read.text, 'utf8') > 2048 || lineCount > 16) return null;
+  if (!read.text.trim() || Buffer.byteLength(read.text, 'utf8') > 2048 || lineCount > 24) return null;
   try {
     assertNoCredentials({ text: read.text, sessionId }, process.env.TYPESAFE_API_KEY ?? '');
   } catch {

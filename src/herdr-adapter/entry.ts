@@ -128,16 +128,19 @@ export function socketReader(path: string): HerdrReader {
         })) as { type?: string; read?: ReadSnapshot };
         return result.type === 'pane_read' ? (result.read ?? null) : null;
       };
-      const snapshot = await read(12);
+      let snapshot = await read(12);
       // Keep complete compact menus free of historical prefixes. Expand only
       // when wrapped permission text has pushed the header out of the excerpt.
-      if (
-        typeof snapshot?.text === 'string' &&
-        !snapshot.text.includes('Requesting permission for:') &&
-        (snapshot.text.includes('Run this command?') || snapshot.text.includes('Apply this edit?')) &&
-        (snapshot.text.includes('1. Yes, run command') || snapshot.text.includes('1. Yes, apply edit'))
-      )
-        return read(16);
+      for (const lines of [16, 24]) {
+        if (
+          typeof snapshot?.text === 'string' &&
+          !snapshot.text.includes('Requesting permission for:') &&
+          (snapshot.text.includes('Run this command?') || snapshot.text.includes('Apply this edit?')) &&
+          (snapshot.text.includes('1. Yes, run command') || snapshot.text.includes('1. Yes, apply edit'))
+        )
+          snapshot = await read(lines);
+        else break;
+      }
       // Detection text is untrusted evidence, not a verified current-stop boundary.
       return snapshot;
     },

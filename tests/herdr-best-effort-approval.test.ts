@@ -802,7 +802,7 @@ test('AGY wrapped unzip permission menu is recognized', () => {
 test('AGY wrapped unzip permission menu can send only 1', async () => {
   const f = await fixture();
   try {
-    // observeStop rejects excerpts over 16 lines; keep the wrapped choices.
+    // Keep the complete action and wrapped choices in the bounded excerpt.
     f.changeText(`Requesting permission for:
    unzip -l
 sentinel/android/app/build/outputs/apk/release/app-release-unsigned.apk
@@ -837,7 +837,32 @@ Run this command?
   ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
 🔧 TOOL ╱ Gemini 3.8 Flash (High)  │   ctx ░·············· 3.7% · artifacts 0 · subagents 0 · tasks 0 · sandbox off`;
 
-for (const [name, screen, context, action] of [
+const agyLoopMenu = `● Bash(for d in /run/user/1000/nix-develop-*; do) (ctrl+o to expand)
+
+Command
+────────────────────────────────────────────────────────────────────────────
+
+Requesting permission for:
+   for d in /run/user/1000/nix-develop-*; do
+     pid=$(basename "$d" | cut -d'-' -f3)
+     if kill -0 "$pid" 2>/dev/null; then
+       echo "Alive PID: $pid ($d)"
+   ⋯ (3 lines hidden)
+
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation for commands that start with 'for d in /run/user/1000/nix-develop-*; do
+  pid=$(basename "$d" | cut -d'-' -f3)
+  ...'
+  3. Yes, and always allow for commands that start with 'for d in /run/user/1000/nix-develop-*; do
+  pid=$(basename "$d" | cut -d'-' -f3)
+  ...' (Persist to settings.json)
+  4. No, cancel
+
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
+🔧 TOOL ╱ Gemini 3.8 Flash (High)  │   ctx ▓·············· 5.8% · tasks 0`;
+
+for (const [name, screen, context, action, readCounts] of [
   [
     'wrapped statix permission header',
     agyStatixMenu,
@@ -845,24 +870,55 @@ for (const [name, screen, context, action] of [
     'statix check packages/cc-connect/default.nix packages/karabiner-driverkit-virtualhiddevice/default.nix packages/newsgoat/default.nix\n' +
       'packages/nix-cleanup/default.nix packages/nix-whereis/default.nix packages/run-bg-alias/default.nix packages/vitaly/default.nix\n' +
       'packages/wpsoffice-cn-fcitx/default.nix packages/herdr-beads/default.nix',
+    [12, 16],
+  ],
+  [
+    'multiline loop permission header beyond 16 lines',
+    agyLoopMenu,
+    agyLoopMenu,
+    `for d in /run/user/1000/nix-develop-*; do
+pid=$(basename "$d" | cut -d'-' -f3)
+if kill -0 "$pid" 2>/dev/null; then
+echo "Alive PID: $pid ($d)"
+⋯ (3 lines hidden)`,
+    [12, 16, 24],
   ],
   [
     'compact permission menu without older transcript',
     'Earlier explanation\nOlder output\n\nCommand\n---\n\n' + dialog(),
     '---\n\n' + dialog(),
     'printf approval-probe',
+    [12],
+  ],
+  [
+    'credential in a recovered action line',
+    agyLoopMenu.replace('   for d in', '   api_key=supersecretvalue1234 for d in'),
+    null,
+    null,
+    [12, 16, 24],
+  ],
+  ['oversized recovered excerpt', agyLoopMenu.replace('Alive PID:', 'x'.repeat(2048)), null, null, [12, 16, 24]],
+  ['conflicting setup prefix', agyLoopMenu.replace('Command\n', 'Settings Error\n'), null, null, [12, 16, 24]],
+  [
+    'extra control after cancel',
+    agyLoopMenu.replace('  4. No, cancel', '  4. No, cancel\n  5. Yes, always allow').replace('\n\n  ↑/↓', '\n  ↑/↓'),
+    null,
+    null,
+    [12, 16, 24],
   ],
 ] as const) {
-  test(`bounded socket detection retains the ${name} and assesses it`, async () => {
+  test(`bounded socket detection handles the ${name}`, async () => {
     const f = await fixture();
     const path = join(f.store.directory, 'herdr.sock');
     const pane = await f.herdr.get();
+    const reads: number[] = [];
     const server = createServer((socket) => {
       let data = '';
       socket.on('data', (chunk) => {
         data += chunk;
         if (!data.includes('\n')) return;
         const { id, method, params } = JSON.parse(data.slice(0, data.indexOf('\n')));
+        if (method === 'agent.read') reads.push(params.lines);
         const result =
           method === 'agent.get'
             ? { type: 'agent_info', agent: pane }
@@ -883,10 +939,17 @@ for (const [name, screen, context, action] of [
     try {
       f.deps.herdr = { ...f.herdr, ...socketReader(path) };
       await f.run();
-      assert.equal(f.inputs.length, 2);
-      assert.equal(f.inputs[0]?.context, context);
-      assert.equal(f.inputs[0]?.pending_action?.action, action);
-      assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+      assert.equal(f.inputs.length, action ? 2 : 0);
+      if (action) {
+        assert.equal(f.inputs[0]?.context, context);
+        assert.equal(f.inputs[0]?.pending_action?.action, action);
+        assert.equal(f.inputs[0]?.status, 'blocked');
+        assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+      } else {
+        assert.deepEqual(f.keys, []);
+        assert.equal(f.handoffs.length, 1);
+      }
+      assert.deepEqual(reads.slice(0, readCounts.length), readCounts);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await f.cleanup();
