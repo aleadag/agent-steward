@@ -1,7 +1,7 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -140,7 +140,7 @@ test.skipIf(!pkg)('installed setup, preserving hook and non-TTY refresh use only
       /old display|private renderer|synthetic-access|synthetic-subject|synthetic-native-secret|Models & Quota/,
     );
     const observer = JSON.parse(readFileSync(f.observer, 'utf8'));
-    assert.equal(observer.cwd, join(f.state, 'agent-steward/agy-quota-workdir'));
+    assert.equal(observer.cwd, realpathSync(join(f.state, 'agent-steward/agy-quota-workdir')));
     assert.equal(existsSync(observer.socketPath), false);
     assert.throws(() => process.kill(observer.pid, 0));
   }),
