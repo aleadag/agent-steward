@@ -1,6 +1,6 @@
 # Unreleased
 
-- The optional Herdr adapter can now recognize wrapped shell-loop permission menus whose headers were clipped from shorter reads. Detection reads expand from 12 to 16 and then 24 lines only while the header is missing and permission controls remain visible. The 2 KiB limit, credential checks, and approval gates are unchanged; see the [adapter limits](README.md#optional-herdr-adapter-not-activated).
+- The optional Herdr adapter can now recognize deeply wrapped permission menus even when their questions and accepting controls fall outside the first excerpt. It selects the smallest complete menu using bounded 12/16/24/48-line reads, while ordinary classification keeps its original short excerpt. Changed, malformed, or credential-bearing probes are rejected; oversized probes are never forwarded. The 2 KiB classification limit and approval policy remain unchanged; see the [adapter limits](README.md#optional-herdr-adapter-not-activated).
 
 - Recovery prompts now explicitly ask agents to continue interrupted tasks instead of doing nothing after a successful operation. They still require checking prior success before repeating actions, allow one retry of the same failure, and ask agents to report when the task is already complete. Retry budgets and delivery checks are unchanged; see the [recovery policy](README.md#optional-herdr-adapter-not-activated).
 
