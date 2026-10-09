@@ -66,6 +66,30 @@ function identity(pane: AgentSnapshot, paneId: string): string | null {
   return value;
 }
 
+// Oversized probes are never classification evidence. Scan their entire text
+// before letting a caller retain a separately captured, bounded excerpt.
+export function checkDetectionRead(read: ReadSnapshot | null, paneId: string): 'valid' | 'oversized' | 'invalid' {
+  if (
+    !read ||
+    read.pane_id !== paneId ||
+    read.source !== 'detection' ||
+    !Number.isSafeInteger(read.revision) ||
+    read.revision < 0 ||
+    typeof read.truncated !== 'boolean' ||
+    typeof read.text !== 'string'
+  )
+    return 'invalid';
+  const lines = read.text.split('\n');
+  const lineCount = lines.length - (read.text.endsWith('\n') ? 1 : 0);
+  if (!read.text.trim() || lineCount > 48) return 'invalid';
+  try {
+    assertNoCredentials({ text: read.text }, process.env.TYPESAFE_API_KEY ?? '');
+  } catch {
+    return 'invalid';
+  }
+  return Buffer.byteLength(read.text, 'utf8') > 2048 ? 'oversized' : 'valid';
+}
+
 export async function observeStop(herdr: HerdrReader, paneId: string): Promise<ObservedStop | null> {
   if (!/^w[A-Za-z0-9]+:p[A-Za-z0-9]+$/.test(paneId)) return null;
   const before = await herdr.get(paneId);
@@ -86,21 +110,14 @@ export async function observeStop(herdr: HerdrReader, paneId: string): Promise<O
     after.agent_session?.source !== sessionSource ||
     after.revision !== before.revision ||
     after.state_change_seq !== before.state_change_seq ||
-    read?.pane_id !== paneId ||
-    read.source !== 'detection' ||
-    !Number.isSafeInteger(read.revision) ||
-    read.revision < 0 ||
-    typeof read.truncated !== 'boolean' ||
-    typeof read.text !== 'string'
+    !read ||
+    checkDetectionRead(read, paneId) !== 'valid'
   )
     return null;
   // Herdr's detection-read revision is independent of agent.get revision, and
   // truncated means older lines may be omitted. This excerpt is only untrusted
   // classification evidence, never proof of the current error or request.
   // Never clip an oversized read: doing so might omit a credential.
-  const lines = read.text.split('\n');
-  const lineCount = lines.length - (read.text.endsWith('\n') ? 1 : 0);
-  if (!read.text.trim() || Buffer.byteLength(read.text, 'utf8') > 2048 || lineCount > 24) return null;
   try {
     assertNoCredentials({ text: read.text, sessionId }, process.env.TYPESAFE_API_KEY ?? '');
   } catch {

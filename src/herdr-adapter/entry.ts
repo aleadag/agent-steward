@@ -13,7 +13,8 @@ import { beginWorkflow } from './authority.ts';
 import type { HerdrControl } from './deliver.ts';
 import { handleEvent, normalizeEvent, workflowEventDeps, type EventDeps, type EventTrigger } from './events.ts';
 import { runEpisodeJob, type JobOptions } from './jobs.ts';
-import type { HerdrReader, AgentSnapshot, ReadSnapshot } from './observe.ts';
+import { checkDetectionRead, type HerdrReader, type AgentSnapshot, type ReadSnapshot } from './observe.ts';
+import { approvalMenu } from './best-effort-approval.ts';
 import { quotaResetHint, type QuotaHint } from './quota-hint.ts';
 import { EpisodeStore, type Episode } from './state.ts';
 import {
@@ -128,21 +129,31 @@ export function socketReader(path: string): HerdrReader {
         })) as { type?: string; read?: ReadSnapshot };
         return result.type === 'pane_read' ? (result.read ?? null) : null;
       };
-      let snapshot = await read(12);
-      // Keep complete compact menus free of historical prefixes. Expand only
-      // when wrapped permission text has pushed the header out of the excerpt.
-      for (const lines of [16, 24]) {
+      const initial = await read(12);
+      if (!initial || checkDetectionRead(initial, paneId) !== 'valid') return null;
+      if (approvalMenu(initial.text)) return initial;
+      // Parsing, not visible trigger strings, determines the smallest complete
+      // menu. Every probe must extend the same safe detection snapshot.
+      let previous = initial;
+      for (const lines of [16, 24, 48]) {
+        if (!previous.truncated) break;
+        const expanded = await read(lines);
+        const checked = checkDetectionRead(expanded, paneId);
         if (
-          typeof snapshot?.text === 'string' &&
-          !snapshot.text.includes('Requesting permission for:') &&
-          (snapshot.text.includes('Run this command?') || snapshot.text.includes('Apply this edit?')) &&
-          (snapshot.text.includes('1. Yes, run command') || snapshot.text.includes('1. Yes, apply edit'))
+          !expanded ||
+          checked === 'invalid' ||
+          expanded.revision !== previous.revision ||
+          !expanded.text.endsWith(previous.text)
         )
-          snapshot = await read(lines);
-        else break;
+          return null;
+        if (checked === 'oversized') return initial;
+        if (approvalMenu(expanded.text)) return expanded;
+        if (expanded.text === previous.text) break;
+        previous = expanded;
       }
-      // Detection text is untrusted evidence, not a verified current-stop boundary.
-      return snapshot;
+      // No complete menu: retain ordinary short classification evidence, not
+      // discarded history. Neither excerpt proves native request identity.
+      return initial;
     },
   };
 }

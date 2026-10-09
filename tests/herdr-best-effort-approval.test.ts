@@ -862,6 +862,34 @@ Run this command?
   ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
 🔧 TOOL ╱ Gemini 3.8 Flash (High)  │   ctx ▓·············· 5.8% · tasks 0`;
 
+const agyBashMenu = `Requesting permission for:
+   bash -c '
+   set -e
+   FUNC=$(sed -n "/^wait_for_storage_api() {/,/^}/p"
+infra/supabase/scripts/test-schema.sh)
+   echo "$FUNC"
+   ⋯ (1 lines hidden)
+
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation for commands that start
+with 'bash -c '
+set -e
+FUNC=$(sed -n "/^wait_for_storage_api() {/,/^}/p" infra/supabas...'
+  3. Yes, and always allow for commands that start with 'bash -c '
+set -e
+FUNC=$(sed -n "/^wait_for_storage_api() {/,/^}/p" infra/supabas...'
+(Persist to settings.json)
+  4. No, cancel`;
+const agyBashAction = `bash -c '
+set -e
+FUNC=$(sed -n "/^wait_for_storage_api() {/,/^}/p"
+infra/supabase/scripts/test-schema.sh)
+echo "$FUNC"
+⋯ (1 lines hidden)`;
+const agyBashMenuWithFooter =
+  agyBashMenu + '\n\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\n🔧 TOOL ╱ Gemini 3.8 Flash (High)';
+
 for (const [name, screen, context, action, readCounts] of [
   [
     'wrapped statix permission header',
@@ -883,6 +911,24 @@ echo "Alive PID: $pid ($d)"
 ⋯ (3 lines hidden)`,
     [12, 16, 24],
   ],
+  ['deeply wrapped bash permission paste', agyBashMenu, agyBashMenu, agyBashAction, [12, 16, 24]],
+  [
+    'deeply wrapped bash permission menu with footer',
+    agyBashMenuWithFooter,
+    agyBashMenuWithFooter,
+    agyBashAction,
+    [12, 16, 24],
+  ],
+  ...[3, 8, 26].map((extraRows) => {
+    const screen = agyBashMenuWithFooter.replace('  3. Yes,', 'wrapped\n'.repeat(extraRows) + '  3. Yes,');
+    return [
+      `bash menu with ${extraRows} additional wrapped option rows`,
+      screen,
+      screen,
+      agyBashAction,
+      [12, 16, 24, 48],
+    ] as const;
+  }),
   [
     'compact permission menu without older transcript',
     'Earlier explanation\nOlder output\n\nCommand\n---\n\n' + dialog(),
@@ -897,14 +943,14 @@ echo "Alive PID: $pid ($d)"
     null,
     [12, 16, 24],
   ],
-  ['oversized recovered excerpt', agyLoopMenu.replace('Alive PID:', 'x'.repeat(2048)), null, null, [12, 16, 24]],
-  ['conflicting setup prefix', agyLoopMenu.replace('Command\n', 'Settings Error\n'), null, null, [12, 16, 24]],
+  ['oversized recovered excerpt', agyLoopMenu.replace('Alive PID:', 'x'.repeat(2048)), null, null, [12, 16]],
+  ['conflicting setup prefix', agyLoopMenu.replace('Command\n', 'Settings Error\n'), null, null, [12, 16, 24, 48]],
   [
     'extra control after cancel',
     agyLoopMenu.replace('  4. No, cancel', '  4. No, cancel\n  5. Yes, always allow').replace('\n\n  ↑/↓', '\n  ↑/↓'),
     null,
     null,
-    [12, 16, 24],
+    [12, 16, 24, 48],
   ],
 ] as const) {
   test(`bounded socket detection handles the ${name}`, async () => {
@@ -939,7 +985,7 @@ echo "Alive PID: $pid ($d)"
     try {
       f.deps.herdr = { ...f.herdr, ...socketReader(path) };
       await f.run();
-      assert.equal(f.inputs.length, action ? 2 : 0);
+      assert.equal(f.inputs.length, action ? 2 : name === 'credential in a recovered action line' ? 0 : 1);
       if (action) {
         assert.equal(f.inputs[0]?.context, context);
         assert.equal(f.inputs[0]?.pending_action?.action, action);
@@ -948,6 +994,11 @@ echo "Alive PID: $pid ($d)"
       } else {
         assert.deepEqual(f.keys, []);
         assert.equal(f.handoffs.length, 1);
+        if (f.inputs[0]) {
+          assert.equal(f.inputs[0].context, screen.split('\n').slice(-12).join('\n'));
+          assert.equal(f.inputs[0].pending_action, undefined);
+          assert.equal(f.inputs[0].automatic_approval_forbidden, true);
+        }
       }
       assert.deepEqual(reads.slice(0, readCounts.length), readCounts);
     } finally {

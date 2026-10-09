@@ -207,7 +207,7 @@ test('rejected detection or unsupported identity emits only a local handoff and 
     [agent(), output({ source: 'recent', text: 'Old terminal history\nCurrent API failure: request timed out' })],
     [agent(), output({ text: 'api_key=supersecretvalue1234' })],
     [agent(), output({ text: 'x'.repeat(4096) })],
-    [agent(), output({ text: 'x\n'.repeat(25) })],
+    [agent(), output({ text: 'x\n'.repeat(49) })],
     [agent(), output({ truncated: 'unknown' })],
     [agent(), output({ text: '' })],
     [agent({ agent: 'claude' }), output()],
@@ -589,7 +589,7 @@ test('Pi 0.9.1 excerpt rejects changed occupants and sequences even when read re
 test('Pi 0.9.1 excerpt rejects oversized bytes, extra actual lines, credentials and malformed read metadata', async () => {
   for (const read of [
     piRead({ text: 'é'.repeat(1025) }),
-    piRead({ text: piExcerpt + 'extra line\n'.repeat(13) }),
+    piRead({ text: piExcerpt + 'extra line\n'.repeat(37) }),
     piRead({ text: 'api_key=supersecretvalue1234\n' }),
     piRead({ text: 'Bearer abcdefghijklmnopqrstuvwxyz\n' }),
     piRead({ source: 'recent' }),
@@ -761,22 +761,22 @@ test('session agent must match the pane agent before observation', async () => {
   assert.equal(await observeStop(fakeHerdr(pane), 'w1:p1'), null);
 });
 
-test('explicit 24-line/2048-byte detection limits accept boundary without clipping', async () => {
-  for (const within of ['a'.repeat(2024) + '\n'.repeat(23) + 'b', 'a'.repeat(2023) + '\n'.repeat(23) + 'b\n']) {
+test('explicit 48-line/2048-byte detection limits accept boundary without clipping', async () => {
+  for (const within of ['a'.repeat(2000) + '\n'.repeat(47) + 'b', 'a'.repeat(1999) + '\n'.repeat(47) + 'b\n']) {
     const observed = await observeStop(fakeHerdr(agent(), output({ text: within })), 'w1:p1');
     assert.ok(observed);
     assert.equal(observed.context, within);
   }
 });
 
-test('25-line detection reads are rejected with or without a final newline', async () => {
-  for (const text of ['x\n'.repeat(24) + 'x', 'x\n'.repeat(25)]) {
+test('49-line detection reads are rejected with or without a final newline', async () => {
+  for (const text of ['x\n'.repeat(48) + 'x', 'x\n'.repeat(49)]) {
     assert.equal(await observeStop(fakeHerdr(agent(), output({ text })), 'w1:p1'), null);
   }
 });
 
-test('24-line reads retain the UTF-8 byte cap and scan credentials on the final line', async () => {
-  for (const text of ['é'.repeat(1013) + '\n'.repeat(23), 'x\n'.repeat(23) + 'api_key=supersecretvalue1234']) {
+test('48-line reads retain the UTF-8 byte cap and scan credentials on the final line', async () => {
+  for (const text of ['é'.repeat(1001) + '\n'.repeat(47), 'x\n'.repeat(47) + 'api_key=supersecretvalue1234']) {
     assert.equal(await observeStop(fakeHerdr(agent(), output({ text })), 'w1:p1'), null);
   }
 });
