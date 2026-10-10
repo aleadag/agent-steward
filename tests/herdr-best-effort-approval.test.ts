@@ -156,7 +156,147 @@ async function fixture(enabled = true) {
   };
 }
 
-test('approval diagnostics correlate both assessments, delivery, and a skipped duplicate without content', async () => {
+test('identical approval text survives metadata-only changes with one assessment', async () => {
+  const f = await fixture();
+  try {
+    const decide = f.deps.decide;
+    f.deps.decide = async (input) => {
+      const result = await decide(input);
+      f.changePane({ revision: 260, state_change_seq: 5, agent_status: 'done' });
+      return result;
+    };
+    await f.run();
+    assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+    assert.equal(f.inputs.length, 1);
+    assert.equal(f.diagnostics[0]?.approval?.assessments.length, 1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('a successful approval does not request a second evaluator judgment', async () => {
+  const f = await fixture();
+  try {
+    const decide = f.deps.decide;
+    f.deps.decide = async (input) => {
+      const result = await decide(input);
+      f.setRisk(0.9);
+      return result;
+    };
+    await f.run();
+    assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+    assert.equal(f.inputs.length, 1);
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
+  } finally {
+    await f.cleanup();
+  }
+});
+
+for (const [name, changed] of [
+  ['command with identical footer', dialog('printf different-command')],
+  ['footer', dialog().replace('tab Amend', 'tab Amend · ctrl+g edit/expand command')],
+  ['terminal newline', `${dialog()}\n`],
+] as const) {
+  test(`whole assessed-text hash refuses changed ${name}`, async () => {
+    const f = await fixture();
+    try {
+      const decide = f.deps.decide;
+      f.deps.decide = async (input) => {
+        const result = await decide(input);
+        f.changeText(changed);
+        return result;
+      };
+      await f.run();
+      assert.deepEqual(f.keys, []);
+      assert.equal(f.inputs.length, 1);
+      assert.equal(f.diagnostics[0]?.approval?.gate, 'observation_changed');
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
+for (const field of ['agent', 'session', 'kind', 'source'] as const) {
+  test(`identical text cannot approve a changed ${field}`, async () => {
+    const f = await fixture();
+    try {
+      const decide = f.deps.decide;
+      f.deps.decide = async (input) => {
+        const result = await decide(input);
+        const current = await f.herdr.get();
+        f.changePane(
+          field === 'agent'
+            ? { agent: 'claude', agent_session: { ...current.agent_session!, agent: 'claude' } }
+            : {
+                agent_session: {
+                  ...current.agent_session!,
+                  ...(field === 'session'
+                    ? { value: 's2' }
+                    : field === 'kind'
+                      ? { kind: 'path' }
+                      : { source: 'other' }),
+                },
+              },
+        );
+        return result;
+      };
+      await f.run();
+      assert.deepEqual(f.keys, []);
+      assert.equal(f.inputs.length, 1);
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
+test('approval rereads the selected RPC size even when fewer actual lines were returned', async () => {
+  const f = await fixture();
+  const directory = await mkdtemp(join(tmpdir(), 'steward-fixed-approval-'));
+  const path = join(directory, 'herdr.sock');
+  const screen = `Command\n---\n${dialog(Array.from({ length: 11 }, (_, i) => `argument-${i}`).join('\n'))}`;
+  const reads: number[] = [];
+  const server = createServer((socket) => {
+    let data = '';
+    socket.on('data', async (chunk) => {
+      data += chunk;
+      if (!data.includes('\n')) return;
+      const { id, method, params } = JSON.parse(data.slice(0, data.indexOf('\n')));
+      assert.ok(method === 'agent.get' || method === 'agent.read');
+      let result;
+      if (method === 'agent.get') result = { type: 'agent_info', agent: await f.herdr.get() };
+      else {
+        reads.push(params.lines);
+        result = {
+          type: 'pane_read',
+          read: {
+            pane_id: 'w1:p1',
+            source: 'detection',
+            revision: 0,
+            text: screen.split('\n').slice(-params.lines).join('\n'),
+            truncated: screen.split('\n').length > params.lines,
+          },
+        };
+      }
+      socket.end(JSON.stringify({ id, result }) + '\n');
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(path, resolve));
+  try {
+    f.deps.herdr = { ...socketReader(path), sendKeys: f.herdr.sendKeys };
+    await f.run();
+    assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+    assert.equal(f.inputs.length, 1);
+    assert.equal(f.inputs[0]?.context, screen);
+    assert.equal(screen.split('\n').length, 22);
+    assert.deepEqual(reads, [12, 16, 24, 24, 24, 24]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await f.cleanup();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('approval diagnostics correlate the assessment, delivery, and a skipped duplicate without content', async () => {
   const f = await fixture();
   try {
     await f.run();
@@ -174,7 +314,7 @@ test('approval diagnostics correlate both assessments, delivery, and a skipped d
     await f.run();
     assert.equal(f.diagnostics[1]?.request_id, event.request_id);
     assert.equal(f.diagnostics[1]?.approval_skip, 'previous_delivered');
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.equal(f.keys.length, 1);
     assert.doesNotMatch(JSON.stringify(f.diagnostics), /printf|approval-probe|w1:p1|herdr:antigravity_cli|"s1"/);
   } finally {
@@ -196,7 +336,7 @@ for (const [name, setup, gate, count] of [
       const decide = f.deps.decide;
       f.deps.decide = async (input) => {
         const result = await decide(input);
-        f.changePane({ state_change_seq: 5 });
+        f.changeText(`${dialog()}\n`);
         return result;
       };
     },
@@ -265,7 +405,7 @@ for (const failure of ['prewrite', 'final_read', 'cleanup_write'] as const) {
         (await f.store.approval('agy', 's1'))?.state,
         failure === 'cleanup_write' ? 'uncertain' : 'not_sent',
       );
-      assert.equal(f.inputs.length, 2);
+      assert.equal(f.inputs.length, 1);
       assert.deepEqual(f.keys, []);
       assert.doesNotMatch(JSON.stringify(f.diagnostics), /private write error|private cleanup error/);
     } finally {
@@ -298,22 +438,21 @@ for (const late of [false, true]) {
   });
 }
 
-test('second policy rejection retains the first approval and the second risk judgment', async () => {
+test('single policy rejection retains its risk judgment', async () => {
   const f = await fixture();
   try {
     const decide = f.deps.decide;
     f.deps.decide = async (input) => {
-      const result = await decide(input);
       f.setRisk(0.9);
-      return result;
+      return decide(input);
     };
     await f.run();
     const diagnostic = f.diagnostics[0]?.approval;
     assert.equal(diagnostic?.gate, 'assessment_rejected');
-    assert.equal(diagnostic?.checkpoint, 'assessment_2');
+    assert.equal(diagnostic?.checkpoint, 'assessment_1');
     assert.deepEqual(
       diagnostic?.assessments.map((assessment) => assessment.reason_code),
-      ['low_risk', 'high_risk'],
+      ['high_risk'],
     );
     assert.deepEqual(f.keys, []);
     assert.equal((await f.store.approval('agy', 's1'))?.state, 'human');
@@ -400,7 +539,7 @@ test('a stalled diagnostic sink has a bounded wait after delivery and never retr
         timer = setTimeout(() => reject(new Error('diagnostics stalled approval handler')), 4000);
       }),
     ]);
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.equal(f.keys.length, 1);
     assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
   } finally {
@@ -417,7 +556,7 @@ test('diagnostic sink failure cannot prevent guarded approval or cause input ret
     };
     await f.run();
     await f.run();
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.equal(f.keys.length, 1);
     assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
   } finally {
@@ -694,6 +833,9 @@ async function scopedApproval() {
     handoffs,
     run,
     attempt,
+    changeText: (next: string) => {
+      text = next;
+    },
     changePane: (changes: Partial<AgentSnapshot>) => {
       current = { ...current, ...changes };
     },
@@ -711,13 +853,13 @@ test('global best-effort mode assesses idle permission UI and sends only one key
   try {
     await f.run();
     assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.equal(f.inputs[0]?.pending_action?.action, 'printf approval-probe');
     assert.equal(f.inputs[0]?.automatic_approval_forbidden, false);
     assert.deepEqual(f.handoffs, []);
     await f.run();
     assert.equal(f.keys.length, 1);
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     // A footer or lifecycle sequence change must not grant another attempt for the same menu.
     f.changeText(dialog() + '\nTOOL · ctx 2.6%');
     f.changePane({ state_change_seq: 5 });
@@ -738,7 +880,7 @@ test('recognized permission reported done is approved only in global approval mo
     assert.equal((await observeStop(f.herdr, 'w1:p1'))?.status, 'done');
     await f.run();
     assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.ok(f.inputs.every((input) => input.status === 'blocked'));
     await f.run();
     assert.equal(f.keys.length, 1);
@@ -1194,7 +1336,7 @@ echo "Alive PID: $pid ($d)"
       f.deps.herdr = { ...f.herdr, ...socketReader(path) };
       await f.run();
       if (!action) assert.deepEqual(f.keys, []);
-      assert.equal(f.inputs.length, action ? 2 : name === 'credential in a recovered action line' ? 0 : 1);
+      assert.equal(f.inputs.length, action ? 1 : name === 'credential in a recovered action line' ? 0 : 1);
       if (action) {
         assert.equal(f.inputs[0]?.context, context);
         assert.equal(f.inputs[0]?.pending_action?.action, action);
@@ -1243,7 +1385,7 @@ for (const boundary of ['dialog', 'session', 'control', 'lease', 'shutdown'] as 
   });
 }
 
-for (const boundary of ['focus', 'dialog'] as const) {
+for (const boundary of ['footer', 'dialog'] as const) {
   test(`${boundary} change after the uncertain prewrite records no send and permits fresh assessment`, async () => {
     const f = await fixture();
     try {
@@ -1254,11 +1396,11 @@ for (const boundary of ['focus', 'dialog'] as const) {
         await record(pane, attempt);
         if (attempt.state !== 'uncertain' || changed) return;
         changed = true;
-        if (boundary === 'focus') f.changePane({ agent_status: 'idle', state_change_seq: 5 });
+        if (boundary === 'footer') f.changeText(`${dialog()}\n`);
         else f.changeText(dialog('printf changed-probe'));
       };
       await f.run();
-      assert.equal(f.inputs.length, 2);
+      assert.equal(f.inputs.length, 1);
       assert.deepEqual(f.keys, []);
       const saved = await f.store.approval('agy', 's1');
       assert.equal(saved?.state, 'not_sent');
@@ -1266,14 +1408,14 @@ for (const boundary of ['focus', 'dialog'] as const) {
       assert.equal(JSON.stringify(saved).includes('approval-probe'), false);
 
       // Persisted no-send evidence must survive a store reopen, but is not
-      // approval: the fresh event still needs both policy assessments.
+      // approval: the fresh event still needs a policy assessment.
       f.deps.store = new EpisodeStore(f.store.directory);
       await f.run();
-      assert.equal(f.inputs.length, 4);
+      assert.equal(f.inputs.length, 2);
       assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
       assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
       await f.run();
-      assert.equal(f.inputs.length, 4);
+      assert.equal(f.inputs.length, 2);
       assert.equal(f.keys.length, 1);
     } finally {
       await f.cleanup();
@@ -1287,13 +1429,13 @@ test('fresh policy rejection after a known no-send attempt still prevents input'
     const record = f.store.recordApproval.bind(f.store);
     f.store.recordApproval = async (pane, attempt) => {
       await record(pane, attempt);
-      if (attempt.state === 'uncertain') f.changePane({ state_change_seq: 5 });
+      if (attempt.state === 'uncertain') f.changeText(`${dialog()}\n`);
     };
     await f.run();
     assert.equal((await f.store.approval('agy', 's1'))?.state, 'not_sent');
     f.setRisk(0.9);
     await f.run();
-    assert.equal(f.inputs.length, 3);
+    assert.equal(f.inputs.length, 2);
     assert.deepEqual(f.keys, []);
     assert.equal((await f.store.approval('agy', 's1'))?.state, 'human');
   } finally {
@@ -1308,14 +1450,14 @@ test('dispatch rejection before transport invocation records no send', async () 
       throw new Error('effect not admitted');
     };
     await f.run();
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.deepEqual(f.keys, []);
     const saved = await f.store.approval('agy', 's1');
     assert.equal(saved?.state, 'not_sent');
     assert.equal(saved?.not_sent_reason, 'delivery_not_started');
     f.deps.dispatchEffect = async (_kind, effect) => effect();
     await f.run();
-    assert.equal(f.inputs.length, 4);
+    assert.equal(f.inputs.length, 2);
     assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
   } finally {
     await f.cleanup();
@@ -1348,11 +1490,11 @@ test('dispatch error after transport invocation keeps session uncertainty', asyn
       throw new Error('dispatch acknowledgment lost');
     };
     await f.run();
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.equal(f.keys.length, 1);
     assert.equal((await f.store.approval('agy', 's1'))?.state, 'uncertain');
     await f.run();
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.equal(f.keys.length, 1);
   } finally {
     await f.cleanup();
@@ -1366,14 +1508,14 @@ test('failed no-send publication retains uncertainty and never retries', async (
     f.store.recordApproval = async (pane, attempt) => {
       if (attempt.state === 'not_sent') throw new Error('publication failed');
       await record(pane, attempt);
-      if (attempt.state === 'uncertain') f.changePane({ state_change_seq: 5 });
+      if (attempt.state === 'uncertain') f.changeText(`${dialog()}\n`);
     };
     await f.run();
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.deepEqual(f.keys, []);
     assert.equal((await f.store.approval('agy', 's1'))?.state, 'uncertain');
     await f.run();
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.deepEqual(f.keys, []);
   } finally {
     await f.cleanup();
@@ -1394,7 +1536,7 @@ for (const boundary of ['session', 'lease', 'shutdown'] as const) {
         if (boundary === 'shutdown') f.stopAdmission();
       };
       await f.run();
-      assert.equal(f.inputs.length, 2);
+      assert.equal(f.inputs.length, 1);
       assert.deepEqual(f.keys, []);
       assert.equal((await f.store.approval('agy', 's1'))?.state, 'uncertain');
     } finally {
@@ -1403,16 +1545,16 @@ for (const boundary of ['session', 'lease', 'shutdown'] as const) {
   });
 }
 
-test('fresh high-risk decision after initial approval prevents input', async () => {
+test('a high-risk judgment in the single assessment prevents input', async () => {
   const f = await fixture();
   try {
     const decide = f.deps.decide;
     f.deps.decide = async (input) => {
-      if (f.inputs.length === 1) f.setRisk(0.8);
+      f.setRisk(0.8);
       return decide(input);
     };
     await f.run();
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.deepEqual(f.keys, []);
   } finally {
     await f.cleanup();
@@ -1570,7 +1712,7 @@ test('configured event entrypoint sends literal agent send-keys once through Her
     ledger.env = { XDG_STATE_HOME: env.XDG_STATE_HOME };
     const [attempt] = await readStopLedger(ledger);
     assert.equal(attempt?.approval?.gate, 'delivered');
-    assert.equal(attempt?.approval?.assessments.length, 2);
+    assert.equal(attempt?.approval?.assessments.length, 1);
     assert.doesNotMatch(JSON.stringify(attempt), /printf|w1:p1|"s1"/);
     await runEvent(env, f.deps.decide);
     assert.equal(await readFile(argv, 'utf8'), 'agent\nsend-keys\nw1:p1\n1\n');
@@ -1590,7 +1732,7 @@ test('changed partial menu with the same status stays human-only without a recov
   try {
     await f.run();
     assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     const decisions = f.inputs.length;
     f.changeText(partialMenu);
     await f.run();
@@ -1646,7 +1788,7 @@ test('scoped status hook approves a complete menu without a global supervisor le
     assert.equal(await f.store.active(), false);
     await f.run();
     assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
     assert.deepEqual(f.handoffs, []);
     assert.equal(await f.store.retry('w1:p1'), null);
@@ -1655,7 +1797,7 @@ test('scoped status hook approves a complete menu without a global supervisor le
   }
 });
 
-test('scoped authority publishes no-send evidence after a focus change and permits fresh assessment', async () => {
+test('scoped authority publishes no-send evidence after a text change and permits fresh assessment', async () => {
   const f = await scopedApproval();
   try {
     f.changePane({ agent_status: 'done' });
@@ -1665,17 +1807,17 @@ test('scoped authority publishes no-send evidence after a focus change and permi
       await record(pane, attempt);
       if (attempt.state === 'uncertain' && !changed) {
         changed = true;
-        f.changePane({ agent_status: 'idle', state_change_seq: 5 });
+        f.changeText(`${dialog()}\n`);
       }
     };
     await f.run();
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.deepEqual(f.keys, []);
     const saved = await f.store.approval('agy', 's1');
     assert.equal(saved?.state, 'not_sent');
     assert.equal(saved?.not_sent_reason, 'observation_changed');
     await f.run();
-    assert.equal(f.inputs.length, 4);
+    assert.equal(f.inputs.length, 2);
     assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
     assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
   } finally {
@@ -1692,7 +1834,7 @@ test('scoped authority revocation after the uncertain prewrite retains quarantin
       if (attempt.state === 'uncertain') f.attempt.close();
     };
     await f.run();
-    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs.length, 1);
     assert.deepEqual(f.keys, []);
     assert.equal((await f.store.approval('agy', 's1'))?.state, 'uncertain');
   } finally {

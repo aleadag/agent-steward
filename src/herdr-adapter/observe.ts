@@ -17,11 +17,13 @@ export type ReadSnapshot = {
   text: string;
   truncated: boolean;
   context_restricted?: true;
+  capture_lines?: number;
 };
 export type HerdrReader = {
   list?: () => Promise<AgentSnapshot[]>;
   get: (paneId: string) => Promise<AgentSnapshot | null>;
   read: (paneId: string) => Promise<ReadSnapshot | null>;
+  readFixed?: (paneId: string, lines: number) => Promise<ReadSnapshot | null>;
 };
 export type ObservedStop = {
   pane_id: string;
@@ -37,6 +39,7 @@ export type ObservedStop = {
   current_episode_id: string;
   error_evidence_digest: string;
   context_restricted?: true;
+  capture_lines?: number;
 };
 
 function hasControls(value: string): boolean {
@@ -79,7 +82,9 @@ export function checkDetectionRead(read: ReadSnapshot | null, paneId: string): '
     read.revision < 0 ||
     typeof read.truncated !== 'boolean' ||
     typeof read.text !== 'string' ||
-    (read.context_restricted !== undefined && read.context_restricted !== true)
+    (read.context_restricted !== undefined && read.context_restricted !== true) ||
+    (read.capture_lines !== undefined &&
+      (!Number.isSafeInteger(read.capture_lines) || read.capture_lines < 1 || read.capture_lines > 48))
   )
     return 'invalid';
   const lines = read.text.split('\n');
@@ -93,15 +98,24 @@ export function checkDetectionRead(read: ReadSnapshot | null, paneId: string): '
   return Buffer.byteLength(read.text, 'utf8') > 2048 ? 'oversized' : 'valid';
 }
 
-export async function observeStop(herdr: HerdrReader, paneId: string): Promise<ObservedStop | null> {
+export async function observeStop(
+  herdr: HerdrReader,
+  paneId: string,
+  captureLines?: number,
+): Promise<ObservedStop | null> {
   if (!/^w[A-Za-z0-9]+:p[A-Za-z0-9]+$/.test(paneId)) return null;
+  if (
+    captureLines !== undefined &&
+    (!Number.isSafeInteger(captureLines) || captureLines < 1 || captureLines > 48 || !herdr.readFixed)
+  )
+    return null;
   const before = await herdr.get(paneId);
   if (!before) return null;
   const sessionId = identity(before, paneId);
   if (!sessionId) return null;
   const sessionKind = before.agent_session!.kind;
   const sessionSource = before.agent_session!.source;
-  const read = await herdr.read(paneId);
+  const read = captureLines === undefined ? await herdr.read(paneId) : await herdr.readFixed!(paneId, captureLines);
   const after = await herdr.get(paneId);
   if (
     !after ||
@@ -114,7 +128,8 @@ export async function observeStop(herdr: HerdrReader, paneId: string): Promise<O
     after.revision !== before.revision ||
     after.state_change_seq !== before.state_change_seq ||
     !read ||
-    checkDetectionRead(read, paneId) !== 'valid'
+    checkDetectionRead(read, paneId) !== 'valid' ||
+    (captureLines !== undefined && read.capture_lines !== captureLines)
   )
     return null;
   // Herdr's detection-read revision is independent of agent.get revision, and
@@ -155,6 +170,7 @@ export async function observeStop(herdr: HerdrReader, paneId: string): Promise<O
     state_change_seq: before.state_change_seq,
     context: read.text,
     ...(read.context_restricted ? { context_restricted: true as const } : {}),
+    ...(read.capture_lines === undefined ? {} : { capture_lines: read.capture_lines }),
     current_episode_id: episodeId,
     error_evidence_digest: errorDigest,
   };

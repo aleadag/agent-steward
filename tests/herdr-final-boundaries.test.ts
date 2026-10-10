@@ -547,7 +547,7 @@ for (const provenance of ['paused', 'terminal', 'association', 'old-server'] as 
           state,
         ),
       );
-      assert.equal(assessments, 2);
+      assert.equal(assessments, 1);
       assert.equal(keys, 1);
       assert.deepEqual(await episodes.sessionRetry('agy', 's1'), before);
     } finally {

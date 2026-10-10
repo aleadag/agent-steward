@@ -198,17 +198,24 @@ export async function handleBestEffortApproval(
           attempt_id: attemptId,
           recorded_at: now.toISOString(),
         };
+        const assessedLineCount = observed.context.split('\n').length - (observed.context.endsWith('\n') ? 1 : 0);
         let observationCount = 0;
         const matchingObservation = async () => {
           checkpoint =
-            (['initial', 'after_assessment_1', 'after_assessment_2', 'before_delivery'] as const)[observationCount++] ??
-            'before_delivery';
+            (['initial', 'after_assessment_1', 'before_delivery'] as const)[observationCount++] ?? 'before_delivery';
           if (!(await owns())) return false;
           gate = 'observation_unavailable';
-          const fresh = await observeStop(deps.herdr, observed.pane_id);
+          const fresh = await observeStop(deps.herdr, observed.pane_id, observed.capture_lines);
           const matches =
             admissionOpen() &&
-            fresh?.current_episode_id === observed.current_episode_id &&
+            fresh !== null &&
+            fresh.workspace_id === observed.workspace_id &&
+            fresh.agent === observed.agent &&
+            fresh.session_id === observed.session_id &&
+            fresh.session_kind === observed.session_kind &&
+            fresh.session_source === observed.session_source &&
+            fresh.error_evidence_digest === observed.error_evidence_digest &&
+            fresh.context.split('\n').length - (fresh.context.endsWith('\n') ? 1 : 0) === assessedLineCount &&
             !fresh.context_restricted &&
             (!deps.observationAllowed || deps.observationAllowed(fresh));
           if (!matches)
@@ -226,7 +233,7 @@ export async function handleBestEffortApproval(
               session_id: observed.session_id,
             },
             // An explicit permission menu is logically blocked even when Herdr reports idle.
-            // Raw Herdr status remains part of the unchanged-observation delivery checks.
+            // Delivery binds the exact assessed text and actor/session, not mutable status metadata.
             status: 'blocked',
             context: observed.context,
             pending_action: { action: menu.action },
@@ -242,7 +249,7 @@ export async function handleBestEffortApproval(
             },
           });
         const approved = async () => {
-          checkpoint = assessments.length === 0 ? 'assessment_1' : 'assessment_2';
+          checkpoint = 'assessment_1';
           const request = input();
           if (!admissionOpen()) {
             gate = 'ownership_lost';
@@ -301,7 +308,7 @@ export async function handleBestEffortApproval(
           let outcome: NonNullable<ApprovalDiagnostic['no_send_cleanup']>['outcome'] = 'observation_unavailable';
           try {
             if (!(await owns())) return;
-            const fresh = await observeStop(deps.herdr, observed.pane_id);
+            const fresh = await observeStop(deps.herdr, observed.pane_id, observed.capture_lines);
             if (
               !fresh ||
               fresh.workspace_id !== observed.workspace_id ||
@@ -331,13 +338,7 @@ export async function handleBestEffortApproval(
           }
         };
         try {
-          if (
-            !(await matchingObservation()) ||
-            !(await approved()) ||
-            !(await matchingObservation()) ||
-            !(await approved()) ||
-            !(await matchingObservation())
-          ) {
+          if (!(await matchingObservation()) || !(await approved()) || !(await matchingObservation())) {
             if (await owns()) {
               const rejectedGate = gate;
               gate = 'record_failed';

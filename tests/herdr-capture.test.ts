@@ -62,6 +62,113 @@ async function capture(
   }
 }
 
+test('fixed rechecks use their saved size rather than the adaptive reader', async () => {
+  const sizes: number[] = [];
+  const observed = await observeStop(
+    {
+      get: async () => pane,
+      read: async () => ({
+        pane_id: pane.pane_id,
+        source: 'detection',
+        revision: 0,
+        text: 'different adaptive excerpt',
+        truncated: true,
+      }),
+      readFixed: async (_pane: string, lines: number) => {
+        sizes.push(lines);
+        return {
+          pane_id: pane.pane_id,
+          source: 'detection',
+          revision: 0,
+          text: 'assessed excerpt\n',
+          truncated: true,
+          capture_lines: lines,
+        };
+      },
+    },
+    pane.pane_id,
+    24,
+  );
+  assert.equal(observed?.context, 'assessed excerpt\n');
+  assert.deepEqual(sizes, [24]);
+});
+
+for (const size of [0, -1, 49, 1.5, NaN]) {
+  test(`fixed recheck rejects invalid capture size ${size}`, async () => {
+    const observed = await observeStop(
+      {
+        get: async () => pane,
+        read: async () => ({
+          pane_id: pane.pane_id,
+          source: 'detection',
+          revision: 0,
+          text: 'assessed excerpt',
+          truncated: true,
+        }),
+      },
+      pane.pane_id,
+      size,
+    );
+    assert.equal(observed, null);
+  });
+}
+
+test('fixed recheck refuses a reader without the fixed-size capability', async () => {
+  const observed = await observeStop(
+    {
+      get: async () => pane,
+      read: async () => ({
+        pane_id: pane.pane_id,
+        source: 'detection',
+        revision: 0,
+        text: 'assessed excerpt',
+        truncated: true,
+      }),
+    },
+    pane.pane_id,
+    24,
+  );
+  assert.equal(observed, null);
+});
+
+for (const [name, changes] of [
+  ['different capture size', { capture_lines: 16 }],
+  ['invalid local capture size', { capture_lines: 0 }],
+  ['wrong source', { source: 'recent' }],
+  ['oversized text', { text: 'x'.repeat(2049) }],
+  ['too many actual lines', { text: 'x\n'.repeat(49) }],
+  ['credentials', { text: 'api_key=pretendcredential12345678' }],
+] as const) {
+  test(`fixed recheck rejects ${name}`, async () => {
+    const observed = await observeStop(
+      {
+        get: async () => pane,
+        read: async () => null,
+        readFixed: async () =>
+          Object.assign(
+            {
+              pane_id: pane.pane_id,
+              source: 'detection',
+              revision: 0,
+              text: 'assessed excerpt',
+              truncated: true,
+              capture_lines: 24,
+            },
+            changes,
+          ),
+      },
+      pane.pane_id,
+      24,
+    );
+    assert.equal(observed, null);
+  });
+}
+
+test('peer capture-size annotations cannot choose the local recheck size', async () => {
+  const { observed } = await capture(shortMenu, (read) => ({ ...read, capture_lines: 48 }));
+  assert.equal(observed?.capture_lines, 12);
+});
+
 const ordinary = Array.from({ length: 48 }, (_, i) => `Ordinary output ${i}`).join('\n');
 const initial = ordinary.split('\n').slice(-12).join('\n');
 

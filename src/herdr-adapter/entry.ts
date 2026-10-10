@@ -108,7 +108,28 @@ async function request(
 }
 
 export function socketReader(path: string): HerdrReader {
+  const readFixed = async (paneId: string, lines: number): Promise<ReadSnapshot | null> => {
+    if (!Number.isSafeInteger(lines) || lines < 1 || lines > 48) return null;
+    const result = (await request(path, 'agent.read', {
+      target: paneId,
+      source: 'detection',
+      lines,
+      format: 'text',
+    })) as { type?: string; read?: ReadSnapshot };
+    const raw = result.type === 'pane_read' ? result.read : null;
+    if (!raw) return null;
+    // Capture size and restrictions are local annotations, never peer authority.
+    return {
+      pane_id: raw.pane_id,
+      source: raw.source,
+      revision: raw.revision,
+      text: raw.text,
+      truncated: raw.truncated,
+      capture_lines: lines,
+    };
+  };
   return {
+    readFixed,
     list: async () => {
       const result = (await request(path, 'agent.list', {})) as { type?: string; agents?: AgentSnapshot[] };
       if (result.type !== 'agent_list' || !Array.isArray(result.agents)) throw new Error('Invalid Herdr agent list');
@@ -119,24 +140,7 @@ export function socketReader(path: string): HerdrReader {
       return result.type === 'agent_info' ? (result.agent ?? null) : null;
     },
     read: async (paneId) => {
-      const read = async (lines: number) => {
-        const result = (await request(path, 'agent.read', {
-          target: paneId,
-          source: 'detection',
-          lines,
-          format: 'text',
-        })) as { type?: string; read?: ReadSnapshot };
-        const raw = result.type === 'pane_read' ? result.read : null;
-        if (!raw) return null;
-        // Private restrictions are derived below, never supplied by the peer.
-        return {
-          pane_id: raw.pane_id,
-          source: raw.source,
-          revision: raw.revision,
-          text: raw.text,
-          truncated: raw.truncated,
-        };
-      };
+      const read = (lines: number) => readFixed(paneId, lines);
       const hasHeader = (text: string) => text.split('\n').some((line) => line.trim() === 'Requesting permission for:');
       const hasCue = (text: string) =>
         hasHeader(text) ||
