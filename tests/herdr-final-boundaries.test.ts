@@ -334,6 +334,87 @@ test('pending last approval validation cannot invoke keys after another instance
   }
 });
 
+for (const restricted of [false, true])
+  for (const boundary of ['pause', 'generation', 'closed'] as const) {
+    test(`permission assessment loses ${boundary} admission without state effects (restricted=${restricted})`, async () => {
+      const root = await mkdtemp(join(tmpdir(), 'steward-permission-boundary-'));
+      const state = new WorkflowState(root);
+      const attempt = start(state);
+      const entered = deferred<void>(),
+        resume = deferred<void>();
+      let replacement: ReturnType<typeof start> | undefined;
+      let work: Promise<void> | undefined;
+      let calls = 0,
+        effects = 0;
+      try {
+        const authority = await attempt.ready;
+        assert.ok(authority);
+        const episodes = new EpisodeStore(root);
+        const deps = workflowEventDeps(
+          {
+            herdr: {
+              get: async () => snapshot(),
+              read: async () => ({
+                pane_id: 'w1:p1',
+                source: 'detection',
+                revision: 0,
+                text: restricted ? dialog : 'Requesting permission for:\n echo local-test',
+                truncated: false,
+                ...(restricted ? { context_restricted: true as const } : {}),
+              }),
+              sendKeys: async () => {
+                effects++;
+              },
+              prompt: async () => {
+                effects++;
+              },
+            },
+            store: episodes,
+            autoApprove: true,
+            targets: 'all',
+            clock: { now: () => new Date() },
+            decide: async (input) => {
+              calls++;
+              entered.resolve();
+              await resume.promise;
+              return decision(input);
+            },
+            handoff: async () => {
+              effects++;
+            },
+          },
+          authority,
+          state,
+        );
+        work = handleEvent(event, deps);
+        await within(entered.promise);
+        if (boundary === 'closed') attempt.close();
+        else {
+          assert.equal(await new WorkflowState(root).pause(scope.serverId), 'paused');
+          if (boundary === 'generation') {
+            assert.equal(await new WorkflowState(root).resume(scope.serverId, true), 'resumed');
+            replacement = start(state);
+            assert.ok(await replacement.ready);
+          }
+        }
+        resume.resolve();
+        await within(work);
+        assert.equal(calls, 1);
+        assert.equal(effects, 0);
+        assert.equal(await state.sessionRetry(scope), null);
+        assert.equal(await episodes.approval('agy', 's1'), null);
+      } finally {
+        resume.resolve();
+        await work?.catch(() => {});
+        attempt.close();
+        replacement?.close();
+        await attempt.finish();
+        await replacement?.finish();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+
 for (const provenance of ['paused', 'terminal', 'association', 'old-server'] as const)
   test(`ordinary recovery classifies but refuses canonical ${provenance} provenance before write`, async () => {
     const root = await mkdtemp(join(tmpdir(), 'steward-final-provenance-'));

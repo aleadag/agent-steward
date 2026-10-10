@@ -1277,8 +1277,8 @@ test('due recovery does not treat a partial permission menu as a reason to poll'
       },
       true,
     );
-    assert.equal(decisions, 0);
-    assert.equal(reads, 1);
+    assert.equal(decisions, 1);
+    assert.equal(reads, 2);
     assert.equal((await retryEpisode(f)).next_check_at, null);
     assert.equal((await retryEpisode(f)).attempt_count, 1);
     assert.ok(handoffs.length >= 1);

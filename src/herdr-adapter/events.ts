@@ -283,11 +283,14 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       return;
     }
     if (deps.observationAllowed && !deps.observationAllowed(observed)) return;
+    const recognizedMenu = approvalMenu(observed.context);
+    const partialMenu = !recognizedMenu && observed.context.includes('Requesting permission for:');
+    const permissionAssessment = partialMenu || observed.context_restricted === true;
     if (!due && (await handleBestEffortApproval(observed, deps, stillOwner))) return;
     if (!admissionOpen()) return;
     let history = existing;
     let recoveryPermitted = true;
-    if (deps.recoveryAllowed) {
+    if (!permissionAssessment && deps.recoveryAllowed) {
       if (!admissionOpen()) return;
       recoveryPermitted = await deps.recoveryAllowed(observed);
       if (!recoveryPermitted && !deps.completeRecovery) return;
@@ -310,6 +313,37 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     }
     const quarantine = async (reason: HandoffReason) => {
       if (!admissionOpen()) return;
+      if (permissionAssessment) {
+        if (!(await stillOwner())) return;
+        let fresh;
+        try {
+          fresh = await observeStop(deps.herdr, observed.pane_id);
+        } catch {
+          if (!admissionOpen()) return;
+          if (due) throw new Error('Herdr observation unavailable');
+          await notify('observation_unavailable');
+          return;
+        }
+        if (!admissionOpen()) return;
+        if (
+          fresh?.current_episode_id !== observed.current_episode_id ||
+          fresh.context_restricted !== observed.context_restricted ||
+          (deps.observationAllowed && !deps.observationAllowed(fresh))
+        ) {
+          if (due) throw new Error('Herdr observation unavailable');
+          if (await stillOwner()) await notify('observation_unavailable');
+          return;
+        }
+        if (!(await stillOwner())) return;
+        if (history)
+          await deps.store.record(observed.pane_id, {
+            ...history,
+            next_check_at: null,
+            last_delivery_state: history.last_delivery_state === 'uncertain' ? 'uncertain' : 'human',
+          });
+        if (await stillOwner()) await notify(reason);
+        return;
+      }
       if (due && history) {
         const stillOwned = await stillOwner();
         if (!admissionOpen()) return;
@@ -327,7 +361,14 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       }
       await notify(reason);
     };
-    if (history && (history as Episode).session_id !== observed.session_id) {
+    if (
+      history &&
+      (history.session_id !== observed.session_id || (permissionAssessment && history.pane_id !== observed.pane_id))
+    ) {
+      if (permissionAssessment) {
+        if (await stillOwner()) await notify('observation_unavailable');
+        return;
+      }
       if (!admissionOpen()) return;
       const stillOwned = await stillOwner();
       if (!admissionOpen()) return;
@@ -341,7 +382,12 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       await notify('observation_unavailable');
       return;
     }
-    if (!deps.completeRecovery && history && history.failure_episode_id !== observed.current_episode_id) {
+    if (
+      !permissionAssessment &&
+      !deps.completeRecovery &&
+      history &&
+      history.failure_episode_id !== observed.current_episode_id
+    ) {
       // A sequence/revision/status change, even with identical or different historical
       // detection text, cannot prove a fresh failure. Keep the same-session caps.
       const moved = observed.workspace_id !== observed.pane_id.split(':')[0];
@@ -366,10 +412,8 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       }
       return;
     }
-    if (!deps.completeRecovery && history && (history as Episode).last_delivery_state !== 'none') return;
-    const recognizedMenu = approvalMenu(observed.context);
-    const partialMenu = !recognizedMenu && observed.context.includes('Requesting permission for:');
-    if ((recognizedMenu && (due || !deps.autoApprove)) || partialMenu) {
+    if (!permissionAssessment && !deps.completeRecovery && history && history.last_delivery_state !== 'none') return;
+    if (!permissionAssessment && recognizedMenu && (due || !deps.autoApprove)) {
       if (history) {
         const stillOwned = await stillOwner();
         if (!admissionOpen()) return;
@@ -388,6 +432,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       return;
     }
     if (
+      !permissionAssessment &&
       !deps.completeRecovery &&
       history &&
       (history as Episode).next_check_at &&
@@ -413,6 +458,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     // No new classification for the same pending timer. Due wake-ups advance quota
     // history only when the fresh decision still confirms quota exhaustion.
     if (
+      !permissionAssessment &&
       !due &&
       (history as Episode | null)?.next_check_at &&
       (!deps.completeRecovery || history!.failure_episode_id === observed.current_episode_id) &&
@@ -423,7 +469,8 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     if (!Number.isFinite(now.getTime())) return;
     const retry: Retry = history
       ? {
-          failure_episode_id: deps.completeRecovery ? observed.current_episode_id : history.failure_episode_id,
+          failure_episode_id:
+            !permissionAssessment && deps.completeRecovery ? observed.current_episode_id : history.failure_episode_id,
           first_observed_at: history.first_observed_at,
           attempt_count: history.attempt_count,
           last_attempt_at: history.last_attempt_at,
@@ -466,7 +513,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       return;
     }
     const inputRetry: Retry =
-      due && history && (history as Episode).next_check_at
+      !permissionAssessment && due && history && history.next_check_at
         ? {
             ...retry,
             quota_check_count: retry.quota_check_count + 1,
@@ -499,7 +546,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       return;
     }
     if (!admissionOpen()) return;
-    if (deps.completeRecovery && !(await stillOwner())) return;
+    if ((permissionAssessment || deps.completeRecovery) && !(await stillOwner())) return;
     if (!admissionOpen()) return;
     let result: StopResult;
     try {
@@ -512,6 +559,10 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
     if (!admissionOpen()) return;
     if (result.decision !== 'stop_decision' || result.request_id !== input.data.request_id) {
       await quarantine('decision_failed');
+      return;
+    }
+    if (permissionAssessment) {
+      await quarantine('human_review_required');
       return;
     }
     if (deps.completeRecovery) {

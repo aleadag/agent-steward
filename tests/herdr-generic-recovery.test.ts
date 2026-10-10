@@ -305,6 +305,42 @@ for (const completed of [false, true])
     }
   });
 
+for (const restricted of [false, true])
+  for (const choice of ['completed', 'quota_limit', 'recoverable_api_error']) {
+    test(`permission assessment retains uncertain history for ${choice} (restricted=${restricted})`, async () => {
+      const f = await fixture();
+      try {
+        f.transport(async () => {
+          throw new Error('lost acknowledgment');
+        });
+        await f.stop();
+        f.advance(30_000);
+        await f.stop(true);
+        const old = await f.state.sessionRetry(f.scope);
+        assert.equal(old?.last_delivery_state, 'uncertain');
+        const binding = await f.state.binding(f.scope);
+        f.change(choice);
+        if (restricted) {
+          const read = f.herdr.read;
+          f.herdr.read = async () => ({ ...(await read()), context_restricted: true as const });
+        } else f.menu();
+        const before = f.decisions();
+        await f.stop();
+        assert.equal(f.decisions() - before, 1);
+        assert.deepEqual(await f.state.sessionRetry(f.scope), old);
+        assert.deepEqual(await f.state.binding(f.scope), binding);
+        assert.equal(f.prompts.length, 1);
+        f.change();
+        f.advance(600_000);
+        await f.stop();
+        assert.deepEqual(await f.state.sessionRetry(f.scope), old);
+        assert.equal(f.prompts.length, 1);
+      } finally {
+        await f.finish();
+      }
+    });
+  }
+
 test('the real quota job advances changed snapshots and services the next deadline', async () => {
   const f = await fixture();
   let waits = 0;

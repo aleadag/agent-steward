@@ -16,6 +16,7 @@ export type ReadSnapshot = {
   revision: number;
   text: string;
   truncated: boolean;
+  context_restricted?: true;
 };
 export type HerdrReader = {
   list?: () => Promise<AgentSnapshot[]>;
@@ -35,6 +36,7 @@ export type ObservedStop = {
   context: string;
   current_episode_id: string;
   error_evidence_digest: string;
+  context_restricted?: true;
 };
 
 function hasControls(value: string): boolean {
@@ -76,7 +78,8 @@ export function checkDetectionRead(read: ReadSnapshot | null, paneId: string): '
     !Number.isSafeInteger(read.revision) ||
     read.revision < 0 ||
     typeof read.truncated !== 'boolean' ||
-    typeof read.text !== 'string'
+    typeof read.text !== 'string' ||
+    (read.context_restricted !== undefined && read.context_restricted !== true)
   )
     return 'invalid';
   const lines = read.text.split('\n');
@@ -151,6 +154,7 @@ export async function observeStop(herdr: HerdrReader, paneId: string): Promise<O
     revision: before.revision,
     state_change_seq: before.state_change_seq,
     context: read.text,
+    ...(read.context_restricted ? { context_restricted: true as const } : {}),
     current_episode_id: episodeId,
     error_evidence_digest: errorDigest,
   };

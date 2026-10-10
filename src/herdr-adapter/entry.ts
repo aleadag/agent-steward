@@ -14,7 +14,6 @@ import type { HerdrControl } from './deliver.ts';
 import { handleEvent, normalizeEvent, workflowEventDeps, type EventDeps, type EventTrigger } from './events.ts';
 import { runEpisodeJob, type JobOptions } from './jobs.ts';
 import { checkDetectionRead, type HerdrReader, type AgentSnapshot, type ReadSnapshot } from './observe.ts';
-import { approvalMenu } from './best-effort-approval.ts';
 import { quotaResetHint, type QuotaHint } from './quota-hint.ts';
 import { EpisodeStore, type Episode } from './state.ts';
 import {
@@ -127,33 +126,74 @@ export function socketReader(path: string): HerdrReader {
           lines,
           format: 'text',
         })) as { type?: string; read?: ReadSnapshot };
-        return result.type === 'pane_read' ? (result.read ?? null) : null;
+        const raw = result.type === 'pane_read' ? result.read : null;
+        if (!raw) return null;
+        // Private restrictions are derived below, never supplied by the peer.
+        return {
+          pane_id: raw.pane_id,
+          source: raw.source,
+          revision: raw.revision,
+          text: raw.text,
+          truncated: raw.truncated,
+        };
       };
-      const initial = await read(12);
-      if (!initial || checkDetectionRead(initial, paneId) !== 'valid') return null;
-      if (approvalMenu(initial.text)) return initial;
-      // Parsing, not visible trigger strings, determines the smallest complete
-      // menu. Every probe must extend the same safe detection snapshot.
+      const hasHeader = (text: string) => text.split('\n').some((line) => line.trim() === 'Requesting permission for:');
+      const hasCue = (text: string) =>
+        hasHeader(text) ||
+        text.includes('Run this command?') ||
+        text.includes('Apply this edit?') ||
+        text.split('\n').some((line) => /^\s*(?:>\s*)?1\. Yes, (?:run command|apply edit)\s*$/.test(line));
+      const reads = new Map<number, ReadSnapshot>();
+      let weak: ReadSnapshot | undefined;
+      let weakLines = 0;
+      const acquire = async (lines: number) => {
+        const candidate = reads.get(lines) ?? (await read(lines));
+        const checked = checkDetectionRead(candidate, paneId);
+        if (!candidate || checked === 'invalid') return null;
+        for (const [cachedLines, cached] of reads) {
+          if (
+            candidate.revision !== cached.revision ||
+            !(cachedLines <= lines ? candidate.text.endsWith(cached.text) : cached.text.endsWith(candidate.text))
+          )
+            return null;
+        }
+        reads.set(lines, candidate);
+        if (checked === 'valid' && lines > weakLines && hasCue(candidate.text)) {
+          weak = candidate;
+          weakLines = lines;
+        }
+        return { candidate, checked };
+      };
+      const first = await acquire(12);
+      if (!first || first.checked !== 'valid') return null;
+      const initial = first.candidate;
+      if (hasHeader(initial.text)) return initial;
       let previous = initial;
       for (const lines of [16, 24, 48]) {
         if (!previous.truncated) break;
-        const expanded = await read(lines);
-        const checked = checkDetectionRead(expanded, paneId);
-        if (
-          !expanded ||
-          checked === 'invalid' ||
-          expanded.revision !== previous.revision ||
-          !expanded.text.endsWith(previous.text)
-        )
-          return null;
-        if (checked === 'oversized') return initial;
-        if (approvalMenu(expanded.text)) return expanded;
+        const probe = await acquire(lines);
+        if (!probe) return null;
+        const expanded = probe.candidate;
+        if (probe.checked === 'oversized') {
+          if (!hasCue(expanded.text)) return initial;
+          // Reacquire bounded evidence, not a slice of the oversized text.
+          let smaller = initial;
+          for (let size = 13; size < lines; size++) {
+            const bounded = await acquire(size);
+            if (!bounded) return null;
+            if (bounded.checked === 'oversized') break;
+            const candidate = bounded.candidate;
+            if (hasHeader(candidate.text)) return { ...candidate, context_restricted: true };
+            if (!candidate.truncated || candidate.text === smaller.text) break;
+            smaller = candidate;
+          }
+          return { ...(weak ?? initial), context_restricted: true };
+        }
+        if (hasHeader(expanded.text)) return expanded;
         if (expanded.text === previous.text) break;
         previous = expanded;
       }
-      // No complete menu: retain ordinary short classification evidence, not
-      // discarded history. Neither excerpt proves native request identity.
-      return initial;
+      return weak ?? initial;
     },
   };
 }

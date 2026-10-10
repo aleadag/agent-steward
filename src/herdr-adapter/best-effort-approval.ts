@@ -86,7 +86,7 @@ export async function handleBestEffortApproval(
   deps: EventDeps,
   stillOwner: () => Promise<boolean>,
 ): Promise<boolean> {
-  if (!deps.autoApprove) return false;
+  if (!deps.autoApprove || observed.context_restricted) return false;
   if (deps.observationAllowed && !deps.observationAllowed(observed)) return true;
   const menu = approvalMenu(observed.context);
   if (!menu) return false;
@@ -209,6 +209,7 @@ export async function handleBestEffortApproval(
           const matches =
             admissionOpen() &&
             fresh?.current_episode_id === observed.current_episode_id &&
+            !fresh.context_restricted &&
             (!deps.observationAllowed || deps.observationAllowed(fresh));
           if (!matches)
             gate = admissionOpen() ? (fresh ? 'observation_changed' : 'observation_unavailable') : 'ownership_lost';

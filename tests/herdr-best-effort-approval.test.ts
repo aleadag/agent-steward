@@ -12,7 +12,7 @@ import { EpisodeStore } from '../src/herdr-adapter/state.ts';
 import { WorkflowState } from '../src/herdr-adapter/workflow-state.ts';
 import { assessStop } from '../src/triage.ts';
 import { observeStop, type AgentSnapshot } from '../src/herdr-adapter/observe.ts';
-import type { Evaluation, StopInput } from '../src/contracts.ts';
+import type { Evaluation, StopInput, StopResult } from '../src/contracts.ts';
 import { readStopLedger, type StopLedgerEvent } from '../src/stop-ledger.ts';
 import { createRuntime } from '../src/main.ts';
 
@@ -274,6 +274,30 @@ for (const failure of ['prewrite', 'final_read', 'cleanup_write'] as const) {
   });
 }
 
+for (const late of [false, true]) {
+  test(`known omitted context blocks approval (${late ? 'after first assessment' : 'initial'})`, async () => {
+    const f = await fixture();
+    let restricted = !late;
+    const read = f.herdr.read;
+    f.herdr.read = async () => ({ ...(await read()), ...(restricted ? { context_restricted: true as const } : {}) });
+    const decide = f.deps.decide;
+    f.deps.decide = async (input) => {
+      const result = await decide(input);
+      restricted = true;
+      return result;
+    };
+    try {
+      await f.run();
+      assert.deepEqual(f.keys, []);
+      assert.equal(f.inputs.length, 1);
+      assert.equal(await f.store.retry('w1:p1'), null);
+      if (!late) assert.equal(await f.store.approval('agy', 's1'), null);
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
 test('second policy rejection retains the first approval and the second risk judgment', async () => {
   const f = await fixture();
   try {
@@ -402,6 +426,190 @@ test('diagnostic sink failure cannot prevent guarded approval or cause input ret
 });
 
 const partialMenu = 'Requesting permission for:\n   printf approval-probe\n\nRun this command?\n> 1. Yes, run command';
+
+for (const restricted of [false, true]) {
+  test(`permission evidence uses one combined assessment (restricted=${restricted})`, async () => {
+    const f = await fixture();
+    try {
+      if (restricted) {
+        const read = f.herdr.read;
+        f.herdr.read = async () => ({ ...(await read()), context_restricted: true as const });
+      } else f.changeText(partialMenu);
+      f.setConfidence(0.99);
+      f.setRisk(0.01);
+      await f.run();
+      assert.deepEqual(f.keys, []);
+      assert.equal(f.inputs.length, 1);
+      assert.equal(f.inputs[0]?.context, restricted ? dialog() : partialMenu);
+      assert.equal(f.inputs[0]?.status, 'idle');
+      assert.equal(f.inputs[0]?.pending_action, undefined);
+      assert.equal(f.inputs[0]?.automatic_approval_forbidden, true);
+      assert.deepEqual(f.handoffs, ['human_review_required']);
+      assert.equal(await f.store.approval('agy', 's1'), null);
+      assert.equal(await f.store.retry('w1:p1'), null);
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
+type ProposedAction = Extract<StopResult, { decision: 'stop_decision' }>['proposed_action'];
+const permissionActions: ProposedAction[] = [
+  { kind: 'approve_request' },
+  { kind: 'manual_review' },
+  { kind: 'no_action' },
+  { kind: 'wait_for_quota', not_before: '2026-10-03T12:05:00Z' },
+  {
+    kind: 'send_recovery_instruction',
+    not_before: '2026-10-03T12:05:00Z',
+    instruction:
+      'Continue the interrupted task from the last unfinished step. Before repeating the preceding operation, check whether it succeeded; do not repeat completed actions. If the same failure is still current, retry the operation once. If the task is already complete, report that.',
+  },
+];
+for (const restricted of [false, true])
+  for (const action of permissionActions) {
+    test(`permission evidence fences ${action.kind} (restricted=${restricted})`, async () => {
+      const f = await fixture();
+      let effects = 0;
+      try {
+        if (restricted) {
+          const read = f.herdr.read;
+          f.herdr.read = async () => ({ ...(await read()), context_restricted: true as const });
+        } else f.changeText(partialMenu);
+        f.deps.recoveryAllowed = async () => {
+          effects++;
+          return true;
+        };
+        f.deps.completeRecovery = async () => {
+          effects++;
+        };
+        f.deps.recoveryHandoff = async () => {
+          effects++;
+        };
+        f.deps.dispatchEffect = async () => {
+          effects++;
+        };
+        f.deps.quotaHint = async () => {
+          effects++;
+          return null;
+        };
+        f.deps.decide = async (input): Promise<StopResult> => {
+          f.inputs.push(input);
+          return {
+            schema_version: 2,
+            request_id: input.request_id,
+            decision: 'stop_decision',
+            proposed_action: action,
+            reason_code: action.kind === 'no_action' ? 'completed' : 'low_risk',
+            waiting_for: action.kind === 'no_action' ? 'completed' : 'approve_command',
+            waiting_confidence: 1,
+            risk_probability: 0.01,
+            evaluation: null,
+          };
+        };
+        await f.run();
+        assert.deepEqual(f.keys, []);
+        assert.equal(f.inputs.length, 1);
+        assert.equal(effects, 0);
+        assert.equal(await f.store.retry('w1:p1'), null);
+        assert.equal(await f.store.approval('agy', 's1'), null);
+      } finally {
+        await f.cleanup();
+      }
+    });
+  }
+
+for (const boundary of ['dialog', 'session', 'restriction', 'lease', 'shutdown', 'failed', 'mismatch'] as const) {
+  test(`deferred permission handoff validates ${boundary}`, async () => {
+    const f = await fixture();
+    const read = f.herdr.read;
+    let restricted = false;
+    f.changeText(partialMenu);
+    f.herdr.read = async () => ({ ...(await read()), ...(restricted ? { context_restricted: true as const } : {}) });
+    f.deps.decide = async (input) => {
+      f.inputs.push(input);
+      if (boundary === 'dialog') f.changeText(partialMenu + '\nchanged');
+      if (boundary === 'session')
+        f.changePane({ agent_session: { agent: 'agy', kind: 'id', source: 'herdr:antigravity_cli', value: 's2' } });
+      if (boundary === 'restriction') restricted = true;
+      if (boundary === 'lease') f.deps.sessionValid = async () => false;
+      if (boundary === 'shutdown') f.stopAdmission();
+      if (boundary === 'failed') throw new Error('private model failure');
+      return {
+        schema_version: 2,
+        request_id: boundary === 'mismatch' ? 'wrong-request' : input.request_id,
+        decision: 'stop_decision',
+        proposed_action: { kind: 'manual_review' },
+        reason_code: 'low_risk',
+        waiting_for: 'approve_command',
+        waiting_confidence: 1,
+        risk_probability: 0.01,
+        evaluation: null,
+      };
+    };
+    try {
+      await f.run();
+      assert.deepEqual(f.keys, []);
+      assert.equal(f.inputs.length, 1);
+      assert.equal(await f.store.retry('w1:p1'), null);
+      assert.deepEqual(
+        f.handoffs,
+        boundary === 'lease' || boundary === 'shutdown'
+          ? []
+          : [boundary === 'failed' || boundary === 'mismatch' ? 'decision_failed' : 'observation_unavailable'],
+      );
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
+for (const restricted of [false, true]) {
+  test(`due permission assessment preserves uncertainty and quota counters (restricted=${restricted})`, async () => {
+    const f = await fixture();
+    try {
+      if (restricted) {
+        const read = f.herdr.read;
+        f.herdr.read = async () => ({ ...(await read()), context_restricted: true as const });
+      } else f.changeText(partialMenu);
+      const observed = await observeStop(f.herdr, 'w1:p1');
+      assert.ok(observed);
+      const history = {
+        pane_id: 'w1:p1',
+        session_id: 's1',
+        failure_episode_id: observed.current_episode_id,
+        error_evidence_digest: observed.error_evidence_digest,
+        first_observed_at: at,
+        attempt_count: 2,
+        last_attempt_at: at,
+        quota_check_count: 1,
+        last_quota_check_at: at,
+        next_check_at: at,
+        last_delivery_state: 'uncertain' as const,
+      };
+      await f.store.record('w1:p1', history);
+      const pane = await f.herdr.get();
+      await handleEvent(
+        {
+          type: 'pane.agent_status_changed',
+          pane_id: 'w1:p1',
+          workspace_id: 'w1',
+          agent: pane.agent,
+          agent_status: pane.agent_status,
+        },
+        f.deps,
+        true,
+      );
+      assert.deepEqual(f.keys, []);
+      assert.equal(f.inputs.length, 1);
+      assert.equal(f.inputs[0]?.retry.quota_check_count, 1);
+      assert.equal(f.inputs[0]?.retry.last_quota_check_at, at);
+      assert.deepEqual(await f.store.retry('w1:p1'), { ...history, next_check_at: null });
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
 
 async function scopedApproval() {
   const directory = await mkdtemp(join(tmpdir(), 'steward-scoped-approval-'));
@@ -944,13 +1152,13 @@ echo "Alive PID: $pid ($d)"
     [12, 16, 24],
   ],
   ['oversized recovered excerpt', agyLoopMenu.replace('Alive PID:', 'x'.repeat(2048)), null, null, [12, 16]],
-  ['conflicting setup prefix', agyLoopMenu.replace('Command\n', 'Settings Error\n'), null, null, [12, 16, 24, 48]],
+  ['conflicting setup prefix', agyLoopMenu.replace('Command\n', 'Settings Error\n'), null, null, [12, 16, 24]],
   [
     'extra control after cancel',
     agyLoopMenu.replace('  4. No, cancel', '  4. No, cancel\n  5. Yes, always allow').replace('\n\n  ↑/↓', '\n  ↑/↓'),
     null,
     null,
-    [12, 16, 24, 48],
+    [12, 16, 24],
   ],
 ] as const) {
   test(`bounded socket detection handles the ${name}`, async () => {
@@ -985,6 +1193,7 @@ echo "Alive PID: $pid ($d)"
     try {
       f.deps.herdr = { ...f.herdr, ...socketReader(path) };
       await f.run();
+      if (!action) assert.deepEqual(f.keys, []);
       assert.equal(f.inputs.length, action ? 2 : name === 'credential in a recovered action line' ? 0 : 1);
       if (action) {
         assert.equal(f.inputs[0]?.context, context);
@@ -995,7 +1204,9 @@ echo "Alive PID: $pid ($d)"
         assert.deepEqual(f.keys, []);
         assert.equal(f.handoffs.length, 1);
         if (f.inputs[0]) {
-          assert.equal(f.inputs[0].context, screen.split('\n').slice(-12).join('\n'));
+          if (name === 'conflicting setup prefix') assert.ok(String(f.inputs[0].context).includes('Settings Error'));
+          if (name === 'extra control after cancel')
+            assert.ok(String(f.inputs[0].context).includes('5. Yes, always allow'));
           assert.equal(f.inputs[0].pending_action, undefined);
           assert.equal(f.inputs[0].automatic_approval_forbidden, true);
         }
@@ -1384,7 +1595,7 @@ test('changed partial menu with the same status stays human-only without a recov
     f.changeText(partialMenu);
     await f.run();
     assert.equal(f.keys.length, 1);
-    assert.equal(f.inputs.length, decisions);
+    assert.equal(f.inputs.length, decisions + 1);
     assert.equal(await f.store.retry('w1:p1'), null);
     assert.ok(f.handoffs.includes('human_review_required'));
   } finally {
@@ -1420,6 +1631,7 @@ for (const status of ['idle', 'done'] as const) {
       assert.equal(history?.quota_check_count, 1);
       assert.equal(history?.last_delivery_state, 'human');
       assert.equal(f.handoffs.length, 1);
+      assert.equal(f.inputs.length, 0);
       assert.deepEqual(f.keys, []);
       assert.equal(f.inputs.length, 0);
     } finally {

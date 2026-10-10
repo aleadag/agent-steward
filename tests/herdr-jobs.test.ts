@@ -408,6 +408,43 @@ test('sleeping quota job waits the +5m deadline, holds no locks, and performs on
   }
 });
 
+for (const restricted of [false, true]) {
+  test(`due job assesses permission once without advancing quota or promoting (restricted=${restricted})`, async () => {
+    const f = await world();
+    try {
+      const saved = await assess(f);
+      const before = f.counts.decide;
+      let waits = 0;
+      const result = await runJob(f, async (deadline) => {
+        assert.equal(++waits, 1);
+        f.setNow(deadline.toISOString());
+        f.text = restricted ? dialog : 'Requesting permission for:\n echo local-test';
+        f.snapshot = pane({ revision: 9, state_change_seq: 5 });
+        if (restricted) {
+          const read = f.herdr.read;
+          f.herdr.read = async (target) => {
+            const snapshot = await read(target);
+            return snapshot ? { ...snapshot, context_restricted: true as const } : null;
+          };
+        }
+      });
+      assert.equal(result, 'finished');
+      assert.equal(f.counts.decide - before, 1);
+      assert.equal(waits, 1);
+      assert.deepEqual(f.keys, []);
+      assert.deepEqual(f.prompts, []);
+      assert.deepEqual(await f.state.sessionRetry(f.authority.scope), {
+        ...saved,
+        next_check_at: null,
+        last_delivery_state: 'human',
+      });
+      assert.deepEqual(f.handoffs, ['human_review_required']);
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
 test('duplicate events consume no slot, reset no deadline and launch nothing', async () => {
   const f = await world();
   const { wait, entered, wake } = jobWait();
