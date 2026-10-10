@@ -14,6 +14,7 @@ import type { StopInput, StopResult } from '../contracts.ts';
 import type { WorkflowAuthority } from './authority.ts';
 import type { WorkflowState } from './workflow-state.ts';
 import type { StopLedgerEvent } from '../stop-ledger.ts';
+import type { ApprovalObservationDiagnostic } from './diagnostics.ts';
 
 export type Event = {
   type?: string;
@@ -62,6 +63,7 @@ export type EventDeps = {
   quotaHint?: QuotaHint;
   decide: (input: StopInput) => Promise<unknown>;
   approvalDiagnostic?: (event: StopLedgerEvent) => Promise<void>;
+  observationDiagnostic?: (event: ApprovalObservationDiagnostic) => void | Promise<void>;
   store: Store;
   clock: { now: () => Date };
   targets: readonly string[] | 'all';

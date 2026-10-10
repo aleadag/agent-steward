@@ -3,6 +3,8 @@ import { lstat, open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { assertNoCredentials, configuredApiKeys } from '../privacy.ts';
+import { ApprovalDiagnosticSchema, type ApprovalDiagnostic } from '../stop-ledger.ts';
+import { observationPhases, observationReasons, type ObservationRejection } from './observe.ts';
 import type { LeaseOptions } from './lease.ts';
 import { withPrivateGuard, writePrivateContents } from './private-files.ts';
 
@@ -12,6 +14,40 @@ export type DiagnosticEvent = {
   outcome: 'created' | 'finished' | 'handoff' | 'shutdown_incomplete';
   reason: 'completed' | 'human' | 'canceled' | 'lost' | 'capacity' | 'release_unconfirmed' | null;
 };
+
+export type ApprovalObservationDiagnostic = ObservationRejection & {
+  attempt_id: string;
+  checkpoint: NonNullable<ApprovalDiagnostic['checkpoint']>;
+  purpose: 'revalidation' | 'no_send_cleanup';
+};
+const ApprovalObservationSchema = z.strictObject({
+  attempt_id: z.uuid(),
+  checkpoint: ApprovalDiagnosticSchema.shape.checkpoint.unwrap(),
+  purpose: z.enum(['revalidation', 'no_send_cleanup']),
+  phase: z.enum(observationPhases),
+  reason: z.enum(observationReasons),
+});
+
+export function writeApprovalObservationDiagnostic(
+  event: ApprovalObservationDiagnostic,
+  env: NodeJS.ProcessEnv = process.env,
+  write: (text: string) => void | Promise<void> = (text) => {
+    process.stderr.write(text);
+  },
+): void {
+  try {
+    const data = ApprovalObservationSchema.parse(event);
+    const text = `agent-steward: observation_rejected attempt_id=${data.attempt_id} checkpoint=${data.checkpoint} purpose=${data.purpose} phase=${data.phase} reason=${data.reason}\n`;
+    if (Buffer.byteLength(text) > 256) return;
+    assertNoCredentials(
+      text,
+      configuredApiKeys({ TYPESAFE_API_KEY: env.TYPESAFE_API_KEY, OPENROUTER_API_KEY: env.OPENROUTER_API_KEY }),
+    );
+    void Promise.resolve(write(text)).catch(() => {});
+  } catch {
+    // Diagnostic output can never grant authority or affect a refusal.
+  }
+}
 
 const MAX_LOG_BYTES = 1_048_576;
 const MAX_LINE_BYTES = 1024;

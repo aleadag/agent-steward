@@ -11,6 +11,7 @@ import { createRuntime } from '../main.ts';
 import { readFileText } from '../io.ts';
 import { beginWorkflow } from './authority.ts';
 import type { HerdrControl } from './deliver.ts';
+import { writeApprovalObservationDiagnostic } from './diagnostics.ts';
 import { handleEvent, normalizeEvent, workflowEventDeps, type EventDeps, type EventTrigger } from './events.ts';
 import { runEpisodeJob, type JobOptions } from './jobs.ts';
 import { checkDetectionRead, type HerdrReader, type AgentSnapshot, type ReadSnapshot } from './observe.ts';
@@ -732,6 +733,7 @@ export async function runEvent(
       herdr,
       decide,
       approvalDiagnostic: (event) => appendStopEvent(diagnosticRuntime, event),
+      observationDiagnostic: (event) => writeApprovalObservationDiagnostic(event, diagnosticRuntime.env),
       store: {
         active: async () => true,
         retry: (paneId) => episodes.retry(paneId),

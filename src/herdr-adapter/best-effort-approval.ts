@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { StewardError, StopInputSchema, StopResultSchema } from '../contracts.ts';
 import { ApprovalDiagnosticSchema, stopTool, type ApprovalDiagnostic } from '../stop-ledger.ts';
-import { observeStop, type ObservedStop } from './observe.ts';
+import { observeStop, type ObservedStop, type ObservationRejection } from './observe.ts';
 import type { EventDeps } from './events.ts';
 import type { ApprovalAttempt } from './state.ts';
 
@@ -134,6 +134,8 @@ export async function handleBestEffortApproval(
       clearTimeout(timer);
     }
   };
+  const readRejection = (purpose: 'revalidation' | 'no_send_cleanup') => (failure: ObservationRejection) =>
+    deps.observationDiagnostic?.({ attempt_id: attemptId, checkpoint, purpose, ...failure });
   const admissionOpen = deps.admissionOpen ?? (() => true);
   const owns = async () => {
     const owned = admissionOpen() && (await stillOwner()) && admissionOpen();
@@ -205,7 +207,12 @@ export async function handleBestEffortApproval(
             (['initial', 'after_assessment_1', 'before_delivery'] as const)[observationCount++] ?? 'before_delivery';
           if (!(await owns())) return false;
           gate = 'observation_unavailable';
-          const fresh = await observeStop(deps.herdr, observed.pane_id, observed.capture_lines);
+          const fresh = await observeStop(
+            deps.herdr,
+            observed.pane_id,
+            observed.capture_lines,
+            readRejection('revalidation'),
+          );
           const matches =
             admissionOpen() &&
             fresh !== null &&
@@ -308,7 +315,12 @@ export async function handleBestEffortApproval(
           let outcome: NonNullable<ApprovalDiagnostic['no_send_cleanup']>['outcome'] = 'observation_unavailable';
           try {
             if (!(await owns())) return;
-            const fresh = await observeStop(deps.herdr, observed.pane_id, observed.capture_lines);
+            const fresh = await observeStop(
+              deps.herdr,
+              observed.pane_id,
+              observed.capture_lines,
+              readRejection('no_send_cleanup'),
+            );
             if (
               !fresh ||
               fresh.workspace_id !== observed.workspace_id ||

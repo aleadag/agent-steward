@@ -156,6 +156,125 @@ async function fixture(enabled = true) {
   };
 }
 
+for (const mode of ['collect', 'throws', 'rejects', 'stalls'] as const) {
+  test(`precise approval reread diagnostics (${mode}) preserve human state and one assessment`, async () => {
+    const f = await fixture();
+    const failures: unknown[] = [];
+    let unstable = false;
+    try {
+      const decide = f.deps.decide;
+      f.deps.decide = async (input) => {
+        const result = await decide(input);
+        unstable = true;
+        return result;
+      };
+      const read = f.herdr.read;
+      f.herdr.read = async () => {
+        const result = await read();
+        if (unstable) {
+          unstable = false;
+          f.changePane({ state_change_seq: 5 });
+        }
+        return result;
+      };
+      f.deps.observationDiagnostic = (event) => {
+        failures.push(event);
+        if (mode === 'throws') throw new Error('private diagnostic failure');
+        if (mode === 'rejects') return Promise.reject(new Error('private diagnostic failure'));
+        if (mode === 'stalls') return new Promise<void>(() => {});
+      };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          f.run(),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('diagnostic stalled approval')), 1000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+      const diagnostic = f.diagnostics[0]?.approval;
+      assert.ok(diagnostic);
+      assert.deepEqual(failures, [
+        {
+          attempt_id: diagnostic.attempt_id,
+          checkpoint: 'after_assessment_1',
+          purpose: 'revalidation',
+          phase: 'after',
+          reason: 'sequence_changed',
+        },
+      ]);
+      assert.equal(diagnostic.gate, 'observation_unavailable');
+      assert.equal(diagnostic.transport_started, false);
+      assert.equal(f.inputs.length, 1);
+      assert.deepEqual(f.keys, []);
+      assert.equal((await f.store.approval('agy', 's1'))?.state, 'human');
+      await f.run();
+      assert.equal(f.inputs.length, 1);
+      assert.equal(failures.length, 1);
+      assert.deepEqual(f.keys, []);
+      assert.doesNotMatch(JSON.stringify(failures), /printf|w1:p1|private|herdr:|"s1"/);
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
+test('cleanup read diagnostics stay separate from the stopping gate and retain quarantine', async () => {
+  const f = await fixture();
+  const failures: unknown[] = [];
+  let prewritten = false;
+  let changed = false;
+  try {
+    const record = f.store.recordApproval.bind(f.store);
+    f.store.recordApproval = async (pane, attempt) => {
+      await record(pane, attempt);
+      if (attempt.state === 'uncertain') prewritten = true;
+    };
+    const read = f.herdr.read;
+    f.herdr.read = async () => {
+      if (prewritten && changed) throw new Error('raw private read failure');
+      const result = await read();
+      if (prewritten) {
+        changed = true;
+        f.changePane({ state_change_seq: 5 });
+      }
+      return result;
+    };
+    f.deps.observationDiagnostic = (event) => {
+      failures.push(event);
+    };
+    await f.run();
+    const diagnostic = f.diagnostics[0]?.approval;
+    assert.ok(diagnostic);
+    assert.deepEqual(failures, [
+      {
+        attempt_id: diagnostic.attempt_id,
+        checkpoint: 'before_delivery',
+        purpose: 'revalidation',
+        phase: 'after',
+        reason: 'sequence_changed',
+      },
+      {
+        attempt_id: diagnostic.attempt_id,
+        checkpoint: 'before_delivery',
+        purpose: 'no_send_cleanup',
+        phase: 'read',
+        reason: 'failed',
+      },
+    ]);
+    assert.equal(diagnostic.gate, 'observation_unavailable');
+    assert.equal(diagnostic.no_send_cleanup?.outcome, 'observation_unavailable');
+    assert.equal((await f.store.approval('agy', 's1'))?.state, 'uncertain');
+    assert.equal(f.inputs.length, 1);
+    assert.deepEqual(f.keys, []);
+    assert.doesNotMatch(JSON.stringify(failures), /raw|private|printf|w1:p1/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test('identical approval text survives metadata-only changes with one assessment', async () => {
   const f = await fixture();
   try {
@@ -1639,6 +1758,108 @@ test('recognized one-time edit menu uses the edit policy and the same key transp
     assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
     assert.equal(f.inputs[0]?.pending_action?.action, 'Replace the draft heading');
   } finally {
+    await f.cleanup();
+  }
+});
+
+test('configured event entrypoint logs a precise rejection without changing public ledger fields or sending keys', async () => {
+  const f = await fixture();
+  const root = await mkdtemp(join(tmpdir(), 'steward-observation-entry-'));
+  const socket = join(root, 'herdr.sock');
+  const plugin = join(root, 'plugin');
+  const config = join(root, 'config');
+  const state = join(root, 'state');
+  await mkdir(plugin);
+  await mkdir(config);
+  await mkdir(state, { mode: 0o700 });
+  await writeFile(join(plugin, 'herdr-plugin.toml'), 'id = "agent-steward-recover"\n');
+  await writeFile(join(config, 'targets.json'), JSON.stringify({ auto_approve: true }));
+  const argv = join(root, 'argv');
+  const binary = join(root, 'fake-herdr');
+  await writeFile(binary, `#!/bin/sh\nprintf '%s\\n' "$@" >> '${argv}'\n`, { mode: 0o700 });
+  let unstable = false;
+  const server = createServer((client) => {
+    let data = '';
+    client.on('data', async (chunk) => {
+      data += chunk.toString();
+      if (!data.includes('\n')) return;
+      const request = JSON.parse(data.split('\n')[0]!);
+      let result;
+      if (request.method === 'plugin.list')
+        result = {
+          type: 'plugin_list',
+          plugins: [
+            {
+              plugin_id: 'agent-steward-recover',
+              name: 'Agent Steward recover',
+              version: '0.1.0',
+              plugin_root: plugin,
+              manifest_path: join(plugin, 'herdr-plugin.toml'),
+              enabled: true,
+            },
+          ],
+        };
+      else if (request.method === 'agent.get') result = { type: 'agent_info', agent: await f.herdr.get() };
+      else if (request.method === 'agent.read') {
+        result = { type: 'pane_read', read: await f.herdr.read() };
+        if (unstable) {
+          unstable = false;
+          f.changePane({ state_change_seq: 5 });
+        }
+      } else result = { type: 'agent_list', agents: await f.herdr.list() };
+      client.end(JSON.stringify({ id: request.id, result }) + '\n');
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(socket, resolve));
+  const env = {
+    XDG_STATE_HOME: join(root, 'cli-state'),
+    HERDR_SOCKET_PATH: socket,
+    HERDR_BIN_PATH: binary,
+    HERDR_PLUGIN_ID: 'agent-steward-recover',
+    HERDR_PLUGIN_ROOT: plugin,
+    HERDR_PLUGIN_CONFIG_DIR: config,
+    HERDR_PLUGIN_STATE_DIR: state,
+    HERDR_PLUGIN_EVENT_JSON: JSON.stringify({
+      type: 'pane.agent_status_changed',
+      pane_id: 'w1:p1',
+      workspace_id: 'w1',
+      agent_status: 'idle',
+      agent: 'agy',
+    }),
+  };
+  const stderr: string[] = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = ((text: string) => {
+    stderr.push(String(text));
+    return true;
+  }) as typeof originalWrite;
+  try {
+    await runEvent(env, async (input) => {
+      const result = await f.deps.decide(input);
+      unstable = true;
+      return result;
+    });
+    const ledger = createRuntime();
+    ledger.env = { XDG_STATE_HOME: env.XDG_STATE_HOME };
+    const [attempt] = await readStopLedger(ledger);
+    assert.ok(attempt?.approval);
+    assert.equal(attempt.approval.gate, 'observation_unavailable');
+    assert.equal(attempt.approval.checkpoint, 'after_assessment_1');
+    assert.equal(attempt.approval.assessments.length, 1);
+    assert.equal(attempt.approval.transport_started, false);
+    const [line] = stderr.filter((s) => s.includes('observation_rejected'));
+    assert.ok(line);
+    assert.ok(line.includes(attempt.approval.attempt_id));
+    assert.match(line, /checkpoint=after_assessment_1 purpose=revalidation phase=after reason=sequence_changed/);
+    assert.doesNotMatch(line, /printf|w1:p1|herdr:|s1|digest|context/);
+    assert.ok(Buffer.byteLength(line) <= 256);
+    assert.doesNotMatch(JSON.stringify(attempt), /observation_rejected|sequence_changed/);
+    assert.doesNotMatch(await readFile(argv, 'utf8'), /send-keys/);
+    assert.equal(f.inputs.length, 1);
+  } finally {
+    process.stderr.write = originalWrite;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
     await f.cleanup();
   }
 });
