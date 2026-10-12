@@ -482,3 +482,45 @@ test('private JSON helpers reject unsafe files and bound actual reads', async ()
   await unlink(`${path}.linked`);
   assert.deepEqual(await readPrivateJson(path, 8192), { value: 1 });
 });
+
+test('a concurrent atomic replace during read yields the published snapshot', async () => {
+  const { root } = await fixture();
+  const path = join(root, 'data.json');
+  await writePrivateJson(path, { value: 1 });
+  const held = deferred<void>();
+  const entered = deferred<void>();
+  let hold = true;
+  const reading = readPrivateJson(path, 8192, {
+    io: {
+      open: async (p, flags, mode) => {
+        if (hold && p === path) {
+          hold = false;
+          entered.resolve();
+          await held.promise;
+        }
+        return open(p, flags, mode);
+      },
+    },
+  });
+  await within(entered.promise);
+  await writePrivateJson(path, { value: 2 });
+  held.resolve();
+  assert.deepEqual(await within(reading), { value: 2 });
+});
+
+test('a vanished private JSON file after lstat stays unsafe, not absent', async () => {
+  const { root } = await fixture();
+  const path = join(root, 'data.json');
+  await writePrivateJson(path, { value: 1 });
+  await assert.rejects(
+    readPrivateJson(path, 8192, {
+      io: {
+        open: async (p, flags, mode) => {
+          if (p === path) await unlink(path);
+          return open(p, flags, mode);
+        },
+      },
+    }),
+    /unsafe private workflow metadata/,
+  );
+});

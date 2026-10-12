@@ -109,39 +109,58 @@ export async function withPrivateGuard<T>(
 export async function readPrivateJson(path: string, maxBytes: number, options: LeaseOptions = {}): Promise<unknown> {
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw unsafe();
   const io = ioFor(options);
-  const parent = await privateDirectory(dirname(path), options);
-  let before: Stats;
-  try {
-    before = privateFile(await io.lstat(path));
-  } catch (error) {
-    await checkParent(dirname(path), parent, options);
-    throw error;
-  }
-  const handle = await io.open(path, constants.O_RDONLY | constants.O_NOFOLLOW).catch(() => {
-    throw unsafe();
-  });
-  try {
-    const opened = privateFile(await handle.stat());
-    if (!same(before, opened) || opened.size > maxBytes) throw unsafe();
-    const buffer = Buffer.alloc(maxBytes + 1);
-    let length = 0;
-    while (length <= maxBytes) {
-      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
-      if (bytesRead === 0) break;
-      length += bytesRead;
+  let observed = false;
+  let last: unknown;
+  // Atomic rename is the write protocol. A still-private replacement is a concurrent
+  // publish, so retry the full read including privateFile. Vanished-after-observe stays unsafe.
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      const parent = await privateDirectory(dirname(path), options);
+      let before: Stats;
+      try {
+        before = privateFile(await io.lstat(path));
+        observed = true;
+      } catch (error) {
+        await checkParent(dirname(path), parent, options);
+        throw error;
+      }
+      const handle = await io.open(path, constants.O_RDONLY | constants.O_NOFOLLOW).catch(() => {
+        throw unsafe();
+      });
+      try {
+        const opened = privateFile(await handle.stat());
+        if (!same(before, opened) || opened.size > maxBytes) throw unsafe();
+        const buffer = Buffer.alloc(maxBytes + 1);
+        let length = 0;
+        while (length <= maxBytes) {
+          const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+          if (bytesRead === 0) break;
+          length += bytesRead;
+        }
+        if (length > maxBytes) throw unsafe();
+        await checkFile(path, opened, options);
+        await checkParent(dirname(path), parent, options);
+        return JSON.parse(buffer.subarray(0, length).toString('utf8')) as unknown;
+      } catch {
+        // Only the initial lstat may report genuine absence, never a vanished opened file.
+        throw unsafe();
+      } finally {
+        await handle.close().catch(() => {
+          throw unsafe();
+        });
+      }
+    } catch (error) {
+      last = error;
+      if (isMissing(error) && !observed) throw error;
+      try {
+        privateFile(await io.lstat(path));
+        await privateDirectory(dirname(path), options);
+      } catch {
+        throw unsafe();
+      }
     }
-    if (length > maxBytes) throw unsafe();
-    await checkFile(path, opened, options);
-    await checkParent(dirname(path), parent, options);
-    return JSON.parse(buffer.subarray(0, length).toString('utf8')) as unknown;
-  } catch {
-    // Only the initial lstat may report genuine absence, never a vanished opened file.
-    throw unsafe();
-  } finally {
-    await handle.close().catch(() => {
-      throw unsafe();
-    });
   }
+  throw last instanceof Error ? last : unsafe();
 }
 
 export async function writePrivateJson(path: string, data: unknown, options: LeaseOptions = {}): Promise<void> {
