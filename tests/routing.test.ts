@@ -256,6 +256,29 @@ test('pair evaluation includes relative cost in instructions and candidate state
   assert.equal(candidates[1]?.cost, 2);
 });
 
+test('pair instructions spend sooner-resetting quota versus long-lived buckets', async () => {
+  let pairText = '';
+  await route(
+    routeInput(config(), async (_state, questions) => {
+      if (questions.pair !== undefined) {
+        pairText = questions.pair.instructions;
+        return selectedPairAnswer({ 'codex-astra': 1 });
+      }
+      return selectedEffortAnswer({ low: 1 });
+    }),
+  );
+  assert.match(pairText, /even when remaining percent is low/);
+  assert.match(pairText, /much shorter horizon than other suitable options/);
+  assert.match(
+    pairText,
+    /Do not choose among similarly soon-resetting windows solely because one reset is slightly earlier/,
+  );
+  assert.match(pairText, /When reset horizons are comparable, favor lower relative cost/);
+  assert.match(pairText, /Remaining percent of zero is unavailable/);
+  assert.doesNotMatch(pairText, /favor ample known remaining quota that resets sooner/);
+  assert.doesNotMatch(pairText, /When quota is scarce, favor lower relative cost/);
+});
+
 test('low-confidence winning pair and effort produce a complete selected result', async () => {
   const codex = candidate({
     id: 'codex-choice',
