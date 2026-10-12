@@ -303,6 +303,21 @@ test('guard cleanup keeps the original fd identity after a failed pathname read'
   assert.equal(await readFile(guard, 'utf8'), 'replacement');
 });
 
+test('an exclusive-create race before chmod is contention, not unsafe', async () => {
+  const { root } = await fixture();
+  await writeFile(join(root, 'test-guard'), '', { mode: 0o644 });
+  assert.equal(await withPrivateGuard(root, 'test-guard', async () => 'acquired'), null);
+});
+
+test('a symlink at the guard path on EEXIST stays unsafe', async () => {
+  const { root } = await fixture();
+  await symlink(join(root, 'missing'), join(root, 'test-guard'));
+  await assert.rejects(
+    withPrivateGuard(root, 'test-guard', async () => 'acquired'),
+    /unsafe private workflow metadata/,
+  );
+});
+
 test('a replacement guard during a held write cannot authorize publication', async () => {
   const { root } = await fixture();
   const path = join(root, 'data.json');

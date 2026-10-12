@@ -55,7 +55,12 @@ export async function withPrivateGuard<T>(
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     await checkParent(directory, parent, options);
     try {
-      privateFile(await io.lstat(path));
+      const info = await io.lstat(path);
+      const uid = process.getuid?.();
+      // A live exclusive create may not be chmod'd yet. Observing an owned regular
+      // file is contention; we never acquire or write through it. Symlinks, other
+      // owners, and a replaced parent stay unsafe.
+      if (uid === undefined || !info.isFile() || info.uid !== uid) throw unsafe();
     } catch (error) {
       if (!isMissing(error)) throw error;
       // The competing holder may just have removed its guard. Only this
