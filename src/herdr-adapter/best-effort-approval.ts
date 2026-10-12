@@ -5,80 +5,43 @@ import { observeStop, type ObservedStop, type ObservationRejection } from './obs
 import type { EventDeps } from './events.ts';
 import type { ApprovalAttempt } from './state.ts';
 
-function isPermissionChrome(line: string): boolean {
-  if (!line) return true;
-  if (line === 'Command' || line === 'expand)' || /^expand\)$/.test(line)) return true;
-  if (/^(?:●\s*)?Bash\(/.test(line)) return true;
-  if (/ctrl\+o to expand/i.test(line) || /ctrl\+o to$/i.test(line)) return true;
-  if (/^[─━═\-|]+$/.test(line)) return true;
-  return false;
+const permissionMarker = 'Requesting permission for:';
+
+export function hasPermissionMarker(context: string): boolean {
+  return context.split('\n').some((line) => line.trim() === permissionMarker);
 }
 
-function isPermissionFooter(line: string): boolean {
-  return /^↑\/↓ Navigate(?: · [^?]*)?$/.test(line) || /^(?:🔧 )?TOOL(?:[ ·╱][^?]*)?$/.test(line) || /^ctx\b/.test(line);
+function forbidsApprovalKeys(context: string): boolean {
+  return (
+    context.includes('Settings Error') ||
+    context.includes('Do you trust this project?') ||
+    /(^|\n)Sign in(\n|$)/.test(context)
+  );
 }
 
-function foldPermissionRows(lines: string[]): string[] {
-  const rows: string[] = [];
-  let current: string | null = null;
-  const flush = () => {
-    if (current) rows.push(current);
-    current = null;
-  };
-  for (const line of lines) {
-    if (!line) continue;
-    if (/^(?:>\s*)?\d+\. /.test(line)) {
-      flush();
-      current = line.replace(/^>\s*/, '');
-      continue;
+function permissionPending(context: string): {
+  action: string;
+  kind: 'approve_command' | 'approve_edit' | null;
+} | null {
+  if (!hasPermissionMarker(context) || forbidsApprovalKeys(context)) return null;
+  const lines = context.split('\n');
+  const header = lines.findIndex((line) => line.trim() === permissionMarker);
+  if (header < 0) return null;
+  let question = -1;
+  let kind: 'approve_command' | 'approve_edit' | null = null;
+  for (let index = header + 1; index < lines.length; index++) {
+    const line = lines[index]!.trim();
+    if (line === 'Run this command?' || line === 'Apply this edit?') {
+      question = index;
+      kind = line === 'Apply this edit?' ? 'approve_edit' : 'approve_command';
+      break;
     }
-    if (current && !current.endsWith('No, cancel') && !isPermissionFooter(line)) {
-      current = `${current} ${line}`;
-      continue;
-    }
-    flush();
-    rows.push(line);
   }
-  flush();
-  return rows;
-}
-
-// Recognize an explicit one-time control, not a bare "1", yes/no question,
-// persistent grant, trust or setup prompt. Text is best-effort evidence only.
-export function approvalMenu(context: string): { action: string; kind: 'approve_command' | 'approve_edit' } | null {
-  const lines = context.split('\n').map((line) => line.trim());
-  const headers = context.match(/Requesting permission for:/g) ?? [];
-  const questions = lines.filter((line) => line === 'Run this command?' || line === 'Apply this edit?');
-  const ones = lines.filter((line) => /^(?:>\s*)?1\./.test(line));
-  if (headers.length !== 1 || questions.length !== 1 || ones.length !== 1) return null;
-  const header = lines.indexOf('Requesting permission for:');
-  if (header < 0 || lines.slice(0, header).some((line) => !isPermissionChrome(line))) return null;
-  const question = lines.indexOf(questions[0]!);
-  const command = questions[0] === 'Run this command?';
-  const control = command ? '1. Yes, run command' : '1. Yes, apply edit';
-  if (ones[0]!.replace(/^>\s*/, '') !== control || question <= header + 1) return null;
-  const one = lines.findIndex((line) => line.replace(/^>\s*/, '') === control);
-  if (one <= question || lines.slice(question + 1, one).some((line) => line !== '')) return null;
-  let choice = 1;
-  let cancelled = false;
-  for (const line of foldPermissionRows(lines.slice(one))) {
-    if (!line) continue;
-    if (cancelled) {
-      // Unknown suffixes may be another dialog owning the keyboard. Only the
-      // recognized navigation/status footer may follow the complete menu.
-      if (!isPermissionFooter(line)) return null;
-      continue;
-    }
-    const row = /^(?:>\s*)?(\d+)\. (Yes, .+|No, cancel)$/.exec(line);
-    if (!row || Number(row[1]) !== choice++) return null;
-    cancelled = row[2] === 'No, cancel';
-  }
-  if (!cancelled) return null;
-  const action = lines
-    .slice(header + 1, question)
+  const action = (question < 0 ? lines.slice(header + 1) : lines.slice(header + 1, question))
+    .map((line) => line.trim())
     .join('\n')
     .trim();
-  return action ? { action, kind: command ? 'approve_command' : 'approve_edit' } : null;
+  return action ? { action, kind } : null;
 }
 
 export async function handleBestEffortApproval(
@@ -88,7 +51,7 @@ export async function handleBestEffortApproval(
 ): Promise<boolean> {
   if (!deps.autoApprove || observed.context_restricted) return false;
   if (deps.observationAllowed && !deps.observationAllowed(observed)) return true;
-  const menu = approvalMenu(observed.context);
+  const menu = permissionPending(observed.context);
   if (!menu) return false;
   let attemptId: string = randomUUID();
   let gate: ApprovalDiagnostic['gate'] = 'control_unavailable';
@@ -303,7 +266,11 @@ export async function handleBestEffortApproval(
             gate = 'assessment_rejected';
             return false;
           }
-          if (result.waiting_for !== menu.kind) {
+          if (
+            menu.kind
+              ? result.waiting_for !== menu.kind
+              : result.waiting_for !== 'approve_command' && result.waiting_for !== 'approve_edit'
+          ) {
             gate = 'classification_mismatch';
             return false;
           }

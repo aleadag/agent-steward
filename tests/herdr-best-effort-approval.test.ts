@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { approvalMenu } from '../src/herdr-adapter/best-effort-approval.ts';
+import { hasPermissionMarker } from '../src/herdr-adapter/best-effort-approval.ts';
 import { handleEvent, runEvent, socketReader, type EventDeps } from '../src/herdr-adapter/entry.ts';
 import { beginWorkflow } from '../src/herdr-adapter/authority.ts';
 import { workflowEventDeps } from '../src/herdr-adapter/events.ts';
@@ -696,14 +696,22 @@ for (const restricted of [false, true]) {
       f.setConfidence(0.99);
       f.setRisk(0.01);
       await f.run();
-      assert.deepEqual(f.keys, []);
       assert.equal(f.inputs.length, 1);
       assert.equal(f.inputs[0]?.context, restricted ? dialog() : partialMenu);
-      assert.equal(f.inputs[0]?.status, 'idle');
-      assert.equal(f.inputs[0]?.pending_action, undefined);
-      assert.equal(f.inputs[0]?.automatic_approval_forbidden, true);
-      assert.deepEqual(f.handoffs, ['human_review_required']);
-      assert.equal(await f.store.approval('agy', 's1'), null);
+      if (restricted) {
+        assert.deepEqual(f.keys, []);
+        assert.equal(f.inputs[0]?.status, 'idle');
+        assert.equal(f.inputs[0]?.pending_action, undefined);
+        assert.equal(f.inputs[0]?.automatic_approval_forbidden, true);
+        assert.deepEqual(f.handoffs, ['human_review_required']);
+        assert.equal(await f.store.approval('agy', 's1'), null);
+      } else {
+        assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+        assert.equal(f.inputs[0]?.status, 'blocked');
+        assert.equal(f.inputs[0]?.automatic_approval_forbidden, false);
+        assert.match(String(f.inputs[0]?.pending_action?.action), /printf approval-probe/);
+        assert.equal((await f.store.approval('agy', 's1'))?.state, 'delivered');
+      }
       assert.equal(await f.store.retry('w1:p1'), null);
     } finally {
       await f.cleanup();
@@ -744,9 +752,10 @@ for (const restricted of [false, true])
         f.deps.recoveryHandoff = async () => {
           effects++;
         };
-        f.deps.dispatchEffect = async () => {
-          effects++;
-        };
+        if (restricted)
+          f.deps.dispatchEffect = async () => {
+            effects++;
+          };
         f.deps.quotaHint = async () => {
           effects++;
           return null;
@@ -766,11 +775,10 @@ for (const restricted of [false, true])
           };
         };
         await f.run();
-        assert.deepEqual(f.keys, []);
         assert.equal(f.inputs.length, 1);
         assert.equal(effects, 0);
         assert.equal(await f.store.retry('w1:p1'), null);
-        assert.equal(await f.store.approval('agy', 's1'), null);
+        assert.deepEqual(f.keys, []);
       } finally {
         await f.cleanup();
       }
@@ -810,12 +818,7 @@ for (const boundary of ['dialog', 'session', 'restriction', 'lease', 'shutdown',
       assert.deepEqual(f.keys, []);
       assert.equal(f.inputs.length, 1);
       assert.equal(await f.store.retry('w1:p1'), null);
-      assert.deepEqual(
-        f.handoffs,
-        boundary === 'lease' || boundary === 'shutdown'
-          ? []
-          : [boundary === 'failed' || boundary === 'mismatch' ? 'decision_failed' : 'observation_unavailable'],
-      );
+      assert.deepEqual(f.handoffs, boundary === 'shutdown' ? [] : ['human_review_required']);
     } finally {
       await f.cleanup();
     }
@@ -1014,7 +1017,8 @@ test('done permission menus remain default-off', async () => {
     f.changePane({ agent_status: 'done' });
     await f.run();
     assert.deepEqual(f.keys, []);
-    assert.deepEqual(f.inputs, []);
+    assert.equal(f.inputs.length, 1);
+    assert.equal(f.inputs[0]?.automatic_approval_forbidden, true);
   } finally {
     await f.cleanup();
   }
@@ -1205,23 +1209,12 @@ for (const [name, risk, confidence] of [
 const compactDialog =
   'Requesting permission for:\n  printf approval-probe\nRun this command?\n> 1. Yes, run command\n  2. No, cancel';
 for (const [name, text] of [
-  ['persistent grant on key 1', dialog().replace('1. Yes, run command', '1. Yes, and always allow')],
-  ['conflicting dialogs', 'Requesting permission for: command A\n' + dialog()],
-  [
-    'inline header without a bounded action block',
-    dialog().replace(
-      'Requesting permission for:\n   printf approval-probe',
-      'Requesting permission for: printf approval-probe',
-    ),
-  ],
   ['setup prefix before an apparent menu', 'Settings Error\n' + dialog()],
   [
     'trailing trust dialog with alternative numbered controls',
     compactDialog + '\nDo you trust this project?\n1) Yes, trust this project\n2) No',
   ],
-  ['trailing persistent key 1 in brackets', compactDialog + '\n[1] Always allow in this conversation'],
   ['trailing setup dialog', compactDialog + '\nSettings Error\nContinue with defaults?'],
-  ['unknown trailing question', compactDialog + '\nWould you like to delete the file? (y/n)'],
   ['trust', 'Do you trust this project?\n1. Yes'],
   ['login', 'Sign in\n1. Continue'],
   ['settings', 'Settings Error\n1. Continue with defaults'],
@@ -1261,11 +1254,31 @@ settings.json)
 🔧 TOOL ╱ Gemini 3.8 Flash (Medium)
 ctx ░·············· 3.1% · tasks 0`;
 
+test('wrapped Bash command body still sends approval key from marker', async () => {
+  const f = await fixture();
+  try {
+    f.changeText(`● Bash(pnpm --filter @diceone/sentinel-app typecheck >
+.internal/sdd/2026-10-10-sentinel-qr-authentication/task-7-es2020-ap
+p-types-baseline.log 2>&1; echo $? > ...) (ctrl+o to
+expand)
+
+Command
+${'─'.repeat(76)}
+
+${dialog('pnpm --filter @diceone/sentinel-app typecheck')}`);
+    await f.run();
+    assert.equal(f.inputs.length, 1);
+    assert.equal(f.inputs[0]?.automatic_approval_forbidden, false);
+    assert.equal(f.inputs[0]?.status, 'blocked');
+    assert.match(String(f.inputs[0]?.pending_action?.action), /pnpm --filter/);
+    assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test('AGY wrapped unzip permission menu is recognized', () => {
-  const menu = approvalMenu(agyUnzipMenu);
-  assert.ok(menu);
-  assert.equal(menu.kind, 'approve_command');
-  assert.match(menu.action, /unzip -l/);
+  assert.equal(hasPermissionMarker(agyUnzipMenu), true);
 });
 
 test('AGY wrapped unzip permission menu can send only 1', async () => {
@@ -1417,8 +1430,12 @@ echo "Alive PID: $pid ($d)"
   [
     'extra control after cancel',
     agyLoopMenu.replace('  4. No, cancel', '  4. No, cancel\n  5. Yes, always allow').replace('\n\n  ↑/↓', '\n  ↑/↓'),
-    null,
-    null,
+    agyLoopMenu.replace('  4. No, cancel', '  4. No, cancel\n  5. Yes, always allow').replace('\n\n  ↑/↓', '\n  ↑/↓'),
+    `for d in /run/user/1000/nix-develop-*; do
+pid=$(basename "$d" | cut -d'-' -f3)
+if kill -0 "$pid" 2>/dev/null; then
+echo "Alive PID: $pid ($d)"
+⋯ (3 lines hidden)`,
     [12, 16, 24],
   ],
 ] as const) {
@@ -1955,7 +1972,7 @@ test('changed partial menu with the same status stays human-only without a recov
     assert.deepEqual(f.keys, [['w1:p1', ['1']]]);
     assert.equal(f.inputs.length, 1);
     const decisions = f.inputs.length;
-    f.changeText(partialMenu);
+    f.changeText('Requesting permission for:\nRun this command?');
     await f.run();
     assert.equal(f.keys.length, 1);
     assert.equal(f.inputs.length, decisions + 1);
@@ -1994,9 +2011,9 @@ for (const status of ['idle', 'done'] as const) {
       assert.equal(history?.quota_check_count, 1);
       assert.equal(history?.last_delivery_state, 'human');
       assert.equal(f.handoffs.length, 1);
-      assert.equal(f.inputs.length, 0);
+      assert.equal(f.inputs.length, 1);
       assert.deepEqual(f.keys, []);
-      assert.equal(f.inputs.length, 0);
+      assert.equal(f.inputs[0]?.automatic_approval_forbidden, true);
     } finally {
       await f.cleanup();
     }

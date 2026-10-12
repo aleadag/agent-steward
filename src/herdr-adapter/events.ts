@@ -5,7 +5,7 @@ import { StopInputSchema, StopResultSchema } from '../contracts.ts';
 import { assertNoCredentials } from '../privacy.ts';
 import { observeStop, type ObservedStop } from './observe.ts';
 import { deliverProposal } from './deliver.ts';
-import { approvalMenu, handleBestEffortApproval } from './best-effort-approval.ts';
+import { handleBestEffortApproval, hasPermissionMarker } from './best-effort-approval.ts';
 import { CorruptEpisodeError, EpisodeStore, type Episode } from './state.ts';
 import type { QuotaHint } from './quota-hint.ts';
 import type { HerdrControl } from './deliver.ts';
@@ -285,9 +285,7 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       return;
     }
     if (deps.observationAllowed && !deps.observationAllowed(observed)) return;
-    const recognizedMenu = approvalMenu(observed.context);
-    const partialMenu = !recognizedMenu && observed.context.includes('Requesting permission for:');
-    const permissionAssessment = partialMenu || observed.context_restricted === true;
+    const permissionAssessment = hasPermissionMarker(observed.context) || observed.context_restricted === true;
     if (!due && (await handleBestEffortApproval(observed, deps, stillOwner))) return;
     if (!admissionOpen()) return;
     let history = existing;
@@ -415,24 +413,13 @@ export async function handleEvent(trigger: EventTrigger, deps: EventDeps, due = 
       return;
     }
     if (!permissionAssessment && !deps.completeRecovery && history && history.last_delivery_state !== 'none') return;
-    if (!permissionAssessment && recognizedMenu && (due || !deps.autoApprove)) {
-      if (history) {
-        const stillOwned = await stillOwner();
-        if (!admissionOpen()) return;
-        if (!stillOwned) {
-          await notify('human_review_required');
-          return;
-        }
-        await deps.store.record(observed.pane_id, {
-          ...history,
-          next_check_at: null,
-          last_delivery_state: history.last_delivery_state === 'uncertain' ? 'uncertain' : 'human',
-        });
-        if (!admissionOpen()) return;
-      }
-      await notify('human_review_required');
+    if (
+      permissionAssessment &&
+      history &&
+      history.last_delivery_state !== 'none' &&
+      history.last_delivery_state !== 'uncertain'
+    )
       return;
-    }
     if (
       !permissionAssessment &&
       !deps.completeRecovery &&

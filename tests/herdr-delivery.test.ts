@@ -982,7 +982,7 @@ for (const matchingEvidence of [false, true]) {
       await handleEvent(event, deps);
       await handleEvent(event, deps, true);
       assert.equal(handoffs.length, 1);
-      assert.equal(decisions, 0);
+      assert.equal(decisions, 1);
       assert.deepEqual(f.herdr.writes(), []);
       assert.deepEqual(await retryEpisode(f), { ...original, next_check_at: null, last_delivery_state: 'human' });
     } finally {
@@ -1216,7 +1216,7 @@ test('due recovery cannot send approval keys for a recognized permission menu', 
       true,
     );
     assert.deepEqual(keys, []);
-    assert.equal(decisions, 0);
+    assert.equal(decisions, 1);
     assert.equal((await retryEpisode(f)).next_check_at, null);
     assert.equal((await retryEpisode(f)).attempt_count, 1);
     assert.equal((await retryEpisode(f)).last_delivery_state, 'human');

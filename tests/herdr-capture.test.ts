@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { socketReader } from '../src/herdr-adapter/entry.ts';
 import { observeStop, type ReadSnapshot } from '../src/herdr-adapter/observe.ts';
-import { approvalMenu } from '../src/herdr-adapter/best-effort-approval.ts';
+import { hasPermissionMarker } from '../src/herdr-adapter/best-effort-approval.ts';
 
 const pane = {
   pane_id: 'w1:p1',
@@ -208,7 +208,7 @@ for (const [name, history] of [
   for (const footer of ['', '\n\n↑/↓ Navigate · tab Amend\nTOOL ╱ test']) {
     test(`wrapped Nix menu is captured with ${name} and ${footer ? 'a footer' : 'no footer'}`, async () => {
       const expected = nixMenu + footer;
-      assert.equal(approvalMenu(expected)?.kind, 'approve_command');
+      assert.equal(hasPermissionMarker(expected), true);
       const { observed, reads } = await capture(history + expected);
       assert.ok(observed);
       assert.ok(observed.context.includes('Requesting permission for:'));
@@ -232,7 +232,7 @@ for (const footer of ['', '\n↑/↓ Navigate · tab Amend', '\n↑/↓ Navigate
       const { observed, reads } = await capture(screen);
       assert.ok(observed);
       assert.equal(observed.context, screen);
-      assert.deepEqual(approvalMenu(observed.context), { action: 'printf probe', kind: 'approve_command' });
+      assert.equal(hasPermissionMarker(observed.context), true);
       assert.ok(reads.every((lines) => lines <= 48));
     });
   }
@@ -244,7 +244,7 @@ for (const screen of [
   nixMenu.replace('NODE=', 'Requesting permission for:\nNODE='),
 ]) {
   test('main capture retains evidence with unrecognized menu grammar', async () => {
-    assert.equal(approvalMenu(screen), null);
+    assert.equal(hasPermissionMarker(screen), true);
     const { observed } = await capture(screen);
     assert.equal(observed?.context, screen);
   });
