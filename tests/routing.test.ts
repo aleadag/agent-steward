@@ -102,7 +102,7 @@ test('winning low-confidence pair is not returned when effort fails', async () =
   assert.equal(calls, 2);
 });
 
-test('Jev gets relative resets from one clock without changing shared or stale quota facts', async () => {
+test('Jev gets only relative reset timing without changing shared or stale quota facts', async () => {
   const lite = candidate({ id: 'lite', cost: 1 });
   const strong = candidate({ id: 'strong', cost: 20 });
   const grok = candidate({
@@ -157,11 +157,10 @@ test('Jev gets relative resets from one clock without changing shared or stale q
   });
   const before = JSON.stringify([...quota]);
   type EvaluatorQuota = Omit<QuotaFacts, 'windows'> & {
-    windows: (QuotaFacts['windows'][number] & { seconds_until_reset: number })[];
+    windows: (Omit<QuotaFacts['windows'][number], 'reset_at'> & { seconds_until_reset: number })[];
   };
   const wires: {
     state: {
-      current_time: string;
       candidates?: (Candidate & { quota: EvaluatorQuota })[];
       quota?: EvaluatorQuota;
     };
@@ -192,13 +191,13 @@ test('Jev gets relative resets from one clock without changing shared or stale q
   assert.equal(candidates[0]!.quota.quota_bucket, 'codex');
   assert.equal(candidates[2]!.quota.quota_bucket, 'pi_xai');
   for (const wire of wires) {
-    assert.equal(wire.state.current_time, '2026-09-28T10:30:00.000Z');
+    assert.equal(Object.hasOwn(wire.state, 'current_time'), false);
     const facts = wire.state.quota ?? wire.state.candidates![2]!.quota;
     assert.deepEqual(
       facts.windows.map((window) => window.seconds_until_reset),
       [14400, 3600, 0],
     );
-    assert.equal(facts.windows[0]!.reset_at, '2026-09-28T16:30:00+02:00');
+    for (const window of facts.windows) assert.equal(Object.hasOwn(window, 'reset_at'), false);
     assert.equal(facts.windows[0]!.remaining_percent, 63);
     assert.equal(facts.windows[1]!.status, 'unknown');
     assert.equal(facts.windows[1]!.reason, 'expired');
@@ -208,7 +207,258 @@ test('Jev gets relative resets from one clock without changing shared or stale q
   }
   assert.equal(JSON.stringify([...quota]), before);
   assert.deepEqual(result.quota, quota.get('grok'));
+  assert.equal(result.quota.windows[0]!.reset_at, '2026-09-28T16:30:00+02:00');
   assert.equal(Object.hasOwn(result.quota.windows[0]!, 'seconds_until_reset'), false);
+});
+
+test('routing excludes exhausted shared pools but preserves other pools', async () => {
+  const blocked = candidate({ id: 'blocked' });
+  const sibling = candidate({ id: 'sibling' });
+  const available = candidate({ id: 'available', quota_pool: 'other' });
+  const cfg = config({ candidates: [blocked, sibling, available] });
+  const quota = await loadQuota(cfg, {
+    env: { HOME: '/isolated/home' },
+    now: fixedNow,
+    diagnostic: () => {},
+    readText: async () =>
+      JSON.stringify(
+        snapshot([
+          windowFact({ type: 'account' }, { remaining_percent: 80 }),
+          windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 0 }),
+          windowFact({ type: 'pool', pool_id: 'other' }, { remaining_percent: 40 }),
+        ]),
+      ),
+  });
+  const { post, requests } = recordingPost();
+  const result = await route(
+    routeInput(
+      cfg,
+      makeEvaluator({
+        model: 'jev-1.13.0',
+        apiKey: 'unit-key-not-live',
+        post,
+      }),
+      quota,
+    ),
+  );
+  const wire = JSON.parse(requests[0]!.body);
+  assert.deepEqual(Object.keys(wire.questions.pair.criteria), ['available']);
+  assert.deepEqual(
+    wire.state.candidates.map((item: Candidate) => item.id),
+    ['available'],
+  );
+  assert.equal(result.selected.candidate_id, 'available');
+});
+
+test('exhausted account quota rejects every shared candidate without evaluation', async () => {
+  const cfg = config({ candidates: [candidate(), candidate({ id: 'other-pool', quota_pool: 'other' })] });
+  const quota = await loadQuota(cfg, {
+    env: { HOME: '/isolated/home' },
+    now: fixedNow,
+    diagnostic: () => {},
+    readText: async () =>
+      JSON.stringify(
+        snapshot([
+          windowFact({ type: 'account' }, { remaining_percent: 0 }),
+          windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 80 }),
+          windowFact({ type: 'pool', pool_id: 'other' }, { remaining_percent: 80 }),
+        ]),
+      ),
+  });
+  let calls = 0;
+  await assert.rejects(
+    route(
+      routeInput(
+        cfg,
+        async () => {
+          calls++;
+          return selectedPairAnswer({ 'codex-astra': 0.6, 'other-pool': 0.4 });
+        },
+        quota,
+      ),
+    ),
+    (error) => error instanceof StewardError && error.code === 'quota_exhausted',
+  );
+  assert.equal(calls, 0);
+});
+
+test('evaluator cannot select an excluded exhausted model', async () => {
+  const blocked = candidate({ id: 'blocked' });
+  const available = candidate({ id: 'available', quota_pool: 'other' });
+  const cfg = config({ candidates: [blocked, available] });
+  const quota = await loadQuota(cfg, {
+    env: { HOME: '/isolated/home' },
+    now: fixedNow,
+    diagnostic: () => {},
+    readText: async () =>
+      JSON.stringify(
+        snapshot([
+          windowFact({ type: 'pool', pool_id: 'primary' }, { remaining_percent: 0 }),
+          windowFact({ type: 'pool', pool_id: 'other' }, { remaining_percent: 80 }),
+        ]),
+      ),
+  });
+  await assert.rejects(
+    route(routeInput(cfg, async () => selectedPairAnswer({ blocked: 1, available: 0 }), quota)),
+    (error) => hasCode(error, 'invalid_response'),
+  );
+});
+
+test('unknown exhausted measurements do not exclude a candidate', async () => {
+  for (const overrides of [
+    { valid_until: '2026-09-28T10:15:00Z' },
+    { observed_at: '2026-09-28T10:45:00Z' },
+    { reset_at: '2026-09-28T10:15:00Z', valid_until: '2026-09-28T10:15:00Z' },
+  ]) {
+    const cfg = config();
+    const quota = await loadQuota(cfg, {
+      env: { HOME: '/isolated/home' },
+      now: fixedNow,
+      diagnostic: () => {},
+      readText: async () =>
+        JSON.stringify(
+          snapshot([windowFact({ type: 'account' }, { cadence: 'weekly', remaining_percent: 0, ...overrides })]),
+        ),
+    });
+    const { post } = recordingPost();
+    const result = await route(
+      routeInput(cfg, makeEvaluator({ model: 'jev-1.13.0', apiKey: 'unit-key-not-live', post }), quota),
+    );
+    assert.equal(result.selected.candidate_id, 'codex-astra');
+    assert.equal(result.quota.windows[0]!.status, 'unknown');
+  }
+});
+
+test('Jev receives local weekly pacing in both stages and may select an over-budget stronger model', async () => {
+  const lite = candidate({ id: 'lite', cost: 1, capabilities: 'Simple edits only' });
+  const strong = candidate({
+    id: 'strong',
+    cost: 20,
+    capabilities: 'Difficult architectural reasoning',
+    thinking_levels: [
+      { id: 'low', description: 'Low' },
+      { id: 'high', description: 'High' },
+    ],
+  });
+  const cfg = config({ candidates: [lite, strong] });
+  const quota = await loadQuota(cfg, {
+    env: { HOME: '/isolated/home' },
+    now: fixedNow,
+    diagnostic: () => {},
+    readText: async () =>
+      JSON.stringify(
+        snapshot([
+          windowFact(
+            { type: 'account' },
+            {
+              cadence: 'weekly',
+              remaining_percent: 50,
+              reset_at: '2026-10-03T10:30:00Z',
+            },
+          ),
+          windowFact({ type: 'account' }, { cadence: 'other', remaining_percent: 10 }),
+        ]),
+      ),
+  });
+  const before = JSON.stringify([...quota]);
+  type PacingQuota = Omit<QuotaFacts, 'windows'> & {
+    windows: (QuotaFacts['windows'][number] & {
+      weekly_pacing: { expected_remaining_percent: number; deficit_percent: number; over_budget: boolean } | null;
+    })[];
+  };
+  const wires: { state: { quota?: PacingQuota; candidates?: { quota: PacingQuota }[] }; questions: Questions }[] = [];
+  const now = new Date(fixedNow);
+  const evaluate = makeEvaluator({
+    model: 'jev-1.13.0',
+    apiKey: 'unit-key-not-live',
+    post: async (request) => {
+      const wire = JSON.parse(request.body);
+      wires.push(wire);
+      now.setUTCDate(now.getUTCDate() + 1);
+      return {
+        status: 200,
+        body: JSON.stringify(
+          wire.questions.pair
+            ? selectedPairAnswer({ lite: 0.1, strong: 0.9 })
+            : selectedEffortAnswer({ low: 0.1, high: 0.9 }),
+        ),
+      };
+    },
+  });
+  const result = await route({
+    ...routeInput(cfg, evaluate, quota),
+    task: 'Needs difficult architectural reasoning',
+    now,
+  });
+  assert.equal(wires.length, 2);
+  assert.deepEqual(wires[0]!.state.candidates![0]!.quota, wires[0]!.state.candidates![1]!.quota);
+  for (const wire of wires) {
+    const windows = (wire.state.quota ?? wire.state.candidates![1]!.quota).windows;
+    const pacing = windows[0]!.weekly_pacing;
+    assert.ok(pacing, 'weekly pacing must be calculated locally');
+    assert.ok(Math.abs(pacing.expected_remaining_percent - 71.42857142857143) < 1e-10);
+    assert.ok(Math.abs(pacing.deficit_percent - 21.42857142857143) < 1e-10);
+    assert.equal(pacing.over_budget, true);
+    assert.equal(windows[1]!.weekly_pacing, null);
+  }
+  assert.equal(result.selected.candidate_id, 'strong');
+  assert.equal(result.selected.thinking_level, 'high');
+  assert.equal(JSON.stringify([...quota]), before);
+  assert.deepEqual(result.quota, quota.get('strong'));
+  assert.equal(Object.hasOwn(result.quota.windows[0]!, 'weekly_pacing'), false);
+});
+
+test('weekly pacing distinguishes healthy, boundary, unsupported and stale windows', async () => {
+  for (const { overrides, expected } of [
+    {
+      overrides: { remaining_percent: 80 },
+      expected: { expected_remaining_percent: 71.42857142857143, deficit_percent: 0, over_budget: false },
+    },
+    {
+      overrides: { remaining_percent: 50, reset_at: '2026-10-01T22:30:00Z' },
+      expected: { expected_remaining_percent: 50, deficit_percent: 0, over_budget: false },
+    },
+    {
+      overrides: { remaining_percent: 90, reset_at: '2026-10-08T10:30:00Z' },
+      expected: { expected_remaining_percent: 100, deficit_percent: 10, over_budget: true },
+    },
+    {
+      overrides: {
+        remaining_percent: 1,
+        reset_at: '2026-09-28T10:30:00.500Z',
+        valid_until: '2026-09-28T10:30:00.500Z',
+      },
+      expected: { expected_remaining_percent: 0.00008267195767195767, deficit_percent: 0, over_budget: false },
+    },
+    { overrides: { cadence: 'other' }, expected: null },
+    { overrides: { cadence: undefined }, expected: null },
+    { overrides: { valid_until: '2026-09-28T10:15:00Z' }, expected: null },
+    { overrides: { observed_at: '2026-09-28T10:45:00Z' }, expected: null },
+    { overrides: { reset_at: '2026-09-28T10:15:00Z', valid_until: '2026-09-28T10:15:00Z' }, expected: null },
+  ]) {
+    const cfg = config();
+    const quota = await loadQuota(cfg, {
+      env: { HOME: '/isolated/home' },
+      now: fixedNow,
+      diagnostic: () => {},
+      readText: async () =>
+        JSON.stringify(
+          snapshot([
+            windowFact({ type: 'account' }, { cadence: 'weekly', reset_at: '2026-10-03T10:30:00Z', ...overrides }),
+          ]),
+        ),
+    });
+    const { post, requests } = recordingPost();
+    await route(routeInput(cfg, makeEvaluator({ model: 'jev-1.13.0', apiKey: 'unit-key-not-live', post }), quota));
+    const pacing = JSON.parse(requests[0]!.body).state.candidates[0].quota.windows[0].weekly_pacing;
+    if (expected === null) assert.equal(pacing, null);
+    else {
+      assert.ok(pacing);
+      assert.ok(Math.abs(pacing.expected_remaining_percent - expected.expected_remaining_percent) < 1e-10);
+      assert.ok(Math.abs(pacing.deficit_percent - expected.deficit_percent) < 1e-10);
+      assert.equal(pacing.over_budget, expected.over_budget);
+    }
+  }
 });
 
 test('invalid routing clock fails before evaluation', async () => {
@@ -256,7 +506,7 @@ test('pair evaluation includes relative cost in instructions and candidate state
   assert.equal(candidates[1]?.cost, 2);
 });
 
-test('pair instructions spend sooner-resetting quota versus long-lived buckets', async () => {
+test('pair instructions balance capability, cost and supplied weekly pacing', async () => {
   let pairText = '';
   await route(
     routeInput(config(), async (_state, questions) => {
@@ -267,7 +517,13 @@ test('pair instructions spend sooner-resetting quota versus long-lived buckets',
       return selectedEffortAnswer({ low: 1 });
     }),
   );
-  assert.match(pairText, /even when remaining percent is low/);
+  assert.match(pairText, /weekly_pacing/);
+  assert.match(pairText, /over_budget/);
+  assert.match(pairText, /deficit_percent/);
+  assert.match(pairText, /soft preference, not an exclusion/);
+  assert.match(pairText, /only suitable candidate/);
+  assert.match(pairText, /Do not calculate/);
+  assert.match(pairText, /all applicable windows/);
   assert.match(pairText, /much shorter horizon than other suitable options/);
   assert.match(
     pairText,
@@ -275,8 +531,7 @@ test('pair instructions spend sooner-resetting quota versus long-lived buckets',
   );
   assert.match(pairText, /When reset horizons are comparable, favor lower relative cost/);
   assert.match(pairText, /Remaining percent of zero is unavailable/);
-  assert.doesNotMatch(pairText, /favor ample known remaining quota that resets sooner/);
-  assert.doesNotMatch(pairText, /When quota is scarce, favor lower relative cost/);
+  assert.doesNotMatch(pairText, /do not conserve that capacity/);
 });
 
 test('low-confidence winning pair and effort produce a complete selected result', async () => {
@@ -324,7 +579,6 @@ test('low-confidence winning pair and effort produce a complete selected result'
   assert.deepEqual(Object.keys(effortQuestion.criteria), ['medium', 'high']);
   assert.deepEqual(effortState.state, {
     task,
-    current_time: fixedNow.toISOString(),
     candidate: pi,
     quota: quotaFacts(pi),
   });
@@ -401,8 +655,8 @@ test('agy routing preserves model and effort in evaluation and native launch arg
     }),
   );
   assert.deepEqual(states, [
-    { task, current_time: fixedNow.toISOString(), candidates: [{ ...gemini, quota: quotaFacts(gemini) }] },
-    { task, current_time: fixedNow.toISOString(), candidate: gemini, quota: quotaFacts(gemini) },
+    { task, candidates: [{ ...gemini, quota: quotaFacts(gemini) }] },
+    { task, candidate: gemini, quota: quotaFacts(gemini) },
   ]);
   assert.equal(result.selected.model, 'gemini-3.8-flash');
   assert.equal(result.selected.thinking_level, 'medium');

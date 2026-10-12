@@ -26,6 +26,7 @@ const EventSchema = z
         'invalid_input',
         'invalid_config',
         'missing_credentials',
+        'quota_exhausted',
         'credential_detected',
         'invalid_response',
         'evaluation_failed',

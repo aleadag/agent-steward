@@ -833,6 +833,42 @@ test('router list and show parse local-only options', () => {
     assert.throws(() => parseArgs(args));
 });
 
+test('exhausted routes return a safe error and history without evaluation or launch', async () => {
+  for (const dryRun of [true, false]) {
+    const { post, requests } = fakePost(routeAnswer);
+    const { io, out, launches, files } = runtime({
+      readText: async (path) =>
+        path === CONFIG_PATH
+          ? JSON.stringify(routeConfig())
+          : JSON.stringify(snapshot([windowFact({ type: 'account' }, { remaining_percent: 0 })])),
+      post,
+    });
+    const args = ['router', 'start', 'Review the parser'];
+    if (dryRun) args.push('--dry-run', '--json');
+    assert.equal(await run(args, io), 1);
+    if (dryRun)
+      assert.deepEqual(result(out), {
+        schema_version: 1,
+        request_id: 'generated-1',
+        decision: 'error',
+        reason_code: 'quota_exhausted',
+        message: 'All enabled candidates have exhausted quota.',
+        diagnostics: { stage: 'evaluation' },
+      });
+    assert.deepEqual(requests, []);
+    assert.deepEqual(launches, []);
+    const events = (files.get('/isolated/home/.local/state/agent-steward/router.jsonl') ?? '')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(events.length, 1);
+    assert.equal(events[0].reason_code, 'quota_exhausted');
+    out.length = 0;
+    assert.equal(await run(['router', 'show', 'generated-1', '--json'], io), 0);
+    assert.equal(result(out).reason_code, 'quota_exhausted');
+  }
+});
+
 test('route history records dry-run, native exit, launch failure and evaluation failure safely', async () => {
   for (const mode of ['dry-run', 'live', 'launch-failed', 'evaluation_failed']) {
     const { post } = fakePost(routeAnswer);
@@ -929,7 +965,6 @@ test('router CLI uses the quota classification clock for both Jev reset countdow
   ]);
   let clockCalls = 0;
   const states: {
-    current_time: string;
     candidates?: { quota: { windows: Record<string, unknown>[] } }[];
     quota?: { windows: Record<string, unknown>[] };
   }[] = [];
@@ -947,12 +982,14 @@ test('router CLI uses the quota classification clock for both Jev reset countdow
   assert.equal(await run(['router', 'start', 'task', '--dry-run', '--json'], io), 0);
   assert.equal(states.length, 2);
   for (const state of states) {
-    assert.equal(state.current_time, '2026-09-28T10:30:00.000Z');
+    assert.equal(Object.hasOwn(state, 'current_time'), false);
     const window = (state.quota ?? state.candidates![0]!.quota).windows[0]!;
     assert.equal(window.seconds_until_reset, 5400);
+    assert.equal(Object.hasOwn(window, 'reset_at'), false);
     assert.equal(window.status, 'known');
     assert.equal(window.remaining_percent, 40);
   }
+  assert.equal(result(out).quota.windows[0].reset_at, '2026-09-28T12:00:00Z');
   assert.equal(Object.hasOwn(result(out).quota.windows[0], 'seconds_until_reset'), false);
 });
 
