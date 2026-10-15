@@ -297,6 +297,14 @@ Offline repair is required for corrupt or ownerless remnants, shared selector te
 
 Stable error codes are `invalid_input`, `invalid_config`, `missing_credentials`, `credential_detected`, `invalid_response`, `evaluation_failed`, `interactive_terminal_required`, and `launch_failed`. Messages are fixed and do not contain paths, submitted data, credentials, or raw evaluator or process errors. Diagnostics use stderr; JSON stdout contains one result and a newline.
 
+#### One-time alpha quarantine maintenance
+
+Automatic retirement of historical association-quarantine markers is not shipped. A single-user alpha may instead use separately authorized offline maintenance for a confirmed orphan marker; this is not a normal upgrade step or reset facility.
+
+Disable the plugin and prevent restart, then independently verify that every adapter invocation sharing the state root has exited. Disabling alone, lease expiry or a missing selected record does not establish quiescence or orphanhood. Back up the complete state root and review canonical and legacy history, heads, references, bindings and lease evidence. If ownership, cancellation or delivery is uncertain, stop for human review.
+
+Archive only the confirmed orphan association-quarantine marker outside the active state root, preserving its bytes. Keep all retry/quota counters, approval attempts, cancellation and delivery uncertainty, other markers and locks; never wipe the state directory or apply this exception to approval quarantine. Reenabling remains a separate explicit opt-in. Any later recovery still needs a fresh eligible observation and ordinary authorization; archiving a veto does not authorize input.
+
 ## Command preview references
 
 Syntax baselines for this implementation are Codex 0.157.1, Pi 0.87.1, and `agy` 1.2.11. The Codex effort parser is available in the [0.157.1 version-pinned source](https://raw.githubusercontent.com/openai/codex/rust-v0.157.1/codex-rs/protocol/src/openai_models.rs); the Pi CLI reference is in the [0.87.1 source tag](https://github.com/badlogic/pi-mono/tree/v0.87.1). The agy baseline was checked against 1.2.11 CLI help/error contracts; separate model and effort flags were checked in a no-prompt 1.2.12 startup displaying Gemini 3.8 Flash (Medium) for `--model=gemini-3.8-flash --effort=medium`. These syntax references do not prove model availability or effective runtime effort. Pi documents that thinking levels can be clamped, and agy has model-specific effort restrictions; Codex accepts custom nonempty effort names.
