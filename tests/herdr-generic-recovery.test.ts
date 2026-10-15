@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'bun:test';
+import { setDefaultTimeout, test } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,9 @@ import type { Episode } from '../src/herdr-adapter/state.ts';
 import type { WorkflowScope } from '../src/herdr-adapter/workflow-state.ts';
 import type { Evaluation } from '../src/jev.ts';
 import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
+
+// Integration setup and cleanup share the budget with guarded filesystem work.
+setDefaultTimeout(30_000);
 
 // Run the same recovery regressions against source and the actual Nix bundle.
 const implementation = (name: string) =>

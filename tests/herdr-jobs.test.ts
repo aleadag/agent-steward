@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'bun:test';
+import { setDefaultTimeout, test } from 'bun:test';
 import { mkdir, mkdtemp, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +13,9 @@ import { workflowSession, WorkflowState, type WorkflowScope } from '../src/herdr
 import type { Evaluation, StopInput } from '../src/contracts.ts';
 import { assessStop } from '../src/triage.ts';
 import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
+
+// Integration setup and cleanup share the budget with guarded filesystem work.
+setDefaultTimeout(30_000);
 
 const initial = '2026-09-29T10:00:00.000Z';
 const scope: WorkflowScope = {
@@ -849,7 +852,7 @@ test('saturation marks the episode human without clearing counters or waiting', 
       });
       const slot = reserveJobSlot(f.state, auth);
       slots.push(slot);
-      assert.ok(await within(slot.ready, 3000));
+      assert.ok(await within(slot.ready));
     }
     const saved = await assess(f);
     assert.equal(saved.quota_check_count, 0);

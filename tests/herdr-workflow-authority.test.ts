@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'bun:test';
+import { setDefaultTimeout, test } from 'bun:test';
 import { mkdtemp, rm, readdir, rename, lstat, mkdir, writeFile, readFile, symlink } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -9,6 +9,9 @@ import { beginWorkflow, reserveJobSlot, type WorkflowAttempt } from '../src/herd
 import { WorkflowState, type WorkflowScope, type RuntimePermission } from '../src/herdr-adapter/workflow-state.ts';
 import { EpisodeStore, type Episode } from '../src/herdr-adapter/state.ts';
 import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
+
+// Integration setup and cleanup share the budget with guarded filesystem work.
+setDefaultTimeout(30_000);
 
 const scope: WorkflowScope = {
   serverId: '47:1',

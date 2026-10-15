@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'bun:test';
+import { setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
@@ -18,7 +18,10 @@ import { assessStop } from '../src/triage.ts';
 import type { StopInput } from '../src/contracts.ts';
 import type { Evaluation } from '../src/jev.ts';
 import { withPrivateGuard } from '../src/herdr-adapter/private-files.ts';
-import { deferred, within } from './herdr-lease-helpers.ts';
+import { deferred, within, withinWorkflow } from './herdr-lease-helpers.ts';
+
+// Integration setup and cleanup share the budget with guarded filesystem work.
+setDefaultTimeout(30_000);
 
 const dialog =
   'Requesting permission for:\n printf local-test\n\nRun this command?\n1. Yes, run command\n2. No, cancel';
@@ -1004,7 +1007,7 @@ async function pauseProcess(root: string) {
     `import { WorkflowState } from ${JSON.stringify(module)}; console.log(await new WorkflowState(${JSON.stringify(root)}).pause('47:1'));`,
   ]);
   try {
-    const result = await within(running.result, 2000);
+    const result = await withinWorkflow(running.result);
     assert.equal(result.code, 0, result.stderr);
     return result.stdout.trim();
   } finally {
@@ -1114,11 +1117,11 @@ for (const kind of ['approval', 'ordinary-recovery', 'job-recovery'] as const)
               signal: attempt.signal,
             })
           : handleEvent(event, workflowEventDeps(base, authority, state));
-      await within(entered.promise, 2000);
+      await withinWorkflow(entered.promise);
       assert.equal(inputs, 0);
       assert.equal(await pauseProcess(root), 'shutdown_incomplete');
       resume.resolve();
-      await within(invoked.promise, 2000);
+      await withinWorkflow(invoked.promise);
       // Guards end at actual transport invocation, while its acknowledgment is held.
       const controlGuard = join(
         root,
@@ -1126,7 +1129,7 @@ for (const kind of ['approval', 'ordinary-recovery', 'job-recovery'] as const)
         createHash('sha256').update('["47:1"]').digest('hex'),
         'control-guard',
       );
-      await within(
+      await withinWorkflow(
         (async () => {
           for (;;) {
             try {
@@ -1138,12 +1141,11 @@ for (const kind of ['approval', 'ordinary-recovery', 'job-recovery'] as const)
             await new Promise((resolve) => setTimeout(resolve, 1));
           }
         })(),
-        2000,
       );
       assert.equal(await pauseProcess(root), 'paused');
       assert.equal(inputs, 1);
       ack.resolve();
-      await within(work, 2000);
+      await withinWorkflow(work);
       if (kind === 'approval') assert.equal((await episodes.approval('agy', 's1'))?.state, 'uncertain');
       else assert.equal((await episodes.sessionRetry('agy', 's1'))?.last_delivery_state, 'uncertain');
     } finally {

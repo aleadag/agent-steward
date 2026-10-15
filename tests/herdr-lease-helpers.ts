@@ -28,9 +28,10 @@ export async function within<T>(promise: Promise<T>, ms = 1_000): Promise<T> {
   }
 }
 
-// Workflow integration traverses multiple guarded filesystem records; CI storage
-// can take longer than the one-second watchdog used by focused lease tests.
-export function withinWorkflow<T>(promise: Promise<T>, ms = 5_000): Promise<T> {
+// Workflow integration traverses multiple guarded filesystem records under CI
+// build contention. Keep this budget below the integration tests' 30-second limit;
+// focused lease tests retain the one-second watchdog above.
+export function withinWorkflow<T>(promise: Promise<T>, ms = 15_000): Promise<T> {
   return within(promise, ms);
 }
 

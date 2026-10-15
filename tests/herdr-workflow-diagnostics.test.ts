@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { afterEach, test } from 'bun:test';
+import { afterEach, setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -15,6 +15,9 @@ import { workflowSession, WorkflowState, type WorkflowScope } from '../src/herdr
 import type { Evaluation } from '../src/contracts.ts';
 import { assessStop } from '../src/triage.ts';
 import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
+
+// Integration setup and cleanup share the budget with guarded filesystem work.
+setDefaultTimeout(30_000);
 
 const MAX_LOG = 1_048_576;
 const roots: string[] = [];
