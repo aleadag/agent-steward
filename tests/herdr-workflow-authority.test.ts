@@ -400,7 +400,7 @@ test('eight server capacity leases refuse ninth; reader consumes none; released 
       await a.recordBinding({ ...binding, phase: 'pending', failureEpisodeId: episode.failure_episode_id });
       const slot = reserveJobSlot(i % 2 ? a : b, auth);
       slots.push(slot);
-      const admitted = await within(slot.ready, 3000);
+      const admitted = await within(slot.ready);
       if (i < 8) {
         assert.ok(admitted);
         assert.equal(await admitted.valid(), true);

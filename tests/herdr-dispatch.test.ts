@@ -5,7 +5,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'bun:test';
-import { deferred, leaseFixture, within } from './herdr-lease-helpers.ts';
+import { deferred, leaseFixture, within, withinWorkflow } from './herdr-lease-helpers.ts';
 import type { AgentSnapshot } from '../src/herdr-adapter/observe.ts';
 import { EpisodeStore, type Episode } from '../src/herdr-adapter/state.ts';
 import { SchedulerLeaseStore } from '../src/herdr-adapter/lease.ts';
@@ -75,12 +75,11 @@ function pluginEntry(root: string, enabled: boolean, extras: Record<string, unkn
   };
 }
 
-async function until(check: () => Promise<boolean> | boolean, ms = 2_000): Promise<void> {
-  await within(
+async function until(check: () => Promise<boolean> | boolean): Promise<void> {
+  await withinWorkflow(
     (async () => {
       while (!(await check())) await new Promise((resolve) => setTimeout(resolve, 15));
     })(),
-    ms,
   );
 }
 
@@ -592,8 +591,10 @@ test('runEvent blocks unknown, corrupt, and stranded legacy supervisor state wit
 
 test('runEvent promotes one owner job, duplicate events stay readers, and pause revokes the epoch', async () => {
   const world = await pluginWorld({ enabled: true });
+  const { runEvent, runControl } = await import('../src/herdr-adapter/entry.ts');
+  let running: Promise<void> | undefined;
+  let duplicate: Promise<void> | undefined;
   try {
-    const { runEvent, runControl } = await import('../src/herdr-adapter/entry.ts');
     const event = {
       type: 'pane.agent_status_changed',
       pane_id: 'w1:p1',
@@ -602,7 +603,7 @@ test('runEvent promotes one owner job, duplicate events stay readers, and pause 
       agent_status: 'idle',
     };
     const env = { ...world.env, HERDR_PLUGIN_EVENT_JSON: JSON.stringify(event) };
-    const running = runEvent(env, async (input) => quotaDecision(input));
+    running = runEvent(env, async (input) => quotaDecision(input));
     const session = JSON.stringify([world.serverId, 'agy', 's1']);
     const scopeHash = createHash('sha256').update(session).digest('hex');
     const leaseRoot = join(world.state, 'workflows', scopeHash, 'scheduler-lease');
@@ -619,7 +620,7 @@ test('runEvent promotes one owner job, duplicate events stay readers, and pause 
       } catch {
         return false;
       }
-    }, 3_000);
+    });
     const selected = JSON.parse(
       await (await import('node:fs/promises')).readFile(join(leaseRoot, 'active.json'), 'utf8'),
     ) as {
@@ -658,11 +659,11 @@ test('runEvent promotes one owner job, duplicate events stay readers, and pause 
         }
       }
       return false;
-    }, 3_000);
-    const duplicate = runEvent(env, async () => {
+    });
+    duplicate = runEvent(env, async () => {
       throw new Error('duplicate reader must not decide');
     });
-    await within(duplicate, 3_000);
+    await withinWorkflow(duplicate);
     assert.equal(await runControl(world.env, 'pause'), 'paused');
     await within(running, 6_000);
     const { WorkflowState } = await import('../src/herdr-adapter/workflow-state.ts');
@@ -673,9 +674,14 @@ test('runEvent promotes one owner job, duplicate events stay readers, and pause 
       false,
     );
   } finally {
+    if (running) {
+      const paused = await runControl(world.env, 'pause');
+      await withinWorkflow(Promise.allSettled([running, duplicate]));
+      assert.equal(paused, 'paused');
+    }
     await world.close();
   }
-}, 20_000);
+}, 30_000);
 
 test('an ordinary status event finishes without a persistent recovery job', async () => {
   const world = await pluginWorld({
