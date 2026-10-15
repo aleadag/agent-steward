@@ -566,8 +566,8 @@ export class WorkflowState {
       admissionOpen(): boolean;
     },
     completed = false,
-  ): Promise<'absent' | 'adopted' | 'quarantined'> {
-    type Result = 'absent' | 'adopted' | 'quarantined';
+  ): Promise<'absent' | 'adopted' | 'busy' | 'quarantined'> {
+    type Result = 'absent' | 'adopted' | 'busy' | 'quarantined';
     return new Promise((resolve) => {
       let expired = false,
         settled = false;
@@ -694,26 +694,32 @@ export class WorkflowState {
                   const ownLock =
                     hash('retry-session:' + JSON.stringify([scope.agent, scope.sessionId])) + '.json.lock';
                   const stat = this.options.io?.lstat ?? lstat;
-                  for (const name of names) {
-                    if (name === ownLock || !/^[0-9a-f]{64}\.json\./.test(name)) continue;
-                    if (/^[0-9a-f]{64}\.json\.lock(?:\.takeover)?$/.test(name)) {
-                      try {
-                        if (!(await stat(join(this.directory, name))).isDirectory()) return quarantine();
-                      } catch {
-                        return quarantine();
-                      }
-                      const lockName = name.endsWith('.takeover') ? name.slice(0, -'.takeover'.length) : name;
-                      const record = await readEpisodeLockOwner(join(this.directory, lockName));
-                      if (!record || hash(record.session) + '.json.lock' !== lockName) return quarantine();
-                      if (
-                        record.session === observed.pane_id ||
-                        record.session.startsWith('retry-session:') ||
-                        record.session.startsWith('approval:')
-                      )
-                        continue;
+                  const artifacts = names.filter((name) => name !== ownLock && /^[0-9a-f]{64}\.json\./.test(name));
+                  const writerLock = /^[0-9a-f]{64}\.json\.lock(?:\.takeover)?$/;
+                  let contended = false;
+                  for (const name of artifacts.filter((name) => writerLock.test(name))) {
+                    try {
+                      if (!(await stat(join(this.directory, name))).isDirectory()) return quarantine();
+                    } catch {
+                      return quarantine();
                     }
-                    return quarantine();
+                    const lockName = name.endsWith('.takeover') ? name.slice(0, -'.takeover'.length) : name;
+                    const record = await readEpisodeLockOwner(join(this.directory, lockName));
+                    if (!record || hash(record.session) + '.json.lock' !== lockName) return quarantine();
+                    if (
+                      record.session === observed.pane_id ||
+                      record.session.startsWith('retry-session:') ||
+                      record.session.startsWith('approval:')
+                    )
+                      continue;
+                    if (!pane.safeParse(record.session).success) return quarantine();
+                    contended = true;
                   }
+                  // A recognized writer may still publish relevant history or own
+                  // temporary files. Refuse without adopting anything; a later fresh
+                  // invocation must rescan every artifact after contention ends.
+                  if (contended) return 'busy';
+                  if (artifacts.some((name) => !writerLock.test(name))) return quarantine();
                   const matches: Episode[] = [];
                   for (const name of names.filter((name) => /^[0-9a-f]{64}\.json$/.test(name))) {
                     if (expired) return quarantine();

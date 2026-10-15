@@ -4,15 +4,37 @@ import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beginWorkflow, reserveJobSlot } from '../src/herdr-adapter/authority.ts';
-import { handleEvent, workflowEventDeps } from '../src/herdr-adapter/events.ts';
-import { observeStop, type AgentSnapshot } from '../src/herdr-adapter/observe.ts';
-import { EpisodeStore, type Episode } from '../src/herdr-adapter/state.ts';
-import { WorkflowState, type WorkflowScope } from '../src/herdr-adapter/workflow-state.ts';
-import { assessStop } from '../src/triage.ts';
+import { pathToFileURL } from 'node:url';
+import type { AgentSnapshot } from '../src/herdr-adapter/observe.ts';
+import type { Episode } from '../src/herdr-adapter/state.ts';
+import type { WorkflowScope } from '../src/herdr-adapter/workflow-state.ts';
 import type { Evaluation } from '../src/jev.ts';
-import { runEpisodeJob } from '../src/herdr-adapter/jobs.ts';
 import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
+
+// Run the same recovery regressions against source and the actual Nix bundle.
+const implementation = (name: string) =>
+  process.env.AGENT_STEWARD_PACKAGE
+    ? pathToFileURL(join(process.env.AGENT_STEWARD_PACKAGE, 'lib/agent-steward/dist/src', `${name}.js`)).href
+    : new URL(`../src/${name}.ts`, import.meta.url).href;
+const { beginWorkflow, reserveJobSlot } = (await import(
+  implementation('herdr-adapter/authority')
+)) as typeof import('../src/herdr-adapter/authority.ts');
+const { handleEvent, workflowEventDeps } = (await import(
+  implementation('herdr-adapter/events')
+)) as typeof import('../src/herdr-adapter/events.ts');
+const { observeStop } = (await import(
+  implementation('herdr-adapter/observe')
+)) as typeof import('../src/herdr-adapter/observe.ts');
+const { EpisodeStore } = (await import(
+  implementation('herdr-adapter/state')
+)) as typeof import('../src/herdr-adapter/state.ts');
+const { WorkflowState } = (await import(
+  implementation('herdr-adapter/workflow-state')
+)) as typeof import('../src/herdr-adapter/workflow-state.ts');
+const { runEpisodeJob } = (await import(
+  implementation('herdr-adapter/jobs')
+)) as typeof import('../src/herdr-adapter/jobs.ts');
+const { assessStop } = (await import(implementation('triage'))) as typeof import('../src/triage.ts');
 
 async function fixture(agent: 'pi' | 'codex' | 'agy' = 'pi') {
   const root = await mkdtemp(join(tmpdir(), 'steward-generic-recovery-'));
@@ -38,6 +60,7 @@ async function fixture(agent: 'pi' | 'codex' | 'agy' = 'pi') {
   let choice = 'recoverable_api_error';
   let now = new Date('2026-10-07T00:00:00Z');
   let decisions = 0;
+  let enabled = true;
   const prompts: string[] = [];
   const handoffs: string[] = [];
   let beat = () => {};
@@ -48,7 +71,7 @@ async function fixture(agent: 'pi' | 'codex' | 'agy' = 'pi') {
     scope,
     paneId: pane.pane_id,
     workspaceId: pane.workspace_id,
-    permission: async () => ({ serverId: scope.serverId, enabled: true, targets: 'all', autoApprove: false }),
+    permission: async () => ({ serverId: scope.serverId, enabled, targets: 'all', autoApprove: false }),
     signal: new AbortController().signal,
     scheduleHeartbeat: (tick) => {
       beat = tick;
@@ -159,6 +182,9 @@ async function fixture(agent: 'pi' | 'codex' | 'agy' = 'pi') {
       choice = 'recoverable_api_error';
     },
     decisions: () => decisions,
+    disable: () => {
+      enabled = false;
+    },
     advance: (ms: number) => {
       now = new Date(now.getTime() + ms);
     },
@@ -175,6 +201,76 @@ async function fixture(agent: 'pi' | 'codex' | 'agy' = 'pi') {
     },
   };
 }
+
+// Latching contention, or treating busy as admission, breaks this real event path.
+for (const agent of ['pi', 'codex', 'agy'] as const)
+  test(`${agent}: recognized writer contention blocks input until a fresh event after release`, async () => {
+    const f = await fixture(agent);
+    const entered = deferred<void>(),
+      resume = deferred<void>();
+    const holding = f.episodes.withEpisodeLock('w2:p2', async () => {
+      entered.resolve();
+      await resume.promise;
+    });
+    try {
+      await within(entered.promise);
+      await f.stop();
+      assert.equal(await f.state.sessionRetry(f.scope), null, 'busy must not initialize a recovery budget');
+      f.advance(30_000);
+      await f.stop(true);
+      assert.equal(f.prompts.length, 0, 'busy must never authorize native input');
+      assert.equal(await f.state.sessionRetry(f.scope), null);
+      assert.deepEqual(f.handoffs, [], 'ordinary contention is not permanent human quarantine');
+      assert.equal(await f.state.recoveryQuarantined(f.scope), false);
+      resume.resolve();
+      await holding;
+      assert.equal(await f.state.sessionRetry(f.scope), null, 'release alone must not start recovery');
+      await f.stop();
+      const selected = await f.state.sessionRetry(f.scope);
+      assert.equal(selected?.attempt_count, 0);
+      assert.equal(selected?.next_check_at, '2026-10-07T00:01:00.000Z');
+      assert.equal(f.prompts.length, 0, 'a fresh observation must still respect the normal first delay');
+      f.advance(30_000);
+      await f.stop(true);
+      assert.equal(f.prompts.length, 1);
+      assert.equal((await f.state.sessionRetry(f.scope))?.attempt_count, 1);
+    } finally {
+      resume.resolve();
+      await holding;
+      await f.finish();
+    }
+  });
+
+for (const revoked of ['permission', 'pause'] as const)
+  test(`recognized contention release cannot bypass a later ${revoked}`, async () => {
+    const f = await fixture();
+    const entered = deferred<void>(),
+      resume = deferred<void>();
+    const holding = f.episodes.withEpisodeLock('w2:p2', async () => {
+      entered.resolve();
+      await resume.promise;
+    });
+    try {
+      await within(entered.promise);
+      await f.stop();
+      assert.equal(await f.state.sessionRetry(f.scope), null);
+      assert.deepEqual(f.handoffs, []);
+      if (revoked === 'permission') f.disable();
+      else assert.equal(await f.state.pause(f.scope.serverId), 'paused');
+      resume.resolve();
+      await holding;
+      f.advance(30_000);
+      f.change();
+      await f.stop();
+      await f.stop(true);
+      assert.equal(await f.state.sessionRetry(f.scope), null);
+      assert.equal(f.prompts.length, 0);
+    } finally {
+      resume.resolve();
+      await holding;
+      await f.finish();
+    }
+  });
 
 // Removing fresh classification or preserving session-wide terminal suppression breaks this test.
 for (const agent of ['pi', 'codex', 'agy'] as const)

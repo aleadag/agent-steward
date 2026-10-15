@@ -767,7 +767,7 @@ test('takeover of a positively identified new-session lock is not permanent ambi
   }
 });
 
-test('unidentified other-pane writer lock before its episode is visible is not absence', async () => {
+test('recognized other-pane writer contention blocks without permanently quarantining an empty session', async () => {
   const root = await mkdtemp(join(tmpdir(), 'workflow-other-pane-lock-'));
   const state = new WorkflowState(root),
     episodes = new EpisodeStore(root);
@@ -779,19 +779,121 @@ test('unidentified other-pane writer lock before its episode is visible is not a
   });
   try {
     await within(entered.promise);
-    assert.equal(await state.adoptLegacyRetry(episodes, scope, observation), 'quarantined');
+    assert.equal(await state.adoptLegacyRetry(episodes, scope, observation), 'busy');
     assert.equal(await episodes.sessionRetry('agy', 's1'), null);
-    assert.equal(await state.recoveryQuarantined(scope), true);
+    assert.equal(await state.recoveryQuarantined(scope), false);
     resume.resolve();
     await holding;
-    assert.equal(await new WorkflowState(root).adoptLegacyRetry(episodes, scope, observation), 'quarantined');
-    assert.equal(await new WorkflowState(root).recoveryQuarantined(scope), true);
+    assert.equal(await new WorkflowState(root).adoptLegacyRetry(episodes, scope, observation), 'absent');
+    assert.equal(await new WorkflowState(root).recoveryQuarantined(scope), false);
   } finally {
     resume.resolve();
     await holding;
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// Scanning a writer's temporary file before its lock must not latch a veto;
+// skipping the full rescan after release would instead lose late history.
+for (const published of ['empty', 'unrelated', 'related', 'uncertain', 'corrupt', 'orphan-temp'] as const) {
+  test(`recognized writer contention rescans late ${published} history without refunding budgets`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-contended-publication-'));
+    const episodes = new EpisodeStore(root);
+    const name = createHash('sha256').update('w2:p2').digest('hex') + '.json';
+    const temp = name + '.00000000-0000-4000-8000-000000000001.tmp';
+    const state = new WorkflowState(root, undefined, {
+      io: {
+        readdir: async (path) => {
+          const names = await readdir(path);
+          return [temp, ...names.filter((entry) => entry !== temp)];
+        },
+      },
+    });
+    const entered = deferred<void>(),
+      resume = deferred<void>();
+    const late = {
+      ...episode,
+      pane_id: 'w2:p2',
+      session_id: published === 'unrelated' ? 's2' : 's1',
+      attempt_count: 2,
+      last_delivery_state: published === 'uncertain' ? ('uncertain' as const) : ('none' as const),
+    };
+    const holding = episodes.withEpisodeLock('w2:p2', async () => {
+      await writeFile(join(root, temp), '{', { mode: 0o600 });
+      entered.resolve();
+      await resume.promise;
+      if (published !== 'orphan-temp') await rm(join(root, temp));
+      if (published === 'corrupt') await writeFile(join(root, name), '{', { mode: 0o600 });
+      else if (!['empty', 'orphan-temp'].includes(published)) await episodes.record('w2:p2', late);
+    });
+    try {
+      await within(entered.promise);
+      assert.equal(await state.adoptLegacyRetry(episodes, scope, observation), 'busy');
+      assert.equal(await episodes.sessionRetry('agy', 's1'), null);
+      assert.equal(await state.recoveryQuarantined(scope), false);
+      assert.equal(await readFile(join(root, temp), 'utf8'), '{');
+      resume.resolve();
+      await holding;
+      const before =
+        published === 'empty' ? null : await readFile(join(root, published === 'orphan-temp' ? temp : name));
+      const safe = published === 'empty' || published === 'unrelated';
+      assert.equal(
+        await new WorkflowState(root).adoptLegacyRetry(episodes, scope, observation),
+        safe ? 'absent' : 'quarantined',
+      );
+      assert.equal(await episodes.sessionRetry('agy', 's1'), null, 'late history must never become a fresh budget');
+      assert.equal(await new WorkflowState(root).recoveryQuarantined(scope), !safe);
+      if (before) assert.deepEqual(await readFile(join(root, published === 'orphan-temp' ? temp : name)), before);
+      if (['related', 'uncertain', 'unrelated'].includes(published))
+        assert.deepEqual(await episodes.retry('w2:p2'), late);
+    } finally {
+      resume.resolve();
+      await holding;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const unsafe of ['existing-marker', 'malformed-writer'] as const) {
+  test(`recognized writer contention cannot bypass ${unsafe}`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-contended-unsafe-'));
+    const state = new WorkflowState(root),
+      episodes = new EpisodeStore(root);
+    const marker = join(
+      root,
+      `retry-session-${createHash('sha256').update('["agy","s1"]').digest('hex')}.quarantine.json`,
+    );
+    const entered = deferred<void>(),
+      resume = deferred<void>();
+    const holding = episodes.withEpisodeLock('w2:p2', async () => {
+      entered.resolve();
+      await resume.promise;
+    });
+    try {
+      await within(entered.promise);
+      if (unsafe === 'existing-marker')
+        await writeFile(marker, '{"protocol":1,"agent":"agy","sessionId":"s1","quarantined":true}', { mode: 0o600 });
+      else {
+        const lock = join(root, createHash('sha256').update('w3:p3').digest('hex') + '.json.lock');
+        await mkdir(lock, { mode: 0o700 });
+        await writeFile(join(lock, 'owner.json'), '{', { mode: 0o600 });
+      }
+      const original = unsafe === 'existing-marker' ? await readFile(marker) : null;
+      assert.equal(await state.adoptLegacyRetry(episodes, scope, observation), 'quarantined');
+      const retained = await readFile(marker);
+      if (original) assert.deepEqual(retained, original);
+      resume.resolve();
+      await holding;
+      assert.equal(await new WorkflowState(root).adoptLegacyRetry(episodes, scope, observation), 'quarantined');
+      assert.equal(await episodes.sessionRetry('agy', 's1'), null);
+      assert.deepEqual(await readFile(marker), retained);
+    } finally {
+      resume.resolve();
+      await holding;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
 
 // Catches treating a live binding snapshot as permission to write after the epoch is closed.
 test('canonical retry write is denied after confirmed pause despite a live binding snapshot', async () => {

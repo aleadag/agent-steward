@@ -878,6 +878,7 @@ export function workflowEventDeps(base: EventDeps, authority: WorkflowAuthority,
         if (history) return false;
       } else if (history) return true;
       const adopted = await state.adoptLegacyRetry(legacy, authority.scope, observed, authority);
+      if (adopted === 'busy') return false;
       if (adopted === 'quarantined') {
         associationDenied = true;
         return false;

@@ -192,7 +192,7 @@
             AGENT_STEWARD_PS="${psPath}" \
             AGENT_STEWARD_PROCESS_PATH="${processPath}/bin/process-path" \
             AGENT_STEWARD_PROCESS_OBSERVER="${./tests/installed-process.ts}" \
-            ${pkgs.bun}/bin/bun test ${./tests/installed.test.ts} ${./tests/herdr-plugin.test.ts} ${./tests/installed-delivery.test.ts} ${./tests/installed-agy.test.ts}
+            ${pkgs.bun}/bin/bun test ${./tests/installed.test.ts} ${./tests/herdr-plugin.test.ts} ${./tests/installed-delivery.test.ts} ${./tests/installed-agy.test.ts} ${./tests}/herdr-generic-recovery.test.ts
           touch "$out"
         '';
       };

@@ -297,6 +297,10 @@ Offline repair is required for corrupt or ownerless remnants, shared selector te
 
 Stable error codes are `invalid_input`, `invalid_config`, `missing_credentials`, `credential_detected`, `invalid_response`, `evaluation_failed`, `interactive_terminal_required`, and `launch_failed`. Messages are fixed and do not contain paths, submitted data, credentials, or raw evaluator or process errors. Diagnostics use stderr; JSON stdout contains one result and a newline.
 
+Recognized other-pane writer contention temporarily blocks legacy association without creating a quarantine marker or initializing a recovery budget. After the writer finishes, a later fresh eligible event must repeat the full scan and ordinary authorization checks; lock release alone schedules no recovery. Unknown or malformed writer metadata, ambiguous history, uncertainty and cancellation remain blocked.
+
+This alpha fix assumes an offline, single-version cutover: stop all old adapter invocations before upgrading. It does not automatically repair existing quarantine markers or provide mixed-version revalidation.
+
 #### One-time alpha quarantine maintenance
 
 Automatic retirement of historical association-quarantine markers is not shipped. A single-user alpha may instead use separately authorized offline maintenance for a confirmed orphan marker; this is not a normal upgrade step or reset facility.
