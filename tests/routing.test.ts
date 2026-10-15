@@ -506,7 +506,7 @@ test('pair evaluation includes relative cost in instructions and candidate state
   assert.equal(candidates[1]?.cost, 2);
 });
 
-test('pair instructions balance capability, cost and supplied weekly pacing', async () => {
+test('pair instructions balance capability, cost and weekly pacing without favoring sooner resets', async () => {
   let pairText = '';
   await route(
     routeInput(config(), async (_state, questions) => {
@@ -524,12 +524,11 @@ test('pair instructions balance capability, cost and supplied weekly pacing', as
   assert.match(pairText, /only suitable candidate/);
   assert.match(pairText, /Do not calculate/);
   assert.match(pairText, /all applicable windows/);
-  assert.match(pairText, /much shorter horizon than other suitable options/);
-  assert.match(
-    pairText,
-    /Do not choose among similarly soon-resetting windows solely because one reset is slightly earlier/,
-  );
-  assert.match(pairText, /When reset horizons are comparable, favor lower relative cost/);
+  assert.match(pairText, /Do not favor spending quota merely because it resets sooner/);
+  assert.match(pairText, /even when weekly pacing is on budget or unknown/);
+  assert.match(pairText, /A short-window reset does not replenish weekly capacity/);
+  assert.match(pairText, /Among suitable candidates, favor capability fit then lower relative cost/);
+  assert.doesNotMatch(pairText, /prefer spending known remaining quota|compare reset urgency/);
   assert.match(pairText, /Remaining percent of zero is unavailable/);
   assert.doesNotMatch(pairText, /do not conserve that capacity/);
 });
