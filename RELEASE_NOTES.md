@@ -1,5 +1,7 @@
 # Unreleased
 
+- Inspect weekly quota pacing directly in `quota show`, with red `↑` indicators for usage ahead of an even weekly budget and green `↓` indicators for usage behind it. Remaining quota uses whole percentages; pacing keeps one decimal, and percentage/reset/capture columns stay aligned. Standard terminal colors highlight quota levels and stale measurements; redirected output, `NO_COLOR`, and `TERM=dumb` stay plain. JSON output is unchanged. See [show captured quota](README.md#show-captured-quota).
+
 - Recognized other-pane writer contention no longer leaves a permanent recovery-quarantine marker. Recovery remains blocked while the writer is present; a later fresh eligible event rescans history and applies the normal permission and delay checks. Existing markers, uncertain delivery and ambiguous history are not cleared. This alpha change requires an offline single-version cutover; see [quarantine maintenance](README.md#one-time-alpha-quarantine-maintenance).
 
 - Approval reread refusals now emit best-effort `observation_rejected` plugin stderr diagnostics with the opaque attempt UUID, checkpoint, read purpose/phase and first failed guard's allowlisted reason. Output is bounded and credential-checked, without command, screen, actor/session identity, hash or raw-error values. Public stop/RPC schemas, approval guards, retries and evaluator counts are unchanged. These logs explain future failures, not past snapshots; see [best-effort approval](README.md#global-best-effort-approval).

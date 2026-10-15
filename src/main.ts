@@ -76,6 +76,12 @@ export function createRuntime(): Runtime {
       get PATH() {
         return process.env.PATH;
       },
+      get NO_COLOR() {
+        return process.env.NO_COLOR;
+      },
+      get TERM() {
+        return process.env.TERM;
+      },
       get HOME() {
         return process.env.HOME;
       },

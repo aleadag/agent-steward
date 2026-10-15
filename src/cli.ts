@@ -42,6 +42,8 @@ export type Runtime = QuotaRefreshIO & {
     TYPESAFE_API_KEY?: string;
     OPENROUTER_API_KEY?: string;
     PATH?: string;
+    NO_COLOR?: string;
+    TERM?: string;
   };
   executableAvailable?: DoctorIO['executableAvailable'];
   appendText: (path: string, text: string) => Promise<void>;
@@ -508,8 +510,9 @@ function relativeTime(timestamp: string, now: Date): string {
   return 'now';
 }
 
-function renderQuota(buckets: Awaited<ReturnType<typeof inspectQuota>>, now: Date): string {
-  if (buckets.length === 0) return 'No enabled quota buckets.\n';
+function renderQuota(buckets: Awaited<ReturnType<typeof inspectQuota>>, now: Date, color: boolean): string {
+  const style = (text: string, code: number): string => (color ? `\u001b[${code}m${text}\u001b[0m` : text);
+  if (buckets.length === 0) return `${style('No enabled quota buckets.', 2)}\n`;
   const displayLabel = (value: string): string => (/^[\w.-]+$/.test(value) ? value : jsonValue(value));
   const groups = buckets.map(({ bucket, status, windows }) => ({
     bucket,
@@ -527,26 +530,41 @@ function renderQuota(buckets: Awaited<ReturnType<typeof inspectQuota>>, now: Dat
   const periodWidth = Math.max(0, ...rows.map((row) => row.period.length));
   const captureTimes = new Set(rows.map(({ window }) => Date.parse(window.observed_at)));
   const sharedCapture = captureTimes.size === 1;
+  const hasPacing = rows.some(({ window }) => window.status === 'known' && window.cadence === 'weekly');
+  const pacingWidth = hasPacing ? 10 : 0;
+  const resetWidth = Math.max(0, ...rows.map(({ window }) => relativeTime(window.reset_at, now).length));
   const lines: string[] = [];
   for (const { bucket, status, rows } of groups) {
     if (lines.length > 0) lines.push('');
-    lines.push(`${bucket} · ${status}`);
+    lines.push(`${style(bucket, 36)} · ${style(status, status === 'loaded' ? 2 : 31)}`);
     for (const { window, label, period } of rows) {
       const percent = window.captured_remaining_percent;
       const filled = Math.round(percent / 5);
       const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
-      const percentage = `${Math.round(percent * 10) / 10}%`.padStart(6);
-      const captured = sharedCapture ? '' : `   captured ${relativeTime(window.observed_at, now)}`;
-      const warning = window.status === 'known' ? '' : `   (historical, ${window.reason})`;
+      const percentage = `${Math.round(percent)}%`.padStart(4);
+      const quotaColor = window.status !== 'known' ? 2 : percent <= 10 ? 31 : percent <= 25 ? 33 : 32;
+      let pacing = ' '.repeat(pacingWidth);
+      if (window.status === 'known' && window.cadence === 'weekly') {
+        const millisecondsUntilReset = Math.max(0, Date.parse(window.reset_at) - now.getTime());
+        const expectedRemaining = Math.min(100, (millisecondsUntilReset / 604800_000) * 100);
+        const difference = Math.round((expectedRemaining - percent) * 10) / 10;
+        const arrow = difference > 0 ? '↑' : difference < 0 ? '↓' : '≈';
+        const indicator = `(${arrow}${Math.abs(difference).toFixed(1)}%)`;
+        pacing = ` ${style(indicator, difference > 0 ? 31 : difference < 0 ? 32 : 2)}${' '.repeat(pacingWidth - indicator.length - 1)}`;
+      }
+      const reset = relativeTime(window.reset_at, now);
+      const captured = sharedCapture ? '' : style(`   captured ${relativeTime(window.observed_at, now)}`, 2);
+      const warning = window.status === 'known' ? '' : style(`   (historical, ${window.reason})`, 33);
       lines.push(
-        `  ${label.padEnd(labelWidth)}   ${period.padEnd(periodWidth)}  ${bar} ${percentage}   resets ${relativeTime(window.reset_at, now)}${captured}${warning}`,
+        `  ${label.padEnd(labelWidth)}   ${period.padEnd(periodWidth)}  ${style(bar, quotaColor)} ${style(percentage, quotaColor)}${pacing}${style(`   resets ${sharedCapture ? reset : reset.padEnd(resetWidth)}`, 2)}${captured}${warning}`,
       );
     }
-    if (status === 'loaded' && rows.length === 0) lines.push('  no measured windows');
+    if (status === 'loaded' && rows.length === 0) lines.push(style('  no measured windows', 2));
   }
+  if (hasPacing) lines.push('', style('Weekly pacing: ↑ faster · ↓ slower than weekly budget (% of total quota)', 2));
   if (rows.length > 0) {
     const captured = sharedCapture ? ` · all captured ${relativeTime(rows[0]!.window.observed_at, now)}` : '';
-    lines.push('', `Captured remaining${captured}`);
+    lines.push('', style(`Captured remaining${captured}`, 2));
   }
   return `${lines.join('\n')}\n`;
 }
@@ -723,7 +741,10 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
       const result = { schema_version: 1, request_id: requestId, decision: 'quota_show', buckets };
       assertNoCredentials(result, apiKey);
       if (invocation.json) runtime.stdout(`${JSON.stringify(result)}\n`);
-      else runtime.stdout(renderQuota(buckets, now));
+      else {
+        const color = runtime.terminal.stdout && runtime.env.NO_COLOR === undefined && runtime.env.TERM !== 'dumb';
+        runtime.stdout(renderQuota(buckets, now, color));
+      }
       return buckets.every(({ status }) => status === 'loaded') ? 0 : 1;
     } catch (error) {
       return emitError(runtime, error, requestId, apiKey, !invocation.json);

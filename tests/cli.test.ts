@@ -1,6 +1,8 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
+import { stripVTControlCharacters } from 'node:util';
 import { run, parseArgs, renderDecisionCard } from '../src/cli.ts';
+import { createRuntime } from '../src/main.ts';
 import type { Runtime } from '../src/cli.ts';
 import type { Config, Evaluation, SelectedResult, StopInput } from '../src/contracts.ts';
 import type { HttpPost, Questions } from '../src/jev.ts';
@@ -423,7 +425,7 @@ test('quota show is read-only and displays every bucket window once with relativ
   assert.doesNotMatch(out.join(''), /2026-|identity_fingerprint/);
 });
 
-test('quota show renders aligned bars and rounds only the displayed percentage', async () => {
+test('quota show renders aligned bars and whole remaining percentages without rounding JSON', async () => {
   const { io, out } = runtime({
     terminal: { stdin: false, stdout: false },
     readText: async (path) =>
@@ -436,19 +438,26 @@ test('quota show renders aligned bars and rounds only the displayed percentage',
               windowFact({ type: 'account' }, { id: 'reserve', cadence: 'weekly', remaining_percent: 100 }),
               windowFact({ type: 'pool', pool_id: 'gemini' }, { id: '5h', remaining_percent: 99.19171 }),
               windowFact({ type: 'pool', pool_id: 'gemini' }, { id: 'weekly', remaining_percent: 87.33336 }),
+              windowFact({ type: 'account' }, { id: 'round-up', remaining_percent: 9.5 }),
+              windowFact({ type: 'account' }, { id: 'round-zero', remaining_percent: 0.49 }),
+              windowFact({ type: 'account' }, { id: 'round-full', remaining_percent: 99.5 }),
             ]),
           ),
   });
   assert.equal(await run(['quota', 'show'], io), 0);
   const text = out.join('');
   assert.match(text, /^codex · loaded\n/);
-  assert.match(text, /primary\s+weekly\s+█████████████████░░░\s+86%\s+resets in 1h/);
+  assert.match(text, /primary\s+weekly\s+█████████████████░░░\s+86% \(↓85\.1%\)\s+resets in 1h/);
   assert.match(text, /credits\s+weekly\s+█████████████░░░░░░░\s+63%/);
   assert.match(text, /reserve\s+weekly\s+████████████████████\s+100%/);
-  assert.match(text, /gemini\s+5h\s+████████████████████\s+99\.2%/);
-  assert.match(text, /gemini\s+weekly\s+█████████████████░░░\s+87\.3%/);
-  const rows = text.split('\n').filter((line) => line.includes('█'));
-  assert.equal(new Set(rows.map((line) => line.indexOf('█'))).size, 1);
+  assert.match(text, /gemini\s+5h\s+████████████████████\s+99%/);
+  assert.match(text, /gemini\s+weekly\s+█████████████████░░░\s+87%/);
+  assert.match(text, /round-up.*\s10%/);
+  assert.match(text, /round-zero.*\s0%/);
+  assert.match(text, /round-full.*\s100%/);
+  const rows = text.split('\n').filter((line) => line.includes('░') || line.includes('█'));
+  assert.equal(new Set(rows.map((line) => line.search(/[█░]/))).size, 1);
+  assert.equal(new Set(rows.map((line) => line.indexOf('%'))).size, 1);
   assert.match(text, /\n\nCaptured remaining · all captured 30m ago\n$/);
   assert.equal(text.match(/captured/g)?.length, 1);
   assert.ok(!text.includes('\u001b'));
@@ -460,8 +469,262 @@ test('quota show renders aligned bars and rounds only the displayed percentage',
   assert.equal(windows[4].captured_remaining_percent, 87.33336);
 });
 
+test('quota show displays weekly burn pacing immediately after the remaining percentage', async () => {
+  for (const [remaining, reset, indicator] of [
+    [30, '2026-10-01T22:30:00Z', '(↑20.0%)'],
+    [70, '2026-10-01T22:30:00Z', '(↓20.0%)'],
+    [50, '2026-10-01T22:30:00Z', '(≈0.0%)'],
+    [50.04, '2026-10-01T22:30:00Z', '(≈0.0%)'],
+    [49.96, '2026-10-01T22:30:00Z', '(≈0.0%)'],
+    [50.06, '2026-10-01T22:30:00Z', '(↓0.1%)'],
+    [49.94, '2026-10-01T22:30:00Z', '(↑0.1%)'],
+    [90, '2026-10-06T10:30:00Z', '(↑10.0%)'],
+    [0, '2026-10-06T10:30:00Z', '(↑100.0%)'],
+    [100, '2026-09-28T10:30:00.001Z', '(↓100.0%)'],
+    [50, '2026-10-03T10:30:00Z', '(↑21.4%)'],
+    [0, '2026-09-28T10:30:00.500Z', '(≈0.0%)'],
+  ] as const) {
+    for (const scope of [{ type: 'account' }, { type: 'pool', pool_id: 'gemini' }] as const) {
+      const { io, out } = runtime({
+        terminal: { stdin: false, stdout: false },
+        readText: async (path) =>
+          path === CONFIG_PATH
+            ? JSON.stringify(config())
+            : JSON.stringify(
+                snapshot([windowFact(scope, { cadence: 'weekly', remaining_percent: remaining, reset_at: reset })]),
+              ),
+      });
+      assert.equal(await run(['quota', 'show'], io), 0);
+      const text = out.join('');
+      assert.ok(text.includes(`${Math.round(remaining)}% ${indicator}`), text);
+      assert.ok(text.includes('↑ faster · ↓ slower than weekly budget'), text);
+      assert.ok(!text.includes('\u001b'));
+      out.length = 0;
+      assert.equal(await run(['quota', 'show', '--json'], io), 0);
+      const window = JSON.parse(out.join('')).buckets[0].windows[0];
+      assert.equal(window.captured_remaining_percent, remaining);
+      assert.equal(Object.hasOwn(window, 'weekly_pacing'), false);
+    }
+  }
+});
+
+test('quota show omits pacing for stale, future, non-weekly and unspecified windows', async () => {
+  const { io, out } = runtime({
+    terminal: { stdin: false, stdout: false },
+    readText: async (path) =>
+      path === CONFIG_PATH
+        ? JSON.stringify(config())
+        : JSON.stringify(
+            snapshot([
+              windowFact({ type: 'account' }, { id: 'weekly' }),
+              windowFact({ type: 'account' }, { cadence: 'other' }),
+              windowFact({ type: 'account' }, { cadence: 'weekly', valid_until: NOW.toISOString() }),
+              windowFact({ type: 'account' }, { cadence: 'weekly', reset_at: NOW.toISOString() }),
+              windowFact({ type: 'account' }, { cadence: 'weekly', observed_at: '2026-09-28T10:31:00Z' }),
+            ]),
+          ),
+  });
+  assert.equal(await run(['quota', 'show'], io), 0);
+  assert.doesNotMatch(out.join(''), /[↑↓≈]|weekly budget/);
+  assert.match(out.join(''), /historical, expired/);
+  assert.match(out.join(''), /historical, reset_passed/);
+  assert.match(out.join(''), /historical, future_observation/);
+});
+
+test('quota show uses standard terminal colors without changing visible text or alignment', async () => {
+  const { io, out } = runtime({
+    terminal: { stdin: false, stdout: true },
+    readText: async (path) =>
+      path === CONFIG_PATH
+        ? JSON.stringify(config())
+        : JSON.stringify(
+            snapshot([
+              windowFact(
+                { type: 'account' },
+                { id: 'plenty', cadence: 'weekly', remaining_percent: 60, reset_at: '2026-10-01T22:30:00Z' },
+              ),
+              windowFact(
+                { type: 'account' },
+                { id: 'ahead', cadence: 'weekly', remaining_percent: 30, reset_at: '2026-10-01T22:30:00Z' },
+              ),
+              windowFact(
+                { type: 'account' },
+                { id: 'on-pace', cadence: 'weekly', remaining_percent: 50, reset_at: '2026-10-01T22:30:00Z' },
+              ),
+              windowFact({ type: 'account' }, { id: 'low', remaining_percent: 25 }),
+              windowFact({ type: 'account' }, { id: 'critical', remaining_percent: 10 }),
+              windowFact(
+                { type: 'account' },
+                { id: 'historical', remaining_percent: 80, valid_until: NOW.toISOString() },
+              ),
+              windowFact({ type: 'account' }, { id: 'unsafe\n\u001b[31m' }),
+            ]),
+          ),
+  });
+  assert.equal(await run(['quota', 'show'], io), 0);
+  const colored = out.join('');
+  assert.ok(colored.includes('\u001b[36mcodex\u001b[0m'));
+  assert.ok(colored.includes('\u001b[32m████████████░░░░░░░░\u001b[0m'));
+  assert.ok(colored.includes('\u001b[33m█████░░░░░░░░░░░░░░░\u001b[0m'));
+  assert.ok(colored.includes('\u001b[31m██░░░░░░░░░░░░░░░░░░\u001b[0m'));
+  assert.ok(colored.includes('\u001b[2m████████████████░░░░\u001b[0m'));
+  assert.ok(colored.includes('\u001b[32m 60%\u001b[0m \u001b[32m(↓10.0%)\u001b[0m'));
+  assert.ok(colored.includes('\u001b[31m(↑20.0%)\u001b[0m'));
+  assert.ok(colored.includes('(≈0.0%)'));
+  assert.ok(colored.includes('\u001b[33m 25%\u001b[0m'));
+  assert.ok(colored.includes('\u001b[31m 10%\u001b[0m'));
+  assert.ok(colored.includes('\u001b[2m 80%\u001b[0m'));
+  assert.ok(colored.includes('\u001b[33m   (historical, expired)\u001b[0m'));
+  assert.ok(colored.includes('\u001b[2m   resets in 1h\u001b[0m'));
+  assert.ok(colored.includes('\u001b[2mCaptured remaining'));
+  const visible = stripVTControlCharacters(colored);
+  assert.ok(visible.includes('"unsafe\\n\\u001b[31m"'));
+  const rows = visible.split('\n').filter((line) => line.includes('█'));
+  assert.equal(new Set(rows.map((line) => line.indexOf('█'))).size, 1);
+  io.terminal.stdout = false;
+  out.length = 0;
+  assert.equal(await run(['quota', 'show'], io), 0);
+  assert.equal(out.join(''), visible);
+  out.length = 0;
+  io.terminal.stdout = true;
+  assert.equal(await run(['quota', 'show', '--json'], io), 0);
+  assert.ok(!out.join('').includes('\u001b'));
+  assert.equal(JSON.parse(out.join('')).decision, 'quota_show');
+});
+
+test('quota show aligns reset and capture columns with missing and different-width pacing', async () => {
+  for (const stdout of [true, false]) {
+    const { io, out } = runtime({
+      terminal: { stdin: false, stdout },
+      readText: async (path) => {
+        if (path === CONFIG_PATH) {
+          return JSON.stringify(
+            config({ candidates: [candidate(), candidate({ id: 'pi', tool: 'pi', quota_bucket: 'pi_codex' })] }),
+          );
+        }
+        const source = path === SNAPSHOT_PATH ? 'codex' : 'pi_codex';
+        return JSON.stringify(
+          snapshot(
+            [
+              windowFact(
+                { type: 'account' },
+                { id: 'small', cadence: 'weekly', remaining_percent: 49.9, reset_at: '2026-10-01T22:30:00Z' },
+              ),
+              windowFact(
+                { type: 'account' },
+                { id: 'wide', cadence: 'weekly', remaining_percent: 99.9, reset_at: '2026-09-28T10:30:00.001Z' },
+              ),
+              windowFact(
+                { type: 'account' },
+                { id: 'on-pace', cadence: 'weekly', remaining_percent: 50, reset_at: '2026-10-01T22:30:00Z' },
+              ),
+              windowFact({ type: 'account' }, { id: 'other', cadence: 'other' }),
+              windowFact(
+                { type: 'account' },
+                { id: 'stale', cadence: 'weekly', valid_until: NOW.toISOString(), observed_at: '2026-09-28T09:30:00Z' },
+              ),
+              windowFact(
+                { type: 'account' },
+                {
+                  id: 'past',
+                  cadence: 'weekly',
+                  reset_at: '2026-09-28T08:30:00Z',
+                  observed_at: '2026-09-28T07:30:00Z',
+                },
+              ),
+            ],
+            { source },
+          ),
+        );
+      },
+    });
+    assert.equal(await run(['quota', 'show'], io), 0);
+    const text = stripVTControlCharacters(out.join(''));
+    const rows = text.split('\n').filter((line) => line.includes('█'));
+    assert.equal(rows.length, 12);
+    assert.match(text, /50% \(↑0\.1%\)/);
+    assert.match(text, /100% \(↓99\.9%\)/);
+    for (const column of ['%', 'resets ', 'captured ']) {
+      assert.ok(
+        rows.every((row) => row.includes(column)),
+        text,
+      );
+      assert.equal(new Set(rows.map((row) => row.indexOf(column))).size, 1, text);
+    }
+    assert.match(text, /past.*resets 2h ago/);
+    assert.match(text, /stale.*captured 1h ago/);
+    assert.match(text, /other.*40%\s+resets/);
+    if (!stdout) assert.ok(!out.join('').includes('\u001b'));
+  }
+});
+
+test('quota show disables terminal colors for NO_COLOR, dumb terminals and redirected stdout', async () => {
+  for (const [stdout, env] of [
+    [true, { NO_COLOR: '1' }],
+    [true, { NO_COLOR: '' }],
+    [true, { TERM: 'dumb' }],
+    [false, { FORCE_COLOR: '1' }],
+  ] as const) {
+    const { io, out } = runtime({
+      env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', ...env },
+      terminal: { stdin: true, stdout },
+      readText: async (path) =>
+        path === CONFIG_PATH
+          ? JSON.stringify(config())
+          : JSON.stringify(snapshot([windowFact({ type: 'account' }, { cadence: 'weekly' })])),
+    });
+    assert.equal(await run(['quota', 'show'], io), 0);
+    assert.ok(!out.join('').includes('\u001b'));
+    assert.match(out.join(''), /40% \(↓39\.1%\)/);
+  }
+});
+
+test('quota show honors color environment switches through the production runtime', async () => {
+  const savedNoColor = process.env.NO_COLOR;
+  const savedTerm = process.env.TERM;
+  try {
+    for (const [noColor, term] of [
+      ['1', 'xterm'],
+      [undefined, 'dumb'],
+    ] as const) {
+      if (noColor === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = noColor;
+      process.env.TERM = term;
+      const io = createRuntime();
+      const out: string[] = [];
+      io.terminal.stdout = true;
+      io.now = () => new Date(NOW);
+      io.stdout = (text) => out.push(text);
+      io.readText = async (path) =>
+        path === CONFIG_PATH
+          ? JSON.stringify(config())
+          : JSON.stringify(snapshot([windowFact({ type: 'account' }, { cadence: 'weekly' })]));
+      assert.equal(await run(['quota', 'show', '--config', CONFIG_PATH], io), 0);
+      assert.ok(!out.join('').includes('\u001b'));
+      assert.match(out.join(''), /40% \(↓39\.1%\)/);
+    }
+  } finally {
+    if (savedNoColor === undefined) delete process.env.NO_COLOR;
+    else process.env.NO_COLOR = savedNoColor;
+    if (savedTerm === undefined) delete process.env.TERM;
+    else process.env.TERM = savedTerm;
+  }
+});
+
+test('quota show colors unavailable snapshot status without changing its exit code', async () => {
+  const { io, out } = runtime({
+    readText: async (path) => {
+      if (path === CONFIG_PATH) return JSON.stringify(config());
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+    },
+  });
+  assert.equal(await run(['quota', 'show'], io), 1);
+  assert.ok(out.join('').includes('\u001b[31mmissing\u001b[0m'));
+});
+
 test('quota show keeps individual capture times and historical warnings when captures differ', async () => {
   const { io, out } = runtime({
+    terminal: { stdin: false, stdout: false },
     readText: async (path) =>
       path === CONFIG_PATH
         ? JSON.stringify(config())
@@ -489,6 +752,7 @@ test('quota show keeps individual capture times and historical warnings when cap
 
 test('quota show escapes unsafe display labels and handles text empty inventory', async () => {
   const { io, out } = runtime({
+    terminal: { stdin: false, stdout: false },
     readText: async (path) =>
       path === CONFIG_PATH
         ? JSON.stringify(config())
@@ -497,7 +761,7 @@ test('quota show escapes unsafe display labels and handles text empty inventory'
   assert.equal(await run(['quota', 'show'], io), 0);
   assert.ok(out.join('').includes('"line\\n\\u001b[31m"'));
   assert.ok(!out.join('').includes('\u001b'));
-  const empty = runtime();
+  const empty = runtime({ terminal: { stdin: false, stdout: false } });
   assert.equal(await run(['quota', 'show'], empty.io), 0);
   assert.equal(empty.out.join(''), 'No enabled quota buckets.\n');
 });
@@ -505,6 +769,7 @@ test('quota show escapes unsafe display labels and handles text empty inventory'
 test('quota show groups providers and shares equivalent capture timestamps across buckets', async () => {
   const cfg = config({ candidates: [candidate(), candidate({ id: 'pi', tool: 'pi', quota_bucket: 'pi_codex' })] });
   const { io, out } = runtime({
+    terminal: { stdin: false, stdout: false },
     readText: async (path) => {
       if (path === CONFIG_PATH) return JSON.stringify(cfg);
       const source = path === SNAPSHOT_PATH ? 'codex' : 'pi_codex';
@@ -570,6 +835,7 @@ test('quota show relative times handle seconds, days, future captures and past r
     ['2026-09-26T10:30:00Z', '2026-09-28T08:30:00Z', '2d ago', '2h ago', 'reset_passed'],
   ]) {
     const { io, out } = runtime({
+      terminal: { stdin: false, stdout: false },
       readText: async (path) =>
         path === CONFIG_PATH
           ? JSON.stringify(config())

@@ -167,16 +167,22 @@ For agy, configure one Gemini model with ordinary thinking levels, not a separat
 
 ## Show captured quota
 
-Run `agent-steward quota show` to inspect the latest saved snapshots for enabled, configured quota buckets without refreshing them. It reads local snapshots only: no provider calls, credential reads, or writes. The text display groups windows by provider, with 20-character remaining-percentage bars and percentages rounded to one decimal place. Capture and reset times are relative to the current time:
+Run `agent-steward quota show` to inspect the latest saved snapshots for enabled, configured quota buckets without refreshing them. It reads local snapshots only: no provider calls, credential reads, or writes. The text display groups windows by provider, with 20-character remaining-percentage bars and remaining percentages rounded to whole numbers. Capture and reset times are relative to the current time:
 
 ```text
 codex · loaded
-  primary   weekly  ████████░░░░░░░░░░░░    40%   resets in 1h
+  primary   weekly  ████████░░░░░░░░░░░░  40% (↓39.1%)    resets in 1h
+
+Weekly pacing: ↑ faster · ↓ slower than weekly budget (% of total quota)
 
 Captured remaining · all captured 30m ago
 ```
 
-When capture timestamps differ, each row shows its own capture time instead of a shared footer. `--json` preserves full percentage precision.
+Fresh weekly windows show burn pacing immediately after the remaining percentage: `60% (↑20.0%)` means usage is 20% of total quota ahead of an even weekly budget; `60% (↓20.0%)` means it is behind that budget. This is a gap in quota, not a relative change in burn speed. Pacing uses the same current-time calculation as routing and always shows one decimal place; gaps that round to zero display `(≈0.0%)`. Stale and non-weekly windows omit pacing.
+
+On a terminal, the display uses standard terminal colors: cyan provider headings; green remaining bars and percentages above 25%, yellow at 25% or below, and red at 10% or below. Faster burn is red, slower burn is green, and on-pace indicators, historical measurements, timestamps, and the footer are dimmed. Historical warnings are yellow; snapshot failures are red. Set `NO_COLOR` (including an empty value) or `TERM=dumb` to disable color. Redirected output is always plain text.
+
+When capture timestamps differ, each row shows its own capture time instead of a shared footer. `--json` is unchanged: it preserves full percentage precision and does not include display pacing or colors.
 
 Stale measurements are labeled `historical` with a reason, such as `expired` or `reset_passed`; they are not current availability. `--json` returns `decision: "quota_show"` and a `buckets` array with exact timestamps. Each window includes `captured_remaining_percent`; its usable `remaining_percent` is null when stale. Identity fingerprints are omitted. Missing, unreadable, malformed, or identity-mismatched snapshots are reported per bucket and exit 1. Successfully reading every snapshot exits 0, even if measurements are stale or the inventory is empty.
 
