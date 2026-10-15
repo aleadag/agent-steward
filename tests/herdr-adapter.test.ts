@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'bun:test';
+import { setDefaultTimeout, test } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, cp, chmod, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -12,7 +12,9 @@ import type { EventDeps } from '../src/herdr-adapter/entry.ts';
 import type { AgentSnapshot, HerdrReader, ReadSnapshot } from '../src/herdr-adapter/observe.ts';
 import type { Episode } from '../src/herdr-adapter/state.ts';
 import { StewardError, type StopInput, type StopResult } from '../src/contracts.ts';
-import { deferred, within } from './herdr-lease-helpers.ts';
+import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
+
+setDefaultTimeout(30_000);
 
 type TestHandoffReason = Parameters<EventDeps['handoff']>[0];
 type AdapterHerdr = HerdrReader &

@@ -152,20 +152,22 @@ async function runEventChild(
   extra: { rejectRelease?: boolean; pause?: boolean; inWindow?: boolean } = {},
   milliseconds = 10_000,
 ) {
-  return childResult(
+  const result = await childResult(
     `
     const { runHeldEvent } = await import(${JSON.stringify(runtimeUrl)});
     await runHeldEvent(${JSON.stringify({ hold, signal, ...extra })});
   `,
     milliseconds,
   );
+  const timing = /^settled (\d+(?:\.\d+)?)\n$/.exec(result.stdout);
+  assert.ok(timing, result.stderr || result.stdout);
+  return { ...result, elapsed: Number(timing[1]) };
 }
 
 // Catches reporting a clean stop when slot cleanup is still unconfirmed after SIGINT.
 test('runEvent SIGINT with held capacity release reports incomplete within one 5s window', async () => {
-  const started = Date.now();
   const result = await runEventChild('capacity', 'SIGINT');
-  const elapsed = Date.now() - started;
+  const { elapsed } = result;
   assert.equal(result.code, 1);
   assert.equal(result.stderr, warning);
   assert.equal(result.stdout.startsWith('settled'), true);
@@ -175,9 +177,8 @@ test('runEvent SIGINT with held capacity release reports incomplete within one 5
 
 // Catches a second fresh 5s window when G release is held after slot confirmation.
 test('runEvent SIGINT with held generation release reports incomplete within one 5s window', async () => {
-  const started = Date.now();
   const result = await runEventChild('generation', 'SIGINT');
-  const elapsed = Date.now() - started;
+  const { elapsed } = result;
   assert.equal(result.code, 1);
   assert.equal(result.stderr, warning);
   assert.ok(elapsed >= 4_500 && elapsed < 8_000, `elapsed ${elapsed}`);
@@ -185,9 +186,8 @@ test('runEvent SIGINT with held generation release reports incomplete within one
 
 // Catches sequential G-then-job 5s budgets when both releases are held.
 test('runEvent SIGINT with both releases held still finishes within one 5s window', async () => {
-  const started = Date.now();
   const result = await runEventChild('both', 'SIGINT');
-  const elapsed = Date.now() - started;
+  const { elapsed } = result;
   assert.equal(result.code, 1);
   assert.equal(result.stderr, warning);
   assert.ok(elapsed >= 4_500 && elapsed < 8_000, `elapsed ${elapsed}`);
@@ -195,9 +195,8 @@ test('runEvent SIGINT with both releases held still finishes within one 5s windo
 
 // Catches joining an unowned hung decide after G can confirm, forcing false incomplete.
 test('runEvent SIGINT during hung decide confirms G without joining decide or warning', async () => {
-  const started = Date.now();
   const result = await runEventChild('decide', 'SIGINT');
-  const elapsed = Date.now() - started;
+  const { elapsed } = result;
   assert.equal(result.stdout.startsWith('settled'), true);
   assert.equal(result.stdout.includes('unhandled'), false);
   assert.ok(elapsed < 2_000, `elapsed ${elapsed}`);
@@ -230,9 +229,8 @@ test('run.sh pause with held control publication reports incomplete', async () =
 
 // Catches sequential slot-then-G 5s windows on internal human cleanup.
 test('runEvent internal human with held slot release reports incomplete within one 5s window', async () => {
-  const started = Date.now();
   const result = await runEventChild('human', null);
-  const elapsed = Date.now() - started;
+  const { elapsed } = result;
   assert.equal(result.code, 1);
   assert.equal(result.stderr, warning);
   assert.equal(result.stdout.startsWith('settled'), true);
@@ -241,9 +239,8 @@ test('runEvent internal human with held slot release reports incomplete within o
 
 // Catches sequential slot-then-G 5s windows on internal lost cleanup.
 test('runEvent internal lost with held slot release reports incomplete within one 5s window', async () => {
-  const started = Date.now();
   const result = await runEventChild('lost', null);
-  const elapsed = Date.now() - started;
+  const { elapsed } = result;
   assert.equal(result.code, 1);
   assert.equal(result.stderr, warning);
   assert.equal(result.stdout.startsWith('settled'), true);
@@ -268,9 +265,8 @@ test('runEvent in-window late rejected generation release reports incomplete', a
 
 // Catches forcing incomplete after an in-window late successful ACK.
 test('runEvent in-window late generation ACK can confirm before the deadline', async () => {
-  const started = Date.now();
   const result = await runEventChild('generation', 'SIGINT', { inWindow: true });
-  const elapsed = Date.now() - started;
+  const { elapsed } = result;
   assert.equal(result.code, 0);
   assert.equal(result.stderr, '');
   assert.ok(elapsed < 2_000, `elapsed ${elapsed}`);
@@ -292,9 +288,8 @@ test('runEvent SIGINT during held capacity acquisition reports without unhandled
 
 // Catches joining hung job foreground after G can confirm.
 test('runEvent SIGINT during held job foreground confirms without joining get', async () => {
-  const started = Date.now();
   const result = await runEventChild('foreground', 'SIGINT');
-  const elapsed = Date.now() - started;
+  const { elapsed } = result;
   assert.equal(result.stdout.startsWith('settled'), true);
   assert.equal(result.stdout.includes('unhandled'), false);
   assert.ok(elapsed < 2_000, `elapsed ${elapsed}`);
@@ -304,9 +299,8 @@ test('runEvent SIGINT during held job foreground confirms without joining get', 
 
 // Catches joining a far-future wait after G and slot can confirm.
 test('runEvent SIGINT during job timer wait confirms within the bound', async () => {
-  const started = Date.now();
   const result = await runEventChild('timer', 'SIGINT');
-  const elapsed = Date.now() - started;
+  const { elapsed } = result;
   assert.equal(result.code, 0);
   assert.equal(result.stderr, '');
   assert.ok(elapsed < 2_000, `elapsed ${elapsed}`);

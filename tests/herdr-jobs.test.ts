@@ -811,7 +811,7 @@ test('jobs never expose sendKeys or list on the recovery transport', async () =>
 });
 
 test('saturation marks the episode human without clearing counters or waiting', async () => {
-  const f = await world();
+  const f = await world({ heartbeatIntervalMs: 5_000 });
   const attempts: ReturnType<typeof beginWorkflow>[] = [];
   const slots: ReturnType<typeof reserveJobSlot>[] = [];
   try {
@@ -824,7 +824,6 @@ test('saturation marks the episode human without clearing counters or waiting', 
         workspaceId: 'w1',
         permission: () => permission(false),
         signal: new AbortController().signal,
-        heartbeatIntervalMs: 60_000,
       });
       attempts.push(attempt);
       const auth = await attempt.ready;

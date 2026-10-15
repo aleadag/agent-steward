@@ -146,8 +146,8 @@ test('ordinary CLI and other plugins do not invoke launcher logging', async () =
   }
 });
 
-test('unavailable or malformed plugin logging preserves the original error and uses a fixed warning', async () => {
-  for (const reply of ['error', 'close', 'oversized', 'timeout', 'wrong-id', 'wrong-action', 'invalid-json'] as const) {
+for (const reply of ['error', 'close', 'oversized', 'timeout', 'wrong-id', 'wrong-action', 'invalid-json'] as const)
+  test(`unavailable or malformed plugin logging preserves the original error and uses a fixed warning: ${reply}`, async () => {
     const result = await route('agent-steward-launcher', reply);
     assert.equal(result.code, 1);
     assert.equal(JSON.parse(result.stdout).reason_code, 'invalid_config');
@@ -155,8 +155,7 @@ test('unavailable or malformed plugin logging preserves the original error and u
     assert.equal(result.stderr, 'agent-steward: launcher_log_unavailable\n');
     assert.ok(result.elapsed < 4_000, `logging exceeded its deadline: ${reply}`);
     assert.doesNotMatch(result.stdout + result.stderr, /private-|SyntheticKey333/);
-  }
-});
+  });
 
 test('logged action renders diagnostics without context, messages or terminal output', async () => {
   const result = await execute(renderer, [], {

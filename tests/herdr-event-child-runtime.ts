@@ -213,9 +213,11 @@ export async function runHeldEvent(options: {
     return quotaDecision(input);
   };
   let beat = () => {};
-  const started = Date.now();
+  const started = performance.now();
+  let stopStartedAt: number | undefined;
   try {
     if (options.pause) {
+      stopStartedAt = performance.now();
       const running = runControl(env, 'pause', { state });
       const result = await within(running, 8_000);
       reportWorkflowResult(result, {
@@ -241,7 +243,10 @@ export async function runHeldEvent(options: {
         wait:
           hold === 'human' || hold === 'foreground'
             ? async () => {
-                if (hold === 'human') denyGet = true;
+                if (hold === 'human') {
+                  stopStartedAt ??= performance.now();
+                  denyGet = true;
+                }
                 if (hold === 'foreground') holdGet = true;
               }
             : undefined,
@@ -284,7 +289,10 @@ export async function runHeldEvent(options: {
         );
         if (hold === 'human') denyGet = true;
         if (hold === 'foreground') holdGet = true;
-        if (hold === 'lost') await state.pause(serverId);
+        if (hold === 'lost') {
+          stopStartedAt = performance.now();
+          await state.pause(serverId);
+        }
         if (hold === 'heartbeat') {
           armHeartbeat = true;
           beat();
@@ -293,14 +301,18 @@ export async function runHeldEvent(options: {
           await within(held.promise, 4_000);
         }
       }
-      if (options.signal) process.kill(process.pid, options.signal);
+      if (options.signal) {
+        stopStartedAt = performance.now();
+        process.kill(process.pid, options.signal);
+      }
       if (options.inWindow) {
         await new Promise((resolve) => setTimeout(resolve, 80));
         resume.resolve();
       }
       await within(running, 8_000);
     }
-    const elapsed = Date.now() - started;
+    // Exclude process startup, workflow admission and fixture cleanup from shutdown timing.
+    const elapsed = performance.now() - (stopStartedAt ?? started);
     process.stdout.write(`${unhandled ? 'unhandled' : 'settled'} ${elapsed}\n`);
   } finally {
     resume.resolve();

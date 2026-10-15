@@ -1161,8 +1161,9 @@ for (const kind of ['approval', 'ordinary-recovery', 'job-recovery'] as const)
 async function child(args: string[], env: NodeJS.ProcessEnv = {}) {
   const processChild = spawn(process.execPath, args, {
     env,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
+  const ready = new Promise<void>((resolve) => processChild.stdout.once('data', () => resolve()));
   let stdout = '',
     stderr = '';
   processChild.stdout.on('data', (data) => {
@@ -1176,6 +1177,8 @@ async function child(args: string[], env: NodeJS.ProcessEnv = {}) {
     processChild.once('close', resolve);
   });
   return {
+    ready,
+    stdin: processChild.stdin,
     result: closed.then((code) => ({ code, stdout, stderr })),
     stop: () => processChild.kill('SIGKILL'),
   };
@@ -1324,9 +1327,11 @@ test('eight independent diagnostic writers retain every record across healthy co
       writers.push(
         await child([
           '--eval',
-          `import { appendDiagnostic } from ${JSON.stringify(module)}; console.log('started'); await appendDiagnostic(${JSON.stringify(root)}, ${JSON.stringify({ ...record, scopeHash: String(index).repeat(64), outcome: 'finished', reason: 'completed' })});`,
+          `import { appendDiagnostic } from ${JSON.stringify(module)}; console.log('started'); await Bun.stdin.text(); await appendDiagnostic(${JSON.stringify(root)}, ${JSON.stringify({ ...record, scopeHash: String(index).repeat(64), outcome: 'finished', reason: 'completed' })});`,
         ]),
       );
+    await withinWorkflow(Promise.all(writers.map((writer) => writer.ready)));
+    for (const writer of writers) writer.stdin.end('go\n');
     await new Promise((resolve) => setTimeout(resolve, 150));
     resume.resolve();
     await reservation;
