@@ -654,6 +654,7 @@ test('quota show aligns reset and capture columns with missing and different-wid
     assert.match(text, /past.*resets 2h ago/);
     assert.match(text, /stale.*captured 1h ago/);
     assert.match(text, /other.*40%\s+resets/);
+    assert.doesNotMatch(text, /Captured remaining/);
     if (!stdout) assert.ok(!out.join('').includes('\u001b'));
   }
 });
@@ -746,8 +747,7 @@ test('quota show keeps individual capture times and historical warnings when cap
   const text = out.join('');
   assert.match(text, /fresh.*captured 30m ago/);
   assert.match(text, /old.*captured 1h ago.*historical, expired/);
-  assert.match(text, /Captured remaining\n$/);
-  assert.doesNotMatch(text, /all captured/);
+  assert.doesNotMatch(text, /Captured remaining|all captured/);
 });
 
 test('quota show escapes unsafe display labels and handles text empty inventory', async () => {

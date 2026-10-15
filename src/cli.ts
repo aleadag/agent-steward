@@ -562,9 +562,9 @@ function renderQuota(buckets: Awaited<ReturnType<typeof inspectQuota>>, now: Dat
     if (status === 'loaded' && rows.length === 0) lines.push(style('  no measured windows', 2));
   }
   if (hasPacing) lines.push('', style('Weekly pacing: ↑ faster · ↓ slower than weekly budget (% of total quota)', 2));
-  if (rows.length > 0) {
-    const captured = sharedCapture ? ` · all captured ${relativeTime(rows[0]!.window.observed_at, now)}` : '';
-    lines.push('', style(`Captured remaining${captured}`, 2));
+  if (sharedCapture) {
+    const captured = relativeTime(rows[0]!.window.observed_at, now);
+    lines.push('', style(`Captured remaining · all captured ${captured}`, 2));
   }
   return `${lines.join('\n')}\n`;
 }
