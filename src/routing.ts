@@ -78,7 +78,14 @@ export async function route(input: {
 
   const eligible = enabled.filter(
     (candidate) =>
-      !quotas.get(candidate.id)!.windows.some((window) => window.status === 'known' && window.remaining_percent === 0),
+      !quotas
+        .get(candidate.id)!
+        .windows.some(
+          (window) =>
+            window.status === 'known' &&
+            (window.remaining_percent === 0 ||
+              (candidate.tool === 'agy' && window.remaining_percent !== null && window.remaining_percent < 1)),
+        ),
   );
   if (eligible.length === 0) throw new StewardError('quota_exhausted');
 

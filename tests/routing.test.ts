@@ -250,6 +250,117 @@ test('routing excludes exhausted shared pools but preserves other pools', async 
   assert.equal(result.selected.candidate_id, 'available');
 });
 
+test('AGY requires at least one percent in every fresh applicable window', async () => {
+  const agy = candidate({ id: 'agy', tool: 'agy', quota_bucket: 'antigravity', quota_pool: 'gemini' });
+  const cfg = config({ candidates: [agy] });
+  for (const limitedWindow of ['gemini-5h', 'gemini-weekly']) {
+    for (const remaining of [0, 0.19920059, 0.999, 1, 1.001]) {
+      await runSubcase(`${limitedWindow}: ${remaining}%`, async () => {
+        const quota = await loadQuota(cfg, {
+          env: { HOME: '/isolated/home' },
+          now: fixedNow,
+          diagnostic: () => {},
+          readText: async () =>
+            JSON.stringify(
+              snapshot(
+                ['gemini-5h', 'gemini-weekly'].map((id) =>
+                  windowFact(
+                    { type: 'pool', pool_id: 'gemini' },
+                    { id, remaining_percent: id === limitedWindow ? remaining : 80 },
+                  ),
+                ),
+                { source: 'antigravity' },
+              ),
+            ),
+        });
+        const { post, requests } = recordingPost();
+        const input = routeInput(cfg, makeEvaluator({ model: 'jev-1.13.0', apiKey: 'unit-key-not-live', post }), quota);
+        if (remaining < 1) {
+          await assert.rejects(route(input), (error) => hasCode(error, 'quota_exhausted'));
+          assert.equal(requests.length, 0);
+        } else {
+          const result = await route(input);
+          assert.equal(result.selected.candidate_id, 'agy');
+          assert.deepEqual(result.quota, quota.get('agy'));
+        }
+      });
+    }
+  }
+});
+
+test('near-empty AGY pools are excluded without changing other pools or tools', async () => {
+  const cfg = config({
+    candidates: [
+      candidate({ id: 'gemini-a', tool: 'agy', quota_bucket: 'antigravity', quota_pool: 'gemini' }),
+      candidate({ id: 'gemini-b', tool: 'agy', quota_bucket: 'antigravity', quota_pool: 'gemini' }),
+      candidate({ id: 'third-party', tool: 'agy', quota_bucket: 'antigravity', quota_pool: 'third_party' }),
+      candidate({ id: 'codex' }),
+      candidate({ id: 'pi', tool: 'pi', quota_bucket: 'pi_codex' }),
+    ],
+  });
+  const quota = await loadQuota(cfg, {
+    env: { HOME: '/isolated/home' },
+    now: fixedNow,
+    diagnostic: () => {},
+    readText: async (path) =>
+      JSON.stringify(
+        path.endsWith('/antigravity.json')
+          ? snapshot(
+              [
+                windowFact({ type: 'pool', pool_id: 'gemini' }, { id: 'gemini-5h', remaining_percent: 80 }),
+                windowFact({ type: 'pool', pool_id: 'gemini' }, { id: 'gemini-weekly', remaining_percent: 0.19920059 }),
+                windowFact({ type: 'pool', pool_id: 'third_party' }, { id: '3p-5h', remaining_percent: 80 }),
+                windowFact({ type: 'pool', pool_id: 'third_party' }, { id: '3p-weekly', remaining_percent: 1 }),
+              ],
+              { source: 'antigravity' },
+            )
+          : snapshot([windowFact({ type: 'account' }, { remaining_percent: 0.19920059 })], {
+              source: path.endsWith('/pi_codex.json') ? 'pi_codex' : 'codex',
+            }),
+      ),
+  });
+  const { post, requests } = recordingPost();
+  const result = await route(
+    routeInput(cfg, makeEvaluator({ model: 'jev-1.13.0', apiKey: 'unit-key-not-live', post }), quota),
+  );
+  const wire = JSON.parse(requests[0]!.body);
+  assert.deepEqual(Object.keys(wire.questions.pair.criteria), ['third-party', 'codex', 'pi']);
+  assert.deepEqual(
+    wire.state.candidates.map((item: Candidate) => item.id),
+    ['third-party', 'codex', 'pi'],
+  );
+  assert.equal(result.selected.candidate_id, 'third-party');
+});
+
+test('stale near-empty AGY quota remains unknown and eligible', async () => {
+  const cfg = config({
+    candidates: [candidate({ id: 'agy', tool: 'agy', quota_bucket: 'antigravity', quota_pool: 'gemini' })],
+  });
+  const quota = await loadQuota(cfg, {
+    env: { HOME: '/isolated/home' },
+    now: fixedNow,
+    diagnostic: () => {},
+    readText: async () =>
+      JSON.stringify(
+        snapshot(
+          ['gemini-5h', 'gemini-weekly'].map((id) =>
+            windowFact(
+              { type: 'pool', pool_id: 'gemini' },
+              { id, remaining_percent: 0.19920059, valid_until: '2026-09-28T10:15:00Z' },
+            ),
+          ),
+          { source: 'antigravity' },
+        ),
+      ),
+  });
+  const { post } = recordingPost();
+  const result = await route(
+    routeInput(cfg, makeEvaluator({ model: 'jev-1.13.0', apiKey: 'unit-key-not-live', post }), quota),
+  );
+  assert.equal(result.selected.candidate_id, 'agy');
+  assert.ok(result.quota.windows.every((window) => window.status === 'unknown' && window.remaining_percent === null));
+});
+
 test('exhausted account quota rejects every shared candidate without evaluation', async () => {
   const cfg = config({ candidates: [candidate(), candidate({ id: 'other-pool', quota_pool: 'other' })] });
   const quota = await loadQuota(cfg, {
