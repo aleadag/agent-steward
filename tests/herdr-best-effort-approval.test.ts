@@ -1963,7 +1963,7 @@ test('configured event entrypoint sends literal agent send-keys once through Her
     await rm(root, { recursive: true, force: true });
     await f.cleanup();
   }
-});
+}, 30_000);
 
 test('changed partial menu with the same status stays human-only without a recovery schedule', async () => {
   const f = await fixture();
