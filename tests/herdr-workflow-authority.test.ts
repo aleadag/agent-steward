@@ -9,6 +9,7 @@ import { beginWorkflow, reserveJobSlot, type WorkflowAttempt } from '../src/herd
 import { WorkflowState, type WorkflowScope, type RuntimePermission } from '../src/herdr-adapter/workflow-state.ts';
 import { EpisodeStore, type Episode } from '../src/herdr-adapter/state.ts';
 import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
+import { withTestTiming } from './herdr-test-timing.ts';
 
 // Integration setup and cleanup share the budget with guarded filesystem work.
 setDefaultTimeout(30_000);
@@ -380,61 +381,71 @@ test('synthetic credential identifiers create no binding or input', async () => 
   }
 });
 
-test('eight server capacity leases refuse ninth; reader consumes none; released slot is reusable', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'workflow-capacity-'));
-  const a = new WorkflowState(root),
-    b = new WorkflowState(root),
-    episodes = new EpisodeStore(root);
-  const attempts: WorkflowAttempt[] = [];
-  const slots: ReturnType<typeof reserveJobSlot>[] = [];
-  try {
-    for (let i = 0; i < 9; i++) {
-      const selected = { ...scope, sessionId: `s${i}` };
-      const attempt = start(i % 2 ? a : b, selected);
-      attempts.push(attempt);
-      const auth = await within(attempt.ready);
-      assert.ok(auth);
-      await episodes.recordSessionRetry('agy', selected.sessionId, { ...episode, session_id: selected.sessionId });
-      const binding = await a.binding(selected);
-      assert.ok(binding);
-      await a.recordBinding({ ...binding, phase: 'pending', failureEpisodeId: episode.failure_episode_id });
-      const slot = reserveJobSlot(i % 2 ? a : b, auth);
-      slots.push(slot);
-      const admitted = await within(slot.ready);
-      if (i < 8) {
-        assert.ok(admitted);
-        assert.equal(await admitted.valid(), true);
-      } else assert.equal(admitted, null);
-    }
-    const duplicate = start(b, { ...scope, sessionId: 's0' });
-    attempts.push(duplicate);
-    const reader = await duplicate.ready;
-    assert.ok(reader);
-    assert.equal(reader.ownsGeneration, false);
-    const denied = reserveJobSlot(b, reader);
-    slots.push(denied);
-    assert.equal(await denied.ready, null);
-    assert.equal(await slots[0]!.finish(), 'finished');
-    const auth = await attempts[8]!.ready;
-    assert.ok(auth);
-    const wrongState = reserveJobSlot(a, auth);
-    slots.push(wrongState);
-    assert.equal(await wrongState.ready, null);
-    const replacement = reserveJobSlot(b, auth);
-    slots.push(replacement);
-    assert.ok(await replacement.ready);
-  } finally {
-    for (const slot of slots) {
-      slot.close();
-      await slot.finish();
-    }
-    for (const attempt of attempts) {
-      attempt.close();
-      await attempt.finish();
-    }
-    await rm(root, { recursive: true, force: true });
-  }
-}, 30_000);
+test(
+  'eight server capacity leases refuse ninth; reader consumes none; released slot is reusable',
+  () =>
+    withTestTiming('capacity', async (timing) => {
+      const root = await mkdtemp(join(tmpdir(), 'workflow-capacity-'));
+      const a = new WorkflowState(root, undefined, { io: timing.io() }),
+        b = new WorkflowState(root, undefined, { io: timing.io() }),
+        episodes = new EpisodeStore(root, undefined, { io: timing.io() });
+      const attempts: WorkflowAttempt[] = [];
+      const slots: ReturnType<typeof reserveJobSlot>[] = [];
+      try {
+        for (let i = 0; i < 9; i++) {
+          timing.phase('admission', i);
+          const selected = { ...scope, sessionId: `s${i}` };
+          const attempt = start(i % 2 ? a : b, selected);
+          attempts.push(attempt);
+          const auth = await within(attempt.ready);
+          assert.ok(auth);
+          await episodes.recordSessionRetry('agy', selected.sessionId, { ...episode, session_id: selected.sessionId });
+          const binding = await a.binding(selected);
+          assert.ok(binding);
+          await a.recordBinding({ ...binding, phase: 'pending', failureEpisodeId: episode.failure_episode_id });
+          timing.phase('slot', i);
+          const slot = reserveJobSlot(i % 2 ? a : b, auth);
+          slots.push(slot);
+          const admitted = await within(slot.ready);
+          if (i < 8) {
+            assert.ok(admitted);
+            assert.equal(await admitted.valid(), true);
+          } else assert.equal(admitted, null);
+        }
+        timing.phase('run');
+        const duplicate = start(b, { ...scope, sessionId: 's0' });
+        attempts.push(duplicate);
+        const reader = await duplicate.ready;
+        assert.ok(reader);
+        assert.equal(reader.ownsGeneration, false);
+        const denied = reserveJobSlot(b, reader);
+        slots.push(denied);
+        assert.equal(await denied.ready, null);
+        timing.phase('release');
+        assert.equal(await slots[0]!.finish(), 'finished');
+        const auth = await attempts[8]!.ready;
+        assert.ok(auth);
+        const wrongState = reserveJobSlot(a, auth);
+        slots.push(wrongState);
+        assert.equal(await wrongState.ready, null);
+        const replacement = reserveJobSlot(b, auth);
+        slots.push(replacement);
+        assert.ok(await replacement.ready);
+      } finally {
+        timing.phase('cleanup');
+        for (const slot of slots) {
+          slot.close();
+          await slot.finish();
+        }
+        for (const attempt of attempts) {
+          attempt.close();
+          await attempt.finish();
+        }
+        await rm(root, { recursive: true, force: true });
+      }
+    }),
+  30_000,
+);
 
 test('one generation cannot reserve duplicate capacity while its first acquisition is pending', async () => {
   const root = await mkdtemp(join(tmpdir(), 'workflow-duplicate-slot-'));

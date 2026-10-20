@@ -99,7 +99,7 @@
           cd "$TMPDIR/project"
           export AGENT_STEWARD_BUN_CACHE_GRAPHS='${builtins.toJSON allGraphs}'
           bun run typecheck
-          bun test tests/*.test.ts
+          AGENT_STEWARD_TEST_TIMING=1 bun test tests/*.test.ts
           bun node_modules/oxlint/bin/oxlint src tests
           bun node_modules/oxfmt/bin/oxfmt --config=${./.oxfmtrc.json} --check src tests
           runHook postCheck

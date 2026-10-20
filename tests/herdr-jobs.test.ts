@@ -13,6 +13,7 @@ import { workflowSession, WorkflowState, type WorkflowScope } from '../src/herdr
 import type { Evaluation, StopInput } from '../src/contracts.ts';
 import { assessStop } from '../src/triage.ts';
 import { deferred, withinWorkflow as within } from './herdr-lease-helpers.ts';
+import { withTestTiming } from './herdr-test-timing.ts';
 
 // Integration setup and cleanup share the budget with guarded filesystem work.
 setDefaultTimeout(30_000);
@@ -810,71 +811,84 @@ test('jobs never expose sendKeys or list on the recovery transport', async () =>
   }
 });
 
-test('saturation marks the episode human without clearing counters or waiting', async () => {
-  const f = await world({ heartbeatIntervalMs: 5_000 });
-  const attempts: ReturnType<typeof beginWorkflow>[] = [];
-  const slots: ReturnType<typeof reserveJobSlot>[] = [];
-  try {
-    for (let i = 0; i < 8; i++) {
-      const selected = { ...scope, sessionId: `fill${i}` };
-      const attempt = beginWorkflow({
-        state: f.state,
-        scope: selected,
-        paneId: 'w1:p1',
-        workspaceId: 'w1',
-        permission: () => permission(false),
-        signal: new AbortController().signal,
-      });
-      attempts.push(attempt);
-      const auth = await attempt.ready;
-      assert.ok(auth);
-      await f.episodes.recordSessionRetry('agy', selected.sessionId, {
-        pane_id: 'w1:p1',
-        session_id: selected.sessionId,
-        failure_episode_id: 'a'.repeat(64),
-        error_evidence_digest: 'b'.repeat(64),
-        first_observed_at: initial,
-        attempt_count: 2,
-        last_attempt_at: initial,
-        quota_check_count: 3,
-        last_quota_check_at: initial,
-        next_check_at: '2026-09-29T10:05:00.000Z',
-        last_delivery_state: 'none',
-      });
-      const binding = await f.state.binding(selected);
-      assert.ok(binding);
-      await f.state.recordBinding({
-        ...binding,
-        phase: 'pending',
-        failureEpisodeId: 'a'.repeat(64),
-        historyPaneId: 'w1:p1',
-      });
-      const slot = reserveJobSlot(f.state, auth);
-      slots.push(slot);
-      assert.ok(await within(slot.ready));
-    }
-    const saved = await assess(f);
-    assert.equal(saved.quota_check_count, 0);
-    assert.equal(await within(runJob(f, async () => assert.fail('saturated admission must not wait'))), 'not_admitted');
-    const after = await f.state.sessionRetry(f.authority.scope);
-    assert.equal(after?.last_delivery_state, 'human');
-    assert.equal(after?.next_check_at, null);
-    assert.equal(after?.quota_check_count, 0);
-    assert.equal(after?.attempt_count, 0);
-    assert.equal(f.handoffs.length, 1);
-    assert.equal(f.counts.prompt, 0);
-  } finally {
-    for (const slot of slots) {
-      slot.close();
-      await slot.finish();
-    }
-    for (const attempt of attempts) {
-      attempt.close();
-      await attempt.finish();
-    }
-    await f.cleanup();
-  }
-}, 30_000);
+test(
+  'saturation marks the episode human without clearing counters or waiting',
+  () =>
+    withTestTiming('saturation', async (timing) => {
+      const f = await world({ heartbeatIntervalMs: 5_000, io: timing.io() });
+      const attempts: ReturnType<typeof beginWorkflow>[] = [];
+      const slots: ReturnType<typeof reserveJobSlot>[] = [];
+      try {
+        for (let i = 0; i < 8; i++) {
+          timing.phase('admission', i);
+          const selected = { ...scope, sessionId: `fill${i}` };
+          const attempt = beginWorkflow({
+            state: f.state,
+            scope: selected,
+            paneId: 'w1:p1',
+            workspaceId: 'w1',
+            permission: () => permission(false),
+            signal: new AbortController().signal,
+          });
+          attempts.push(attempt);
+          const auth = await attempt.ready;
+          assert.ok(auth);
+          await f.episodes.recordSessionRetry('agy', selected.sessionId, {
+            pane_id: 'w1:p1',
+            session_id: selected.sessionId,
+            failure_episode_id: 'a'.repeat(64),
+            error_evidence_digest: 'b'.repeat(64),
+            first_observed_at: initial,
+            attempt_count: 2,
+            last_attempt_at: initial,
+            quota_check_count: 3,
+            last_quota_check_at: initial,
+            next_check_at: '2026-09-29T10:05:00.000Z',
+            last_delivery_state: 'none',
+          });
+          const binding = await f.state.binding(selected);
+          assert.ok(binding);
+          await f.state.recordBinding({
+            ...binding,
+            phase: 'pending',
+            failureEpisodeId: 'a'.repeat(64),
+            historyPaneId: 'w1:p1',
+          });
+          timing.phase('slot', i);
+          const slot = reserveJobSlot(f.state, auth);
+          slots.push(slot);
+          assert.ok(await within(slot.ready));
+        }
+        timing.phase('assessment');
+        const saved = await assess(f);
+        assert.equal(saved.quota_check_count, 0);
+        timing.phase('run');
+        assert.equal(
+          await within(runJob(f, async () => assert.fail('saturated admission must not wait'))),
+          'not_admitted',
+        );
+        const after = await f.state.sessionRetry(f.authority.scope);
+        assert.equal(after?.last_delivery_state, 'human');
+        assert.equal(after?.next_check_at, null);
+        assert.equal(after?.quota_check_count, 0);
+        assert.equal(after?.attempt_count, 0);
+        assert.equal(f.handoffs.length, 1);
+        assert.equal(f.counts.prompt, 0);
+      } finally {
+        timing.phase('cleanup');
+        for (const slot of slots) {
+          slot.close();
+          await slot.finish();
+        }
+        for (const attempt of attempts) {
+          attempt.close();
+          await attempt.finish();
+        }
+        await f.cleanup();
+      }
+    }),
+  30_000,
+);
 
 test('already aborted job creates no slot and does not wait', async () => {
   const f = await world();

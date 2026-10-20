@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import * as entry from '../src/herdr-adapter/entry.ts';
 import { within } from './herdr-lease-helpers.ts';
+import { withTestTiming } from './herdr-test-timing.ts';
 
 const warning = 'agent-steward: release unconfirmed; shutdown incomplete. Human review required.\n';
 const sensitive = 'synthetic-token synthetic-session /sensitive/state synthetic-credential';
@@ -42,8 +43,14 @@ test('shutdown result reporter: shutdown_incomplete', () => {
   assert.equal(actual.includes('event hooks may still'), false);
 });
 
-async function childResult(source: string, milliseconds = 4_000) {
-  const child = spawn(process.execPath, ['-e', source], { stdio: ['ignore', 'pipe', 'pipe'] });
+async function childResult(source: string, milliseconds = 4_000, trace = false) {
+  const child = spawn(process.execPath, ['-e', source], {
+    env: trace ? { ...process.env, AGENT_STEWARD_TEST_TIMING_FD: '3' } : process.env,
+    stdio: trace ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
+  });
+  (child.stdio[3] as import('node:stream').Readable | undefined)?.on('data', (data) => {
+    process.stdout.write(data);
+  });
   const closed = once(child, 'close');
   let stderr = '',
     stdout = '';
@@ -158,6 +165,7 @@ async function runEventChild(
     await runHeldEvent(${JSON.stringify({ hold, signal, ...extra })});
   `,
     milliseconds,
+    hold === 'human' && process.env.AGENT_STEWARD_TEST_TIMING === '1',
   );
   const timing = /^settled (\d+(?:\.\d+)?)\n$/.exec(result.stdout);
   assert.ok(timing, result.stderr || result.stdout);
@@ -228,14 +236,21 @@ test('run.sh pause with held control publication reports incomplete', async () =
 }, 15_000);
 
 // Catches sequential slot-then-G 5s windows on internal human cleanup.
-test('runEvent internal human with held slot release reports incomplete within one 5s window', async () => {
-  const result = await runEventChild('human', null);
-  const { elapsed } = result;
-  assert.equal(result.code, 1);
-  assert.equal(result.stderr, warning);
-  assert.equal(result.stdout.startsWith('settled'), true);
-  assert.ok(elapsed >= 4_500 && elapsed < 8_000, `elapsed ${elapsed}`);
-}, 15_000);
+test(
+  'runEvent internal human with held slot release reports incomplete within one 5s window',
+  () =>
+    withTestTiming('shutdown', async (timing) => {
+      timing.phase('run');
+      const result = await runEventChild('human', null);
+      timing.phase('settled');
+      const { elapsed } = result;
+      assert.equal(result.code, 1);
+      assert.equal(result.stderr, warning);
+      assert.equal(result.stdout.startsWith('settled'), true);
+      assert.ok(elapsed >= 4_500 && elapsed < 8_000, `elapsed ${elapsed}`);
+    }),
+  15_000,
+);
 
 // Catches sequential slot-then-G 5s windows on internal lost cleanup.
 test('runEvent internal lost with held slot release reports incomplete within one 5s window', async () => {

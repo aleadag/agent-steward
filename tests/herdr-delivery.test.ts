@@ -13,6 +13,8 @@ import type { AgentSnapshot } from '../src/herdr-adapter/observe.ts';
 import type { Episode } from '../src/herdr-adapter/state.ts';
 import type { StopInput, StopResult } from '../src/contracts.ts';
 import { deferred, within } from './herdr-lease-helpers.ts';
+import { withTestTiming } from './herdr-test-timing.ts';
+import type { LeaseIO } from '../src/herdr-adapter/lease.ts';
 
 type TestHandoffReason = Parameters<EventDeps['handoff']>[0];
 const at = '2026-09-29T10:00:30Z';
@@ -1288,13 +1290,13 @@ test('due recovery does not treat a partial permission menu as a reason to poll'
   }
 });
 
-async function scopedDelivery(status: 'idle' | 'done' = 'idle') {
+async function scopedDelivery(status: 'idle' | 'done' = 'idle', io: Partial<LeaseIO> = {}) {
   const { beginWorkflow } = await import('../src/herdr-adapter/authority.ts');
   const { WorkflowState } = await import('../src/herdr-adapter/workflow-state.ts');
   const { workflowEventDeps } = await import('../src/herdr-adapter/events.ts');
   const root = await mkdtemp(join(tmpdir(), 'steward-scoped-delivery-'));
-  const state = new WorkflowState(root);
-  const store = new EpisodeStore(root);
+  const state = new WorkflowState(root, undefined, { io });
+  const store = new EpisodeStore(root, undefined, { io });
   const attempt = beginWorkflow({
     state,
     scope: {
@@ -1356,89 +1358,103 @@ async function scopedDelivery(status: 'idle' | 'done' = 'idle') {
 }
 
 for (const association of ['ambiguous', 'corrupt', 'closed_after_association', 'paused_after_association'] as const) {
-  test(`scoped ${association} legacy association has no budget or input and hands off only while authorized`, async () => {
-    const f = await scopedDelivery();
-    const held = association === 'closed_after_association' || association === 'paused_after_association';
-    const entered = deferred<void>();
-    const resume = deferred<void>();
-    let running: Promise<void> | undefined;
-    try {
-      const observed = await observeStop(f.herdr, 'w1:p1');
-      assert.ok(observed);
-      const legacy: Episode = {
-        pane_id: 'w1:p1',
-        session_id: 's1',
-        failure_episode_id: observed.current_episode_id,
-        error_evidence_digest: observed.error_evidence_digest,
-        first_observed_at: '2026-09-29T10:00:00Z',
-        attempt_count: 2,
-        last_attempt_at: '2026-09-29T10:00:20Z',
-        quota_check_count: 1,
-        last_quota_check_at: '2026-09-29T10:00:10Z',
-        next_check_at: '2026-09-29T10:05:00Z',
-        last_delivery_state: 'none',
-      };
-      await f.store.record('w1:p1', legacy);
-      if (association === 'corrupt') {
-        const path = join(f.store.directory, createHash('sha256').update('w1:p1').digest('hex') + '.json');
-        await writeFile(path, '{', { mode: 0o600 });
-      } else {
-        await f.store.record('w1:p2', { ...legacy, pane_id: 'w1:p2' });
-      }
-      if (held) {
-        const adopt = f.state.adoptLegacyRetry.bind(f.state);
-        f.state.adoptLegacyRetry = async (...args) => {
-          const result = await adopt(...args);
-          assert.equal(result, 'quarantined');
-          entered.resolve();
-          await resume.promise;
-          return result;
-        };
-      }
-      const handoffs: TestHandoffReason[] = [];
-      let decisions = 0;
-      const deps = f.workflowEventDeps(
-        {
-          herdr: f.herdr,
-          store: f.store,
-          clock: f.clock,
-          targets: 'all',
-          handoff: async (reason) => {
-            handoffs.push(reason);
-          },
-          decide: async (input) => {
-            decisions++;
-            return recovery(input);
-          },
-        },
-        f.authority,
-        f.state,
-      );
-      running = handleEvent(
-        { type: 'pane.agent_status_changed', pane_id: 'w1:p1', workspace_id: 'w1', agent: 'agy', agent_status: 'idle' },
-        deps,
-      );
-      if (held) {
-        await within(entered.promise);
-        assert.deepEqual(handoffs, []);
-        assert.equal(await f.store.sessionRetry('agy', 's1'), null);
-        if (association === 'closed_after_association') f.attempt.close();
-        else assert.equal(await f.state.pause(f.authority.scope.serverId), 'paused');
-        resume.resolve();
-      }
-      await within(running);
-      assert.equal(await f.store.sessionRetry('agy', 's1'), null);
-      assert.equal(await f.state.recoveryQuarantined(f.authority.scope), true);
-      assert.equal(decisions, ['ambiguous', 'corrupt'].includes(association) ? 1 : 0);
-      assert.deepEqual(f.herdr.writes(), []);
-      assert.deepEqual(handoffs, held ? [] : ['human_review_required']);
-      if (association !== 'corrupt') assert.deepEqual(await f.store.retry('w1:p1'), legacy);
-    } finally {
-      resume.resolve();
-      if (running) await within(running);
-      await f.cleanup();
-    }
-  });
+  test(`scoped ${association} legacy association has no budget or input and hands off only while authorized`, () =>
+    withTestTiming(
+      'legacy',
+      async (timing) => {
+        const f = await scopedDelivery('idle', timing.io());
+        timing.phase('assessment');
+        const held = association === 'closed_after_association' || association === 'paused_after_association';
+        const entered = deferred<void>();
+        const resume = deferred<void>();
+        let running: Promise<void> | undefined;
+        try {
+          const observed = await observeStop(f.herdr, 'w1:p1');
+          assert.ok(observed);
+          const legacy: Episode = {
+            pane_id: 'w1:p1',
+            session_id: 's1',
+            failure_episode_id: observed.current_episode_id,
+            error_evidence_digest: observed.error_evidence_digest,
+            first_observed_at: '2026-09-29T10:00:00Z',
+            attempt_count: 2,
+            last_attempt_at: '2026-09-29T10:00:20Z',
+            quota_check_count: 1,
+            last_quota_check_at: '2026-09-29T10:00:10Z',
+            next_check_at: '2026-09-29T10:05:00Z',
+            last_delivery_state: 'none',
+          };
+          await f.store.record('w1:p1', legacy);
+          if (association === 'corrupt') {
+            const path = join(f.store.directory, createHash('sha256').update('w1:p1').digest('hex') + '.json');
+            await writeFile(path, '{', { mode: 0o600 });
+          } else {
+            await f.store.record('w1:p2', { ...legacy, pane_id: 'w1:p2' });
+          }
+          if (held) {
+            const adopt = f.state.adoptLegacyRetry.bind(f.state);
+            f.state.adoptLegacyRetry = async (...args) => {
+              const result = await adopt(...args);
+              assert.equal(result, 'quarantined');
+              entered.resolve();
+              await resume.promise;
+              return result;
+            };
+          }
+          const handoffs: TestHandoffReason[] = [];
+          let decisions = 0;
+          const deps = f.workflowEventDeps(
+            {
+              herdr: f.herdr,
+              store: f.store,
+              clock: f.clock,
+              targets: 'all',
+              handoff: async (reason) => {
+                handoffs.push(reason);
+              },
+              decide: async (input) => {
+                decisions++;
+                return recovery(input);
+              },
+            },
+            f.authority,
+            f.state,
+          );
+          timing.phase('run');
+          running = handleEvent(
+            {
+              type: 'pane.agent_status_changed',
+              pane_id: 'w1:p1',
+              workspace_id: 'w1',
+              agent: 'agy',
+              agent_status: 'idle',
+            },
+            deps,
+          );
+          if (held) {
+            await within(entered.promise);
+            assert.deepEqual(handoffs, []);
+            assert.equal(await f.store.sessionRetry('agy', 's1'), null);
+            if (association === 'closed_after_association') f.attempt.close();
+            else assert.equal(await f.state.pause(f.authority.scope.serverId), 'paused');
+            resume.resolve();
+          }
+          await within(running);
+          assert.equal(await f.store.sessionRetry('agy', 's1'), null);
+          assert.equal(await f.state.recoveryQuarantined(f.authority.scope), true);
+          assert.equal(decisions, ['ambiguous', 'corrupt'].includes(association) ? 1 : 0);
+          assert.deepEqual(f.herdr.writes(), []);
+          assert.deepEqual(handoffs, held ? [] : ['human_review_required']);
+          if (association !== 'corrupt') assert.deepEqual(await f.store.retry('w1:p1'), legacy);
+        } finally {
+          resume.resolve();
+          timing.phase('cleanup');
+          if (running) await within(running);
+          await f.cleanup();
+        }
+      },
+      { enabled: association === 'corrupt' && process.env.AGENT_STEWARD_TEST_TIMING === '1' },
+    ));
 }
 
 test('first upgraded event preserves nonzero legacy attempt and quota counters', async () => {

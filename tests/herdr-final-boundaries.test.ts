@@ -19,6 +19,7 @@ import type { StopInput } from '../src/contracts.ts';
 import type { Evaluation } from '../src/jev.ts';
 import { withPrivateGuard } from '../src/herdr-adapter/private-files.ts';
 import { deferred, within, withinWorkflow } from './herdr-lease-helpers.ts';
+import { withTestTiming } from './herdr-test-timing.ts';
 
 // Integration setup and cleanup share the budget with guarded filesystem work.
 setDefaultTimeout(30_000);
@@ -252,90 +253,96 @@ test('approval enablement comes from authority capture, not the earlier entry pe
   }
 });
 
-test('pending last approval validation cannot invoke keys after another instance confirms pause', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'steward-final-pause-'));
-  const entered = deferred<void>(),
-    resume = deferred<void>();
-  let arm = 0,
-    keys = 0;
-  const reading = new Set<string>();
-  const state = new WorkflowState(root, undefined, {
-    io: {
-      open: async (path, flags, mode) => {
-        const handle = await open(path, flags, mode);
-        if (path.endsWith('/heartbeat.json')) {
-          reading.add(path);
-          const close = handle.close.bind(handle);
-          handle.close = async () => {
-            try {
-              await close();
-            } finally {
-              reading.delete(path);
-            }
-          };
-        }
-        return handle;
-      },
-      lstat: async (path) => {
-        const info = await lstat(path);
-        // Count complete lease inspections, not the new post-read inode check.
-        if (arm > 0 && !reading.has(path) && path.endsWith('/heartbeat.json') && --arm === 0) {
-          entered.resolve();
-          await resume.promise;
-        }
-        return info;
-      },
-    },
-  });
-  const attempt = start(state);
-  let work: Promise<void> | undefined;
-  try {
-    const authority = await attempt.ready;
-    assert.ok(authority);
-    const episodes = new EpisodeStore(root);
-    const deps = workflowEventDeps(
-      {
-        herdr: {
-          get: async () => snapshot(),
-          read: async () => {
-            if ((await episodes.approval('agy', 's1'))?.state === 'uncertain') arm = 2;
-            return {
-              pane_id: 'w1:p1',
-              source: 'detection',
-              revision: 0,
-              text: dialog,
-              truncated: false,
+test('pending last approval validation cannot invoke keys after another instance confirms pause', () =>
+  withTestTiming('approval', async (timing) => {
+    const root = await mkdtemp(join(tmpdir(), 'steward-final-pause-'));
+    const entered = deferred<void>(),
+      resume = deferred<void>();
+    let arm = 0,
+      keys = 0;
+    const reading = new Set<string>();
+    const state = new WorkflowState(root, undefined, {
+      io: timing.io({
+        open: async (path, flags, mode) => {
+          const handle = await open(path, flags, mode);
+          if (path.endsWith('/heartbeat.json')) {
+            reading.add(path);
+            const close = handle.close.bind(handle);
+            handle.close = async () => {
+              try {
+                await close();
+              } finally {
+                reading.delete(path);
+              }
             };
-          },
-          sendKeys: async () => {
-            keys++;
-          },
+          }
+          return handle;
         },
-        store: episodes,
-        autoApprove: true,
-        targets: 'all',
-        clock: { now: () => new Date() },
-        decide: (input) => decision(input),
-        handoff: async () => {},
-      },
-      authority,
-      state,
-    );
-    work = handleEvent(event, deps);
-    await within(entered.promise, 2000);
-    assert.equal(await new WorkflowState(root).pause(scope.serverId), 'paused');
-    resume.resolve();
-    await within(work, 2000);
-    assert.equal(keys, 0);
-    assert.equal((await episodes.approval('agy', 's1'))?.state, 'uncertain');
-  } finally {
-    resume.resolve();
-    await work?.catch(() => {});
-    attempt.close();
-    await attempt.finish();
-    await rm(root, { recursive: true, force: true });
-  }
-});
+        lstat: async (path) => {
+          const info = await lstat(path);
+          // Count complete lease inspections, not the new post-read inode check.
+          if (arm > 0 && !reading.has(path) && path.endsWith('/heartbeat.json') && --arm === 0) {
+            entered.resolve();
+            await resume.promise;
+          }
+          return info;
+        },
+      }),
+    });
+    timing.phase('admission');
+    const attempt = start(state);
+    let work: Promise<void> | undefined;
+    try {
+      const authority = await attempt.ready;
+      assert.ok(authority);
+      const episodes = new EpisodeStore(root);
+      const deps = workflowEventDeps(
+        {
+          herdr: {
+            get: async () => snapshot(),
+            read: async () => {
+              if ((await episodes.approval('agy', 's1'))?.state === 'uncertain') arm = 2;
+              return {
+                pane_id: 'w1:p1',
+                source: 'detection',
+                revision: 0,
+                text: dialog,
+                truncated: false,
+              };
+            },
+            sendKeys: async () => {
+              keys++;
+            },
+          },
+          store: episodes,
+          autoApprove: true,
+          targets: 'all',
+          clock: { now: () => new Date() },
+          decide: (input) => decision(input),
+          handoff: async () => {},
+        },
+        authority,
+        state,
+      );
+      timing.phase('run');
+      work = handleEvent(event, deps);
+      await within(entered.promise, 2000);
+      timing.phase('pause');
+      assert.equal(await new WorkflowState(root, undefined, { io: timing.io() }).pause(scope.serverId), 'paused');
+      timing.phase('resume');
+      resume.resolve();
+      await within(work, 2000);
+      assert.equal(keys, 0);
+      assert.equal((await episodes.approval('agy', 's1'))?.state, 'uncertain');
+    } finally {
+      resume.resolve();
+      timing.phase('cleanup');
+      await work?.catch(() => {});
+      attempt.close();
+      await attempt.finish();
+      await rm(root, { recursive: true, force: true });
+    }
+  }));
 
 for (const restricted of [false, true])
   for (const boundary of ['pause', 'generation', 'closed'] as const) {
@@ -1158,10 +1165,13 @@ for (const kind of ['approval', 'ordinary-recovery', 'job-recovery'] as const)
     }
   });
 
-async function child(args: string[], env: NodeJS.ProcessEnv = {}) {
+async function child(args: string[], env: NodeJS.ProcessEnv = {}, trace = false) {
   const processChild = spawn(process.execPath, args, {
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
+    env: trace ? { ...env, AGENT_STEWARD_TEST_TIMING: '1', AGENT_STEWARD_TEST_TIMING_FD: '3' } : env,
+    stdio: trace ? ['pipe', 'pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
+  });
+  (processChild.stdio[3] as import('node:stream').Readable | undefined)?.on('data', (data) => {
+    process.stdout.write(data);
   });
   const ready = new Promise<void>((resolve) => processChild.stdout.once('data', () => resolve()));
   let stdout = '',
@@ -1301,57 +1311,82 @@ test('held native control context refuses without publication and ignores its la
   }
 });
 
-test('eight independent diagnostic writers retain every record across healthy contention and rotation', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'steward-final-diagnostic-'));
-  const entered = deferred<void>(),
-    resume = deferred<void>();
-  const writers: Awaited<ReturnType<typeof child>>[] = [];
-  const reservation = withPrivateGuard(root, 'workflow-log-guard', async () => {
-    entered.resolve();
-    await resume.promise;
-  });
-  try {
-    await entered.promise;
-    const record = {
-      at: '2026-10-05T12:00:00Z',
-      scopeHash: 'a'.repeat(64),
-      outcome: 'created',
-      reason: null,
-    };
-    const line = JSON.stringify(record) + '\n';
-    await writeFile(join(root, 'workflow.log'), line.repeat(Math.floor(1048576 / Buffer.byteLength(line))), {
-      mode: 0o600,
-    });
-    const module = fileURLToPath(new URL('../src/herdr-adapter/diagnostics.ts', import.meta.url));
-    for (let index = 0; index < 8; index++)
-      writers.push(
-        await child([
-          '--eval',
-          `import { appendDiagnostic } from ${JSON.stringify(module)}; console.log('started'); await Bun.stdin.text(); await appendDiagnostic(${JSON.stringify(root)}, ${JSON.stringify({ ...record, scopeHash: String(index).repeat(64), outcome: 'finished', reason: 'completed' })});`,
-        ]),
+test('eight independent diagnostic writers retain every record across healthy contention and rotation', () =>
+  withTestTiming(
+    'diagnostics',
+    async (timing) => {
+      const root = await mkdtemp(join(tmpdir(), 'steward-final-diagnostic-'));
+      const entered = deferred<void>(),
+        resume = deferred<void>();
+      const writers: Awaited<ReturnType<typeof child>>[] = [];
+      const reservation = withPrivateGuard(
+        root,
+        'workflow-log-guard',
+        async () => {
+          entered.resolve();
+          await resume.promise;
+        },
+        { io: timing.io() },
       );
-    await withinWorkflow(Promise.all(writers.map((writer) => writer.ready)));
-    for (const writer of writers) writer.stdin.end('go\n');
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    resume.resolve();
-    await reservation;
-    for (const writer of writers) {
-      const result = await within(writer.result, 3000);
-      assert.equal(result.code, 0, result.stderr);
-    }
-    const records = (await readFile(join(root, 'workflow.log'), 'utf8'))
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line).scopeHash);
-    assert.deepEqual(
-      records.sort(),
-      Array.from({ length: 8 }, (_, index) => String(index).repeat(64)),
-    );
-    assert.ok((await readFile(join(root, 'workflow.log.1'), 'utf8')).includes('a'.repeat(64)));
-  } finally {
-    resume.resolve();
-    await reservation;
-    for (const writer of writers) writer.stop();
-    await rm(root, { recursive: true, force: true });
-  }
-});
+      try {
+        await entered.promise;
+        const record = {
+          at: '2026-10-05T12:00:00Z',
+          scopeHash: 'a'.repeat(64),
+          outcome: 'created',
+          reason: null,
+        };
+        const line = JSON.stringify(record) + '\n';
+        await writeFile(join(root, 'workflow.log'), line.repeat(Math.floor(1048576 / Buffer.byteLength(line))), {
+          mode: 0o600,
+        });
+        const module = fileURLToPath(new URL('../src/herdr-adapter/diagnostics.ts', import.meta.url));
+        const timingModule = new URL('./herdr-test-timing.ts', import.meta.url).href;
+        timing.phase('writers');
+        for (let index = 0; index < 8; index++)
+          writers.push(
+            await child(
+              [
+                '--eval',
+                `import { appendDiagnostic } from ${JSON.stringify(module)};
+           import { withTestTiming } from ${JSON.stringify(timingModule)};
+           await withTestTiming('diagnostics', async (timing) => {
+             timing.phase('writers'); console.log('started'); await Bun.stdin.text();
+             timing.phase('run');
+             await appendDiagnostic(${JSON.stringify(root)}, ${JSON.stringify({ ...record, scopeHash: String(index).repeat(64), outcome: 'finished', reason: 'completed' })}, { io: timing.io() });
+           }, { worker: ${index} });`,
+              ],
+              {},
+              process.env.AGENT_STEWARD_TEST_TIMING === '1',
+            ),
+          );
+        await withinWorkflow(Promise.all(writers.map((writer) => writer.ready)));
+        timing.phase('run');
+        for (const writer of writers) writer.stdin.end('go\n');
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        timing.phase('release');
+        resume.resolve();
+        await reservation;
+        for (const writer of writers) {
+          const result = await within(writer.result, 3000);
+          assert.equal(result.code, 0, result.stderr);
+        }
+        const records = (await readFile(join(root, 'workflow.log'), 'utf8'))
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line).scopeHash);
+        assert.deepEqual(
+          records.sort(),
+          Array.from({ length: 8 }, (_, index) => String(index).repeat(64)),
+        );
+        assert.ok((await readFile(join(root, 'workflow.log.1'), 'utf8')).includes('a'.repeat(64)));
+      } finally {
+        resume.resolve();
+        timing.phase('cleanup');
+        await reservation;
+        for (const writer of writers) writer.stop();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    { worker: 8 },
+  ));
