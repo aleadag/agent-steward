@@ -1,10 +1,86 @@
 import assert from 'node:assert/strict';
 import { test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
 
 const workflow = readFileSync(new URL('../.github/workflows/native.yml', import.meta.url), 'utf8');
 const flake = readFileSync(new URL('../flake.nix', import.meta.url), 'utf8');
 const approvedFallbackQuery = /^[ \t]*nix config show sandbox-fallback[ \t]*$/gm;
+
+function runNativeNixSteps(fullSuiteExit = 0) {
+  let previous = -1;
+  const scripts = ['Native Nix gates', 'Full Nix test suite', 'Native flake checks'].map((name) => {
+    const start = workflow.indexOf(`      - name: ${name}\n`);
+    assert.ok(start >= 0, `missing native test stage: ${name}`);
+    assert.ok(start > previous, `native test stage out of order: ${name}`);
+    previous = start;
+    const next = workflow.indexOf('      - name:', start + 1);
+    const step = workflow.slice(start, next < 0 ? undefined : next);
+    const block = /        run: \|\n((?:          [^\n]*\n?)+)/.exec(step);
+    assert.ok(block, `missing runnable native test stage: ${name}`);
+    return block[1].replace(/^          /gm, '').replaceAll('${{ matrix.system }}', 'x86_64-linux');
+  });
+  const root = mkdtempSync(join(tmpdir(), 'steward-native-gates-'));
+  const log = join(root, 'calls.jsonl');
+  try {
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    const nix = join(bin, 'nix');
+    writeFileSync(
+      nix,
+      `#!${process.execPath}
+import { appendFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+appendFileSync(process.env.CALL_LOG, JSON.stringify(args) + '\\n');
+if (args.some((arg) => arg.endsWith('.full-suite'))) process.exit(Number(process.env.FULL_SUITE_EXIT));
+`,
+    );
+    chmodSync(nix, 0o700);
+    const result = spawnSync('bash', ['-euo', 'pipefail', '-c', scripts.join('\n')], {
+      env: {
+        ...process.env,
+        PATH: `${bin}${delimiter}${process.env.PATH}`,
+        CALL_LOG: log,
+        FULL_SUITE_EXIT: String(fullSuiteExit),
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    assert.equal(result.error, undefined);
+    return {
+      code: result.status,
+      stderr: result.stderr,
+      calls: readFileSync(log, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line)),
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('native CI executes the full suite before installed flake checks with one build job', () => {
+  const result = runNativeNixSteps();
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.calls.length, 5);
+  assert.ok(result.calls[0].includes('path:.#agent-steward'));
+  assert.ok(result.calls[1].includes('path:.#default'));
+  assert.equal(result.calls[2][0], 'run');
+  assert.ok(result.calls[3].includes('path:.#checks.x86_64-linux.full-suite'));
+  assert.deepEqual(result.calls[3].slice(-4), ['--no-link', '--max-jobs', '1', '-L']);
+  assert.deepEqual(result.calls[4].slice(0, 2), ['flake', 'check']);
+  assert.deepEqual(result.calls[4].slice(-3), ['--max-jobs', '1', '-L']);
+});
+
+test('a failed full-suite check fails native CI rather than continuing to installed checks', () => {
+  const result = runNativeNixSteps(17);
+  assert.equal(result.code, 17, result.stderr);
+  assert.equal(result.calls.length, 4);
+  assert.ok(result.calls.at(-1).includes('path:.#checks.x86_64-linux.full-suite'));
+});
 
 function assertNativeWorkflowHasNoUnapprovedFallbacks(source) {
   assert.doesNotMatch(

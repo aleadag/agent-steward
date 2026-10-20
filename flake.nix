@@ -67,6 +67,7 @@
         src = source;
         nativeBuildInputs = [ pkgs.bun pkgs.bash pkgs.coreutils pkgs.makeWrapper ];
         doCheck = true;
+        agentStewardTestScope = "core";
         dontConfigure = true;
         buildPhase = ''
           runHook preBuild
@@ -99,7 +100,7 @@
           cd "$TMPDIR/project"
           export AGENT_STEWARD_BUN_CACHE_GRAPHS='${builtins.toJSON allGraphs}'
           bun run typecheck
-          AGENT_STEWARD_TEST_TIMING=1 bun test tests/*.test.ts
+          bash tests/package-checks.sh "$agentStewardTestScope"
           bun node_modules/oxlint/bin/oxlint src tests
           bun node_modules/oxfmt/bin/oxfmt --config=${./.oxfmtrc.json} --check src tests
           runHook postCheck
@@ -157,6 +158,10 @@
         app = { type = "app"; program = "${package}/bin/agent-steward"; };
         checks = {
           build = package;
+          full-suite = package.overrideAttrs {
+            pname = "agent-steward-full-suite";
+            agentStewardTestScope = "full";
+          };
           steward-spawn = pkgs.runCommand "steward-spawn-check" {
             nativeBuildInputs = [ pkgs.bun pkgs.bash pkgs.coreutils ];
           } ''

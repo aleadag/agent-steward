@@ -23,12 +23,21 @@ nix flake check path:. --no-update-lock-file
 
 `bun run lint` runs Oxlint on `src` and `tests`; `bun run format:check` checks those files with Oxfmt. Run `bun run format` to apply formatting. TypeScript validation remains in `bun run typecheck`.
 
+Package builds run the core test allowlist in `tests/package-checks.sh`, typecheck, lint, formatting, and a compiled CLI help smoke test. They do not run the full process, socket, PTY, lease-contention, or shutdown suites. To run the complete source test suite in its own offline Nix check:
+
+```sh
+system=$(nix eval --impure --raw --expr builtins.currentSystem)
+nix build "path:.#checks.${system}.full-suite" --no-update-lock-file --no-link --max-jobs 1 -L
+```
+
+`nix flake check` includes that full-suite check and the existing installed-package checks. Native CI runs the full-suite Nix check separately before the remaining flake checks, with one Nix build job at a time; a failure still fails the native job. Keep the native CI status required for merges and releases. A successful package build alone does not certify integration behavior, and this split does not resolve the outstanding timing-sensitive failures or change runtime safety checks.
+
 The package installs `result/bin/agent-steward` and `result/bin/agent-steward-herdr-adapter`, bundles the skill at `share/agent-steward/skills/agent-steward/SKILL.md`, and ships the disabled Herdr plugins at `share/agent-steward/herdr-plugins/`. Both wrappers use the package-local Bun runtime. The TypeScript sources compile to `lib/agent-steward/dist/src/**/*.js`; the wrappers run that JavaScript with Bun. Source and emitted files retain Bun-compatible `node:` API imports, so a separate Node executable is not required. Offline checks do not need credentials, agent executables, user configuration, or live Jev access.
 
 ### Unreleased platform support
 
 This development flake exports packages, the default app, a development shell,
-and build/installed checks for `x86_64-linux`, `aarch64-linux`
+and core/full-suite/installed checks for `x86_64-linux`, `aarch64-linux`
 and `aarch64-darwin`. Release `v0.1.0-alpha.8` is validated for x86_64-linux only;
 aarch64-linux and Darwin native validation remain outstanding. The published
 `v0.1.0-alpha.3` tag is unchanged. Portable packaging is unreleased and is not a

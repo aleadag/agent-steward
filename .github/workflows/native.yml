@@ -125,4 +125,13 @@ jobs:
           nix build path:.#agent-steward --no-update-lock-file --no-link -L
           nix build path:.#default --no-update-lock-file --no-link -L
           nix run path:. --no-update-lock-file -- --help
-          nix flake check path:. --no-update-lock-file -L
+      - name: Full Nix test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix build "path:.#checks.${{ matrix.system }}.full-suite" --no-update-lock-file --no-link --max-jobs 1 -L
+      - name: Native flake checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix flake check path:. --no-update-lock-file --max-jobs 1 -L
