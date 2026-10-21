@@ -279,6 +279,7 @@ for (const revoked of ['permission', 'pause'] as const)
 for (const agent of ['pi', 'codex', 'agy'] as const)
   test(`${agent}: classified completion re-arms future recovery without touching old quarantine`, async () => {
     const f = await fixture(agent);
+    const heartbeat = setInterval(() => f.beat(), 5000);
     try {
       const observed = await observeStop(f.herdr, 'w1:p1');
       assert.ok(observed);
@@ -316,6 +317,7 @@ for (const agent of ['pi', 'codex', 'agy'] as const)
       assert.equal((await f.state.sessionRetry(f.scope))?.attempt_count, 1);
       assert.deepEqual(await Promise.all([readFile(marker), readFile(legacy)]), before);
     } finally {
+      clearInterval(heartbeat);
       await f.finish();
     }
   });
@@ -323,6 +325,7 @@ for (const agent of ['pi', 'codex', 'agy'] as const)
 // Resetting on idle/revision changes or failing to carry budgets breaks this test.
 test('unresolved failures share three attempts, then fresh classified completion starts a new budget', async () => {
   const f = await fixture();
+  const heartbeat = setInterval(() => f.beat(), 5000);
   try {
     for (const [index, delay] of [30_000, 120_000, 480_000].entries()) {
       if (index) f.change();
@@ -349,6 +352,7 @@ test('unresolved failures share three attempts, then fresh classified completion
     await f.stop(true);
     assert.equal(f.prompts.length, 4);
   } finally {
+    clearInterval(heartbeat);
     await f.finish();
   }
 });
