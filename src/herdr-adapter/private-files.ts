@@ -39,38 +39,45 @@ export async function withPrivateGuard<T>(
   name: string,
   action: (assertGuard: () => Promise<void>) => Promise<T>,
   options: LeaseOptions = {},
+  wait?: { deadline: number; open: () => boolean },
 ): Promise<T | null> {
   if (name === '' || name === '.' || name === '..' || basename(name) !== name) throw unsafe();
   const io = ioFor(options);
   const parent = await privateDirectory(directory, options);
   const path = join(directory, name);
   let handle: FileHandle;
-  try {
-    handle = await io.open(
-      path,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-      0o600,
-    );
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    await checkParent(directory, parent, options);
+  for (;;) {
+    if (wait && (!wait.open() || performance.now() >= wait.deadline)) return null;
+    if (wait) await checkParent(directory, parent, options);
     try {
-      const info = await io.lstat(path);
-      const uid = process.getuid?.();
-      // A live exclusive create may not be chmod'd yet. Observing an owned regular
-      // file is contention; we never acquire or write through it. Symlinks, other
-      // owners, and a replaced parent stay unsafe.
-      if (uid === undefined || !info.isFile() || info.uid !== uid) throw unsafe();
+      handle = await io.open(
+        path,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      break;
     } catch (error) {
-      if (!isMissing(error)) throw error;
-      // The competing holder may just have removed its guard. Only this
-      // disappearance is contention; a missing/replaced parent is still unsafe.
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       await checkParent(directory, parent, options);
+      try {
+        const info = await io.lstat(path);
+        const uid = process.getuid?.();
+        // A live exclusive create may not be chmod'd yet. Observing an owned regular
+        // file is contention; we never acquire or write through it. Symlinks, other
+        // owners, and a replaced parent stay unsafe.
+        if (uid === undefined || !info.isFile() || info.uid !== uid) throw unsafe();
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+        // The competing holder may just have removed its guard. Only this
+        // disappearance is contention; a missing/replaced parent is still unsafe.
+        await checkParent(directory, parent, options);
+      }
+      if (!wait || !wait.open() || performance.now() >= wait.deadline) return null;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(10, wait.deadline - performance.now())));
     }
-    return null;
   }
   let original: Stats | undefined;
-  let result: T | undefined;
+  let result: T | null | undefined;
   let failure: unknown;
   try {
     await handle.chmod(0o600);
@@ -81,9 +88,13 @@ export async function withPrivateGuard<T>(
       await checkFile(path, identity, options);
     };
     await assertGuard();
-    result = await publicationGuards.run([...(publicationGuards.getStore() ?? []), assertGuard], () =>
-      action(assertGuard),
-    );
+    // Retry acquisition only: an admitted action is invoked at most once.
+    result =
+      wait && (!wait.open() || performance.now() >= wait.deadline)
+        ? null
+        : await publicationGuards.run([...(publicationGuards.getStore() ?? []), assertGuard], () =>
+            action(assertGuard),
+          );
   } catch (error) {
     failure = error;
   }
