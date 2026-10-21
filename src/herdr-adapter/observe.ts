@@ -42,6 +42,18 @@ export type ObservedStop = {
   capture_lines?: number;
 };
 
+export type ObservedWorking = Pick<
+  ObservedStop,
+  | 'pane_id'
+  | 'workspace_id'
+  | 'agent'
+  | 'session_id'
+  | 'session_kind'
+  | 'session_source'
+  | 'revision'
+  | 'state_change_seq'
+> & { status: 'working' };
+
 export const observationPhases = ['request', 'before', 'read', 'after'] as const;
 export const observationReasons = [
   'pane_invalid',
@@ -111,10 +123,15 @@ function identity(
   pane: AgentSnapshot,
   paneId: string,
   reject: (reason: ObservationRejection['reason']) => null,
+  working = false,
 ): string | null {
   const session = pane.agent_session;
   if (pane.pane_id !== paneId) return reject('pane_mismatch');
-  if (pane.agent_status !== 'blocked' && pane.agent_status !== 'idle' && pane.agent_status !== 'done')
+  if (
+    working
+      ? pane.agent_status !== 'working'
+      : pane.agent_status !== 'blocked' && pane.agent_status !== 'idle' && pane.agent_status !== 'done'
+  )
     return reject('status_ineligible');
   if (!Number.isSafeInteger(pane.revision)) return reject('revision_invalid');
   if (!Number.isSafeInteger(pane.state_change_seq)) return reject('sequence_invalid');
@@ -166,6 +183,25 @@ export function checkDetectionRead(
     return reject('credentials');
   }
   return Buffer.byteLength(read.text, 'utf8') > 2048 ? reject('byte_limit', 'oversized') : 'valid';
+}
+
+// Status is best-effort activity evidence, not proof that an operation succeeded.
+export async function observeWorking(herdr: HerdrReader, paneId: string): Promise<ObservedWorking | null> {
+  const before = await herdr.get(paneId);
+  if (!before) return null;
+  const sessionId = identity(before, paneId, () => null, true);
+  if (!sessionId || before.state_change_seq < 0) return null;
+  return {
+    pane_id: paneId,
+    workspace_id: before.workspace_id,
+    agent: before.agent!,
+    session_id: sessionId,
+    session_kind: before.agent_session!.kind,
+    session_source: before.agent_session!.source,
+    status: 'working',
+    revision: before.revision,
+    state_change_seq: before.state_change_seq,
+  };
 }
 
 export async function observeStop(

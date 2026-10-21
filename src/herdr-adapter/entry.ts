@@ -16,9 +16,10 @@ import { handleEvent, normalizeEvent, workflowEventDeps, type EventDeps, type Ev
 import { runEpisodeJob, type JobOptions } from './jobs.ts';
 import { checkDetectionRead, type HerdrReader, type AgentSnapshot, type ReadSnapshot } from './observe.ts';
 import { quotaResetHint, type QuotaHint } from './quota-hint.ts';
-import { EpisodeStore, type Episode } from './state.ts';
+import { canResetAfterWorking, EpisodeStore, type Episode } from './state.ts';
 import {
   validateWorkflowScope,
+  recoveryResetAfterSecondsSchema,
   workflowSession,
   WorkflowState,
   type ControlResult,
@@ -370,7 +371,7 @@ function quotaHintFrom(env: NodeJS.ProcessEnv): QuotaHint {
 
 async function adapterConfigFrom(
   env: NodeJS.ProcessEnv,
-): Promise<{ targets: readonly string[] | 'all'; autoApprove: boolean } | null> {
+): Promise<Pick<RuntimePermission, 'targets' | 'autoApprove' | 'recoveryResetAfterSeconds'> | null> {
   if (!env.HERDR_PLUGIN_CONFIG_DIR) return null;
   const path = join(env.HERDR_PLUGIN_CONFIG_DIR, 'targets.json');
   let text: string;
@@ -386,11 +387,17 @@ async function adapterConfigFrom(
     return null;
   }
   if (!config || typeof config !== 'object' || Array.isArray(config)) return null;
-  const body = config as { pane_ids?: unknown; auto_approve?: unknown };
+  const body = config as { pane_ids?: unknown; auto_approve?: unknown; recovery_reset_after_seconds?: unknown };
+  const duration = recoveryResetAfterSecondsSchema.safeParse(body.recovery_reset_after_seconds);
+  if (!duration.success) return null;
+  const settings = {
+    autoApprove: body.auto_approve === true,
+    ...(Object.hasOwn(body, 'recovery_reset_after_seconds') ? { recoveryResetAfterSeconds: duration.data } : {}),
+  };
   if (!Object.hasOwn(body, 'pane_ids') || (Array.isArray(body.pane_ids) && body.pane_ids.length === 0))
-    return { targets: 'all', autoApprove: body.auto_approve === true };
+    return { targets: 'all', ...settings };
   if (!Array.isArray(body.pane_ids) || !body.pane_ids.every((id) => typeof id === 'string')) return null;
-  return { targets: body.pane_ids, autoApprove: body.auto_approve === true };
+  return { targets: body.pane_ids, ...settings };
 }
 
 export async function readPluginContext(
@@ -457,7 +464,7 @@ export async function readRuntimePermission(env: NodeJS.ProcessEnv): Promise<Run
   const config = await adapterConfigFrom(env);
   if (!config) return null;
   if (!env.HERDR_SOCKET_PATH || (await socketSession(env.HERDR_SOCKET_PATH)) !== context.serverId) return null;
-  return { serverId: context.serverId, enabled: true, targets: config.targets, autoApprove: config.autoApprove };
+  return { serverId: context.serverId, enabled: true, ...config };
 }
 
 export type EventRunOptions = {
@@ -761,6 +768,28 @@ export async function runEvent(
         episodes,
         deps,
         binding,
+        signal: attempt.signal,
+        ...(options.wait ? { wait: options.wait } : {}),
+      });
+      const result = await jobWork;
+      if (result !== 'finished') return result;
+    }
+    if (
+      authority.ownsGeneration &&
+      (event.agent_status === 'working' || jobWork) &&
+      authority.admissionOpen() &&
+      canResetAfterWorking(await state.sessionRetry(live.scope)) &&
+      !(await state.recoveryQuarantined(live.scope))
+    ) {
+      const current = await state.binding(live.scope);
+      if (!current) return 'finished';
+      jobWork = runEpisodeJob({
+        kind: 'progress',
+        state,
+        authority,
+        episodes,
+        deps,
+        binding: current,
         signal: attempt.signal,
         ...(options.wait ? { wait: options.wait } : {}),
       });

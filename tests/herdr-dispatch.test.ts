@@ -233,7 +233,12 @@ async function pluginWorld(
 async function seedBoundEpisode(
   directory: string,
   serverId: string,
-  overrides: { sessionId?: string; paneId?: string; delivery?: Episode['last_delivery_state'] } = {},
+  overrides: {
+    sessionId?: string;
+    paneId?: string;
+    delivery?: Episode['last_delivery_state'];
+    confirmedApi?: boolean;
+  } = {},
 ) {
   const sessionId = overrides.sessionId ?? 's1';
   const paneId = overrides.paneId ?? 'w1:p1';
@@ -255,14 +260,27 @@ async function seedBoundEpisode(
     failure_episode_id: 'a'.repeat(64),
     error_evidence_digest: 'b'.repeat(64),
     first_observed_at: '2026-10-05T00:00:00Z',
-    attempt_count: 0,
-    last_attempt_at: null,
+    attempt_count: overrides.confirmedApi ? 3 : 0,
+    last_attempt_at: overrides.confirmedApi ? '2026-10-05T00:00:30Z' : null,
     quota_check_count: 0,
     last_quota_check_at: null,
     next_check_at: overrides.delivery && overrides.delivery !== 'none' ? null : '2099-01-01T00:00:00Z',
     last_delivery_state: overrides.delivery ?? 'none',
   };
-  await new EpisodeStore(directory).recordSessionRetry(scope.agent, scope.sessionId, episode);
+  const episodes = new EpisodeStore(directory);
+  if (overrides.confirmedApi) {
+    const pending: Episode = {
+      ...episode,
+      attempt_count: 0,
+      last_attempt_at: null,
+      last_delivery_state: 'none',
+      next_check_at: null,
+    };
+    await episodes.advanceSessionRetry(scope.agent, scope.sessionId, pending, null);
+    await state.publishPendingRecoveryProvenance(scope, ticket, token, paneId, paneId.split(':')[0]!, pending);
+    episode.workflow_episode_id = (await episodes.sessionRetry(scope.agent, scope.sessionId))!.workflow_episode_id;
+  }
+  await episodes.recordSessionRetry(scope.agent, scope.sessionId, episode);
   await state.recordBinding({
     protocol: 1,
     scope,
@@ -431,6 +449,58 @@ test('readRuntimePermission requires enablement and does not widen malformed tar
     await malformed.close();
     await listed.close();
     await linked.close();
+  }
+});
+
+for (const value of [1, 5, 60, 2_147_483, 0, -1, 0.5, '60', null, 2_147_484])
+  test(`recovery reset duration validates ${JSON.stringify(value)}`, async () => {
+    const world = await pluginWorld({ config: { recovery_reset_after_seconds: value } });
+    try {
+      const { readRuntimePermission } = await import('../src/herdr-adapter/entry.ts');
+      const permission = await readRuntimePermission(world.env);
+      if (typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 2_147_483)
+        assert.equal(permission?.recoveryResetAfterSeconds, value);
+      else assert.equal(permission, null);
+    } finally {
+      await world.close();
+    }
+  });
+
+test('a real working hook confirms the configured window without evaluator or pane reads', async () => {
+  const world = await pluginWorld({
+    config: { recovery_reset_after_seconds: 1 },
+    snapshot: snapshot({ agent_status: 'working' }),
+  });
+  try {
+    const seeded = await seedBoundEpisode(world.state, world.serverId, { delivery: 'delivered', confirmedApi: true });
+    await seeded.state.lease(seeded.scope).release(seeded.token);
+    const { runEvent } = await import('../src/herdr-adapter/entry.ts');
+    let decisions = 0;
+    await runEvent(
+      {
+        ...world.env,
+        HERDR_PLUGIN_EVENT_JSON: JSON.stringify({
+          type: 'pane.agent_status_changed',
+          pane_id: 'w1:p1',
+          workspace_id: 'w1',
+          agent: 'agy',
+          agent_status: 'working',
+        }),
+      },
+      async () => {
+        decisions++;
+        throw new Error('working must not call Jev');
+      },
+    );
+    assert.equal(decisions, 0);
+    assert.equal(await seeded.state.sessionRetry(seeded.scope), null);
+    assert.equal(
+      world.methods.some(({ method }) => method === 'pane.read' || method === 'pane.read_detection'),
+      false,
+    );
+    assert.equal(world.methods.filter(({ method }) => method === 'agent.get').length, 4);
+  } finally {
+    await world.close();
   }
 });
 

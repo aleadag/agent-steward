@@ -6,7 +6,14 @@ import { SchedulerLeaseStore, type LeaseOptions } from './lease.ts';
 import { assertNoCredentials, configuredApiKeys } from '../privacy.ts';
 import type { ObservedStop } from './observe.ts';
 import { readPrivateJson, withPrivateGuard, writePrivateJson } from './private-files.ts';
-import { EpisodeStore, parseEpisode, readEpisodeLockOwner, workflowEpisodeId, type Episode } from './state.ts';
+import {
+  canResetAfterWorking,
+  EpisodeStore,
+  parseEpisode,
+  readEpisodeLockOwner,
+  workflowEpisodeId,
+  type Episode,
+} from './state.ts';
 
 export type WorkflowScope = {
   serverId: string;
@@ -18,11 +25,13 @@ export type WorkflowScope = {
 export type AdmissionTicket = { serverId: string; epoch: string };
 export type ControlResult = 'paused' | 'resumed' | 'denied' | 'shutdown_incomplete';
 export type WorkflowResult = 'finished' | 'stopped' | 'not_admitted' | 'shutdown_incomplete';
+export const recoveryResetAfterSecondsSchema = z.number().int().min(1).max(2_147_483).default(60);
 export type RuntimePermission = {
   serverId: string;
   enabled: boolean;
   targets: readonly string[] | 'all';
   autoApprove: boolean;
+  recoveryResetAfterSeconds?: number;
 };
 export type WorkflowBinding = {
   protocol: 1;
@@ -356,7 +365,7 @@ export class WorkflowState {
           if (
             requested.phase === 'pending' &&
             (!episode ||
-              !recoverable(episode) ||
+              (!recoverable(episode) && !canResetAfterWorking(episode)) ||
               episode.pane_id !== selected.historyPaneId ||
               episode.pane_id !== selected.paneId ||
               workflowEpisodeId(episode) !== selected.failureEpisodeId ||

@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { appendDiagnostic, type DiagnosticEvent } from './diagnostics.ts';
-import { EpisodeStore, parseEpisode, workflowEpisodeId, type Episode } from './state.ts';
+import { canResetAfterWorking, EpisodeStore, parseEpisode, workflowEpisodeId, type Episode } from './state.ts';
 import { assertNoCredentials, configuredApiKeys } from '../privacy.ts';
 import type { LeaseAttempt, SchedulerLeaseStore } from './lease.ts';
 import {
   validateWorkflowScope,
+  recoveryResetAfterSecondsSchema,
   workflowSession,
   type AdmissionTicket,
   type WorkflowBinding,
@@ -61,6 +62,7 @@ export type JobSlot = {
   // Caller holds pane -> retry-session locks. Only this admitted writer may
   // advance the captured history proof, including uncertainty before input.
   record(episode: Episode): Promise<void>;
+  completeWorking(observationId: string): Promise<void>;
   dispatch(effect: () => Promise<void>): Promise<void>;
 };
 export type JobSlotAttempt = {
@@ -176,6 +178,7 @@ function permitted(
     permission.serverId === scope.serverId &&
     permission.enabled === true &&
     typeof permission.autoApprove === 'boolean' &&
+    recoveryResetAfterSecondsSchema.safeParse(permission.recoveryResetAfterSeconds).success &&
     (permission.targets === 'all' ||
       (Array.isArray(permission.targets) &&
         permission.targets.every((target) => typeof target === 'string') &&
@@ -218,7 +221,13 @@ export function beginWorkflow(options: AuthorityOptions): WorkflowAttempt {
         ...initial,
         targets: initial.targets === 'all' ? ('all' as const) : Object.freeze([...initial.targets]),
       });
-      const snapshot = JSON.stringify({ autoApprove: permission.autoApprove, targets: permission.targets });
+      const permissionSnapshot = (value: RuntimePermission) =>
+        JSON.stringify({
+          autoApprove: value.autoApprove,
+          targets: value.targets,
+          recoveryResetAfterSeconds: value.recoveryResetAfterSeconds ?? 60,
+        });
+      const snapshot = permissionSnapshot(permission);
       if (!(await options.state.legacyInactive()) || !lifetime.open()) {
         lifetime.close('not_admitted');
         return null;
@@ -278,7 +287,7 @@ export function beginWorkflow(options: AuthorityOptions): WorkflowAttempt {
             allowed =
               lifetime.open() &&
               permitted(current, scope, options.paneId) &&
-              JSON.stringify({ autoApprove: current.autoApprove, targets: current.targets }) === snapshot &&
+              permissionSnapshot(current) === snapshot &&
               (await options.state.matches(ticket)) &&
               (await options.state.legacyInactive()) &&
               (await lease.leaseMatches(generation, workflowSession(scope))) &&
@@ -383,7 +392,11 @@ export function beginWorkflow(options: AuthorityOptions): WorkflowAttempt {
   };
 }
 
-export function reserveJobSlot(state: WorkflowState, authority: WorkflowAuthority): JobSlotAttempt {
+export function reserveJobSlot(
+  state: WorkflowState,
+  authority: WorkflowAuthority,
+  kind: 'recovery' | 'progress' = 'recovery',
+): JobSlotAttempt {
   const parent = controls.get(authority);
   const lifetime = new Lifetime(parent?.options.shutdownDeadline);
   if (
@@ -423,6 +436,7 @@ export function reserveJobSlot(state: WorkflowState, authority: WorkflowAuthorit
     const binding = await state.binding(authority.scope);
     const episode = await state.sessionRetry(authority.scope);
     const successor =
+      kind === 'recovery' &&
       bindingProof !== undefined &&
       previousProof !== undefined &&
       episode !== null &&
@@ -446,9 +460,11 @@ export function reserveJobSlot(state: WorkflowState, authority: WorkflowAuthorit
             (proof) => proof !== undefined && isDeepStrictEqual(episode, proof),
           ) ||
             successor)
-        : episode.last_delivery_state === 'none' &&
-          episode.next_check_at !== null &&
-          episode.lifecycle_handoff_sent !== true) &&
+        : kind === 'progress'
+          ? canResetAfterWorking(episode)
+          : episode.last_delivery_state === 'none' &&
+            episode.next_check_at !== null &&
+            episode.lifecycle_handoff_sent !== true) &&
       !(await state.recoveryQuarantined(authority.scope));
     if (matches && !bindingProof) {
       bindingProof = binding!;
@@ -548,6 +564,16 @@ export function reserveJobSlot(state: WorkflowState, authority: WorkflowAuthorit
         },
         valid,
         dispatch,
+        completeWorking: async (observationId) => {
+          if (kind !== 'progress' || !historyProof || !(await valid())) throw new Error('lost progress authority');
+          const previous = historyProof;
+          await authority.dispatch(
+            'completion',
+            () =>
+              episodes.completeSessionRetry(authority.scope.agent, authority.scope.sessionId, observationId, previous),
+            proof,
+          );
+        },
         record: async (episode) => {
           const next = parseEpisode({
             ...episode,

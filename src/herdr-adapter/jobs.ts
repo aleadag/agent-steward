@@ -3,11 +3,12 @@ import { isDeepStrictEqual } from 'node:util';
 import { reserveJobSlot, type JobSlot, type WorkflowAuthority } from './authority.ts';
 import { appendDiagnostic, type DiagnosticEvent } from './diagnostics.ts';
 import { handleEvent, workflowEventDeps, type EventDeps } from './events.ts';
-import { observeStop } from './observe.ts';
-import { workflowEpisodeId, type Episode, type EpisodeStore } from './state.ts';
+import { observeStop, observeWorking, type ObservedWorking } from './observe.ts';
+import { canResetAfterWorking, workflowEpisodeId, type Episode, type EpisodeStore } from './state.ts';
 import type { WorkflowBinding, WorkflowResult, WorkflowState } from './workflow-state.ts';
 
 export type JobOptions = {
+  kind?: 'recovery' | 'progress';
   state: WorkflowState;
   authority: WorkflowAuthority;
   episodes: EpisodeStore;
@@ -85,6 +86,16 @@ export async function runEpisodeJob(options: JobOptions): Promise<WorkflowResult
   const scope = options.authority.scope;
   const retryKey = 'retry-session:' + JSON.stringify([scope.agent, scope.sessionId]);
   const wait = options.wait ?? defaultWait;
+  const progress = options.kind === 'progress';
+  const eligible = progress ? canResetAfterWorking : recoverable;
+  const sameSubject = (seen: ObservedWorking | null): seen is ObservedWorking =>
+    seen !== null &&
+    seen.pane_id === paneId &&
+    seen.workspace_id === options.binding.workspaceId &&
+    seen.agent === scope.agent &&
+    seen.session_id === scope.sessionId &&
+    seen.session_kind === scope.sessionKind &&
+    seen.session_source === scope.sessionSource;
   const scopeHash = createHash('sha256')
     .update(JSON.stringify([scope.serverId, scope.agent, scope.sessionId]))
     .digest('hex');
@@ -125,11 +136,13 @@ export async function runEpisodeJob(options: JobOptions): Promise<WorkflowResult
     )
       return 'not_admitted';
 
+    const working = progress ? await observeWorking(options.deps.herdr, paneId) : null;
+    if (progress && !sameSubject(working)) return 'finished';
     const ready = await options.episodes.withEpisodeLock(paneId, async (): Promise<JobSlot | WorkflowResult> => {
       if (!(await valid())) return 'stopped';
       const episode = await options.state.sessionRetry(scope);
       if (!open()) return 'stopped';
-      if (!recoverable(episode) || (await options.state.recoveryQuarantined(scope))) return 'not_admitted';
+      if (!eligible(episode) || (await options.state.recoveryQuarantined(scope))) return 'not_admitted';
       if (!open()) return 'stopped';
       const current = await options.state.binding(scope);
       if (
@@ -154,7 +167,7 @@ export async function runEpisodeJob(options: JobOptions): Promise<WorkflowResult
       if (!open()) return 'stopped';
       // Keep the pane lock across tentative publication, reservation and refusal
       // cleanup. A second promotion must not slip into the reconciliation gap.
-      slotAttempt = reserveJobSlot(options.state, options.authority);
+      slotAttempt = reserveJobSlot(options.state, options.authority, progress ? 'progress' : 'recovery');
       if (!open()) {
         slotAttempt.close();
         return 'stopped';
@@ -164,7 +177,7 @@ export async function runEpisodeJob(options: JobOptions): Promise<WorkflowResult
       if (selected) return selected;
       // A duplicate includes an in-flight reservation, not just a visible
       // selector. Never infer duplication from a best-effort capacity scan.
-      if (slotAttempt.duplicate) return 'not_admitted';
+      if (slotAttempt.duplicate || progress) return 'not_admitted';
       try {
         const ours = async () => {
           if (!(await valid())) return false;
@@ -203,6 +216,30 @@ export async function runEpisodeJob(options: JobOptions): Promise<WorkflowResult
     emit('created', null);
     slot.signal.addEventListener('abort', forward);
     if (slot.signal.aborted) forward();
+    if (progress && working) {
+      const now = options.deps.clock.now().getTime();
+      const deadline = new Date(now + (options.authority.permission.recoveryResetAfterSeconds ?? 60) * 1000);
+      if (!Number.isFinite(now) || !Number.isFinite(deadline.getTime()) || !(await valid())) return 'stopped';
+      await wait(deadline, controller.signal);
+      if (!(await valid())) return 'stopped';
+      if (options.deps.clock.now().getTime() < deadline.getTime()) return 'finished';
+      const confirmed = await options.episodes.withEpisodeLock(paneId, () =>
+        options.episodes.withEpisodeLock(retryKey, async () => {
+          if (!(await valid())) return false;
+          // One metadata confirmation, not a screen/evaluator poll. The sequence
+          // is this terminal's last change; other agents can advance the allocator.
+          const seen = await observeWorking(options.deps.herdr, paneId);
+          if (!sameSubject(seen) || seen.state_change_seq !== working.state_change_seq || !(await valid()))
+            return false;
+          const observationId = createHash('sha256')
+            .update(JSON.stringify(['sustained-working', scope, options.authority.ticket.epoch, seen.state_change_seq]))
+            .digest('hex');
+          await slot!.completeWorking(observationId);
+          return true;
+        }),
+      );
+      return confirmed ? 'finished' : open() ? 'finished' : 'stopped';
+    }
     const recovery = workflowEventDeps(
       { ...options.deps, herdr: recoveryHerdr(options.deps.herdr, valid), autoApprove: false },
       options.authority,

@@ -39,7 +39,7 @@ const { runEpisodeJob } = (await import(
 )) as typeof import('../src/herdr-adapter/jobs.ts');
 const { assessStop } = (await import(implementation('triage'))) as typeof import('../src/triage.ts');
 
-async function fixture(agent: 'pi' | 'codex' | 'agy' = 'pi') {
+async function fixture(agent: 'pi' | 'codex' | 'agy' = 'pi', resetAfterSeconds?: number) {
   const root = await mkdtemp(join(tmpdir(), 'steward-generic-recovery-'));
   const state = new WorkflowState(root);
   const episodes = new EpisodeStore(root);
@@ -64,6 +64,7 @@ async function fixture(agent: 'pi' | 'codex' | 'agy' = 'pi') {
   let now = new Date('2026-10-07T00:00:00Z');
   let decisions = 0;
   let enabled = true;
+  let recoveryResetAfterSeconds = resetAfterSeconds;
   const prompts: string[] = [];
   const handoffs: string[] = [];
   let beat = () => {};
@@ -74,7 +75,13 @@ async function fixture(agent: 'pi' | 'codex' | 'agy' = 'pi') {
     scope,
     paneId: pane.pane_id,
     workspaceId: pane.workspace_id,
-    permission: async () => ({ serverId: scope.serverId, enabled, targets: 'all', autoApprove: false }),
+    permission: async () => ({
+      serverId: scope.serverId,
+      enabled,
+      targets: 'all',
+      autoApprove: false,
+      recoveryResetAfterSeconds,
+    }),
     signal: new AbortController().signal,
     scheduleHeartbeat: (tick) => {
       beat = tick;
@@ -177,6 +184,32 @@ async function fixture(agent: 'pi' | 'codex' | 'agy' = 'pi') {
     },
     stop,
     change,
+    resetAfter: (seconds: number) => {
+      recoveryResetAfterSeconds = seconds;
+    },
+    confirmWorking: async (wait?: (deadline: Date, signal: AbortSignal) => Promise<void>) =>
+      runEpisodeJob({
+        kind: 'progress',
+        state,
+        authority,
+        episodes,
+        deps,
+        binding: (await state.binding(scope))!,
+        signal: attempt.signal,
+        wait:
+          wait ??
+          (async (deadline) => {
+            now = deadline;
+          }),
+      }),
+    status: (status: string) => {
+      pane = {
+        ...pane,
+        agent_status: status,
+        revision: pane.revision + 1,
+        state_change_seq: pane.state_change_seq + 1,
+      };
+    },
     prompts,
     handoffs,
     restore: (saved: AgentSnapshot, savedText: string) => {
@@ -353,6 +386,273 @@ test('unresolved failures share three attempts, then fresh classified completion
     assert.equal(f.prompts.length, 4);
   } finally {
     clearInterval(heartbeat);
+    await f.finish();
+  }
+});
+
+for (const agent of ['pi', 'codex', 'agy'] as const)
+  test(`${agent}: a minute of uninterrupted work starts a new API failure budget`, async () => {
+    const f = await fixture(agent);
+    try {
+      for (const delay of [30_000, 120_000, 480_000]) {
+        await f.stop();
+        f.advance(delay);
+        await f.stop(true);
+        f.change();
+      }
+      assert.equal(f.prompts.length, 3);
+      const exhausted = await f.state.sessionRetry(f.scope);
+      assert.equal(exhausted?.attempt_count, 3);
+      const decisions = f.decisions();
+      f.status('working');
+      await f.stop();
+      assert.equal(f.decisions(), decisions, 'working hooks must not call Jev');
+      await f.confirmWorking(async (deadline) => {
+        assert.equal(deadline.toISOString(), '2026-10-07T00:11:30.000Z');
+        f.advance(60_000);
+      });
+      assert.equal(await new EpisodeStore(f.root).sessionRetry(agent, 's1'), null);
+      f.status('idle');
+      await f.stop();
+      const fresh = await new EpisodeStore(f.root).sessionRetry(agent, 's1');
+      assert.equal(fresh?.attempt_count, 0, 'normal activity must end the exhausted failure streak');
+      assert.notEqual(fresh?.failure_episode_id, exhausted?.failure_episode_id);
+      assert.equal(fresh?.first_observed_at, '2026-10-07T00:11:30.000Z');
+      assert.equal(fresh?.next_check_at, '2026-10-07T00:12:00.000Z');
+      assert.equal(f.decisions() - decisions, 1, 'reset must not add an evaluator call');
+      f.advance(30_000);
+      await f.stop(true);
+      assert.equal(f.prompts.length, 4);
+      assert.equal((await f.state.sessionRetry(f.scope))?.attempt_count, 1);
+    } finally {
+      await f.finish();
+    }
+  });
+
+for (const interruption of [
+  'brief',
+  'missed_transition',
+  'missing_start',
+  'clock_rollback',
+  'uncertain',
+  'quota',
+] as const)
+  test(`working does not reset retry history after ${interruption}`, async () => {
+    const f = await fixture();
+    try {
+      if (interruption === 'uncertain')
+        f.transport(async () => {
+          throw new Error('lost acknowledgment');
+        });
+      if (interruption === 'quota') f.change('quota_limit');
+      await f.stop();
+      f.advance(interruption === 'quota' ? 300_000 : 30_000);
+      await f.stop(true);
+      const old = await f.state.sessionRetry(f.scope);
+      assert.ok(old);
+      f.status('working');
+      if (interruption === 'missing_start') f.status('idle');
+      else await f.stop();
+      await f.confirmWorking(async () => {
+        f.advance(interruption === 'brief' ? 59_999 : interruption === 'clock_rollback' ? -1 : 60_000);
+        if (interruption === 'missed_transition') {
+          f.status('idle');
+          f.status('working');
+        }
+      });
+      f.status('idle');
+      await f.stop();
+      const retained = await f.state.sessionRetry(f.scope);
+      assert.equal(retained?.attempt_count, old.attempt_count);
+      assert.equal(retained?.first_observed_at, old.first_observed_at);
+      assert.equal(retained?.quota_check_count, old.quota_check_count);
+      assert.equal(f.prompts.length, interruption === 'quota' ? 0 : 1);
+      if (interruption === 'uncertain') assert.equal(retained?.last_delivery_state, 'uncertain');
+    } finally {
+      await f.finish();
+    }
+  });
+
+test('working confirmation honors a five-second configured window without polling', async () => {
+  const f = await fixture('pi', 5);
+  try {
+    await f.stop();
+    f.advance(30_000);
+    await f.stop(true);
+    f.status('working');
+    await f.stop();
+    const read = f.herdr.get;
+    let reads = 0;
+    f.herdr.get = async () => {
+      reads++;
+      return read();
+    };
+    const decisions = f.decisions();
+    const files = await readFile(
+      join(f.root, `retry-session-${createHash('sha256').update('["pi","s1"]').digest('hex')}.json.head.json`),
+    );
+    const oldRecord = JSON.parse(files.toString()).recordId;
+    const oldPath = join(
+      f.root,
+      `retry-session-${createHash('sha256').update('["pi","s1"]').digest('hex')}.json.episode-${oldRecord}.json`,
+    );
+    const before = await readFile(oldPath);
+    await f.confirmWorking(async (deadline) => {
+      assert.equal(deadline.toISOString(), '2026-10-07T00:00:35.000Z');
+      assert.equal(reads, 1);
+      // Sleeping must hold neither the pane nor retry-session lock.
+      assert.equal(await f.episodes.withEpisodeLock('w1:p1', async () => true), true);
+      f.advance(5_000);
+      assert.equal(reads, 1);
+    });
+    assert.equal(reads, 2, 'one initial metadata read and one confirmation only');
+    assert.equal(f.decisions(), decisions);
+    assert.equal(await f.state.sessionRetry(f.scope), null);
+    assert.deepEqual(await readFile(oldPath), before, 'retain old attempt records byte-for-byte');
+    // Replaying the old attempted screen must not create another budget.
+    await assert.rejects(f.episodes.recordSessionRetry('pi', 's1', JSON.parse(before.toString())));
+  } finally {
+    await f.finish();
+  }
+});
+
+for (const interruption of ['idle', 'unknown', 'replaced', 'source_changed', 'pause', 'disabled', 'human'] as const)
+  test(`working confirmation preserves the budget after ${interruption}`, async () => {
+    const f = await fixture();
+    try {
+      await f.stop();
+      f.advance(30_000);
+      await f.stop(true);
+      f.status('working');
+      const old = (await f.state.sessionRetry(f.scope))!;
+      if (interruption === 'human')
+        await f.episodes.recordSessionRetry('pi', 's1', { ...old, last_delivery_state: 'human' });
+      await f.confirmWorking(async () => {
+        f.advance(60_000);
+        if (interruption === 'idle' || interruption === 'unknown') f.status(interruption);
+        if (interruption === 'pause') assert.equal(await f.state.pause(f.scope.serverId), 'paused');
+        if (interruption === 'disabled') f.disable();
+        if (interruption === 'replaced' || interruption === 'source_changed') {
+          const pane = (await f.herdr.get())!;
+          f.restore(
+            {
+              ...pane,
+              agent_session: {
+                ...pane.agent_session!,
+                ...(interruption === 'replaced' ? { value: 'another-session' } : { source: 'integration:pi' }),
+              },
+            },
+            'Working',
+          );
+        }
+      });
+      assert.deepEqual(await f.state.sessionRetry(f.scope), {
+        ...old,
+        ...(interruption === 'human' ? { last_delivery_state: 'human' } : {}),
+      });
+      assert.equal(f.prompts.length, 1);
+    } finally {
+      await f.finish();
+    }
+  });
+
+test('working confirmation uses the configured delay and cancels on configuration change', async () => {
+  const f = await fixture();
+  try {
+    await f.stop();
+    f.advance(30_000);
+    await f.stop(true);
+    const old = await f.state.sessionRetry(f.scope);
+    f.status('working');
+    await f.stop();
+    await f.confirmWorking(async () => {
+      f.advance(60_000);
+      f.resetAfter(5);
+    });
+    assert.deepEqual(await f.state.sessionRetry(f.scope), old);
+    assert.equal(f.prompts.length, 1);
+  } finally {
+    await f.finish();
+  }
+});
+
+test('working confirmation obeys the shared eight-slot limit without altering the budget on refusal', async () => {
+  const f = await fixture();
+  const occupied: { index: number; token: string }[] = [];
+  try {
+    await f.stop();
+    f.advance(30_000);
+    await f.stop(true);
+    f.status('working');
+    const old = await f.state.sessionRetry(f.scope);
+    for (let index = 0; index < 8; index++) {
+      const token = await f.state
+        .capacity(f.scope.serverId, index)
+        .acquire(JSON.stringify(['e'.repeat(64), '00000000-0000-4000-8000-000000000000']));
+      assert.ok(token);
+      occupied.push({ index, token });
+    }
+    assert.equal(
+      await f.confirmWorking(async () => {
+        assert.fail('no capacity may not start a timer');
+      }),
+      'not_admitted',
+    );
+    assert.deepEqual(await f.state.sessionRetry(f.scope), old);
+    assert.equal(f.prompts.length, 1);
+  } finally {
+    for (const { index, token } of occupied) await f.state.capacity(f.scope.serverId, index).release(token);
+    await f.finish();
+  }
+});
+
+test('a working confirmation is deduplicated without sending another recovery prompt', async () => {
+  const f = await fixture();
+  try {
+    await f.stop();
+    f.advance(30_000);
+    await f.stop(true);
+    f.status('working');
+    await f.confirmWorking(async () => {
+      assert.equal(
+        await f.confirmWorking(async () => {
+          assert.fail('duplicate confirmation timer');
+        }),
+        'not_admitted',
+      );
+      f.advance(60_000);
+    });
+    assert.equal(await f.state.sessionRetry(f.scope), null);
+    assert.equal(f.prompts.length, 1);
+  } finally {
+    await f.finish();
+  }
+});
+
+test('working confirmation tolerates other agents changing status but not this agent', async () => {
+  const f = await fixture();
+  try {
+    await f.stop();
+    f.advance(30_000);
+    await f.stop(true);
+    f.status('working');
+    // Herdr allocates sequences globally. Other panes can consume the next numbers,
+    // but this pane's last state change stays fixed throughout its working interval.
+    const pane = (await f.herdr.get())!;
+    f.restore({ ...pane, state_change_seq: 500 }, 'Still working');
+    await f.stop();
+    const decisions = f.decisions();
+    await f.confirmWorking(async () => {
+      f.advance(30_000);
+      await f.stop(); // A duplicate hook must not add a timer or postpone confirmation.
+      f.advance(30_000);
+    });
+    assert.equal(await f.state.sessionRetry(f.scope), null);
+    assert.equal(f.decisions(), decisions);
+    f.status('idle');
+    await f.stop();
+    assert.equal((await f.state.sessionRetry(f.scope))?.attempt_count, 0);
+  } finally {
     await f.finish();
   }
 });

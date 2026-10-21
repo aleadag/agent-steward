@@ -168,7 +168,13 @@ test('owner renews generation and occupied slot single-flight; closure bypasses 
   }
 });
 
-for (const change of [{ serverId: '47:2' }, { enabled: false }, { targets: [] }, { autoApprove: true }]) {
+for (const change of [
+  { serverId: '47:2' },
+  { enabled: false },
+  { targets: [] },
+  { autoApprove: true },
+  { recoveryResetAfterSeconds: 5 },
+]) {
   test(`captured permission snapshot rejects ${Object.keys(change)[0]} changes irreversibly`, async () => {
     const root = await mkdtemp(join(tmpdir(), 'workflow-permission-'));
     let current: RuntimePermission = await permission();

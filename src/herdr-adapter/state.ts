@@ -21,6 +21,15 @@ export type Episode = Retry & {
   workflow_episode_id?: string;
   completion_observation_id?: string;
 };
+// Only confirmed API deliveries may be rearmed by sustained reported activity.
+export const canResetAfterWorking = (episode: Episode | null): episode is Episode =>
+  episode !== null &&
+  episode.attempt_count > 0 &&
+  episode.quota_check_count === 0 &&
+  episode.next_check_at === null &&
+  episode.last_delivery_state === 'delivered' &&
+  !episode.lifecycle_handoff_sent;
+
 export const workflowEpisodeId = (episode: Episode): string =>
   episode.workflow_episode_id ?? episode.failure_episode_id;
 const retryHeadSchema = z
@@ -388,7 +397,7 @@ export class EpisodeStore {
     if (!written) throw new CorruptEpisodeError();
   }
   // Select a newly classified stop without rewriting its predecessor. Counters
-  // only reset after explicit completion; lifecycle/screen changes carry them.
+  // only reset after completion or validated sustained work; screen changes carry them.
   async advanceSessionRetry(
     agent: string,
     sessionId: string,
