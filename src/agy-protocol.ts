@@ -18,7 +18,8 @@ export function createAgyProtocol(requestId: string, now: () => Date): AgyProtoc
   let output = '',
     bytes = 0,
     refreshAt = 0,
-    panelSeen = false;
+    panelSeen = false,
+    loginSeen = false;
   let captured: AgyCapture | null = null,
     failure: Failure | null = null;
   const decoder = new TextDecoder();
@@ -33,7 +34,8 @@ export function createAgyProtocol(requestId: string, now: () => Date): AgyProtoc
     result: () => failure ?? (phase === 'complete' && captured ? { observation: captured } : null),
     accept(event) {
       if (phase === 'complete' || phase === 'failed') return [];
-      if (event.kind === 'deadline' || event.kind === 'exit') return fail('fetch');
+      if (event.kind === 'deadline' || event.kind === 'exit')
+        return fail(phase === 'starting' && loginSeen ? 'auth' : 'fetch');
       if (event.kind === 'capture') {
         const value = event.observation;
         const timestamp = SnapshotSchema.shape.windows.element.shape.observed_at.safeParse(value.observedAt);
@@ -65,14 +67,24 @@ export function createAgyProtocol(requestId: string, now: () => Date): AgyProtoc
           .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
           .toLowerCase();
         if (/do you trust|trust this folder|trust the contents/.test(visible)) return fail('fetch', 'quota_agy_trust');
-        if (/select login method|authorization code|click here to authenticate/.test(visible)) return fail('auth');
+        if (/authorization code|click here to authenticate/.test(visible)) return fail('auth');
+        const loginAt = visible.lastIndexOf('select login method');
+        if (loginAt >= 0) {
+          if (phase !== 'starting') return fail('auth');
+          loginSeen = true;
+        }
         if (
           /settings error|unknown command|(?:failed|error|unable|could not)[^\n]{0,120}(?:quota|usage)|(?:quota|usage)[^\n]{0,120}(?:failed|error)/.test(
             visible,
           )
         )
           return fail('fetch');
-        if (phase === 'starting' && />\s*(?:accept-edits|plan|normal) mode:/.test(visible)) {
+        // Native renewal can render login selection before becoming ready. Wait
+        // without input; only a prompt after the latest selection can advance.
+        if (
+          phase === 'starting' &&
+          />\s*(?:accept-edits|plan|normal) mode:/.test(visible.slice(Math.max(0, loginAt)))
+        ) {
           phase = 'recognizing';
           output = '';
           return [{ kind: 'write', text: '/usage' }];
