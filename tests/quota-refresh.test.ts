@@ -4,7 +4,17 @@ import { createHash } from 'node:crypto';
 import { dirname } from 'node:path';
 import { SnapshotSchema, StewardError } from '../src/contracts.ts';
 import type { QuotaBucket, SnapshotSource } from '../src/contracts.ts';
-import { candidate, choice, config, evaluation, recordingPost, snapshot, windowFact } from './helpers.ts';
+import {
+  assertSubscriptionQuota,
+  apiCandidate,
+  candidate,
+  choice,
+  config,
+  evaluation,
+  recordingPost,
+  snapshot,
+  windowFact,
+} from './helpers.ts';
 import { makeEvaluator } from '../src/jev.ts';
 import { route } from '../src/routing.ts';
 import type { QuotaHttpGet, QuotaRefreshIO } from '../src/quota-refresh.ts';
@@ -21,6 +31,29 @@ import {
 
 import { agyAuth, agyQuota } from './agy-helpers.ts';
 import { readAgyIdentity } from '../src/agy-auth.ts';
+
+test('API-only refresh never reads auth, collects quotas, or writes snapshots for any tool', async () => {
+  const { io } = refreshIO();
+  const deny = async () => {
+    throw new Error('API billing has no subscription collector');
+  };
+  for (const tool of ['pi', 'codex', 'agy'] as const) {
+    assert.deepEqual(
+      await refreshQuota(config({ tools: [tool], candidates: [apiCandidate({ tool })] }), {
+        ...io,
+        readText: deny,
+        httpGet: deny,
+        collectAgy: deny,
+        writeText: deny,
+        mkdirp: deny,
+        chmod: deny,
+        rename: deny,
+        unlink: deny,
+      }),
+      { buckets: [] },
+    );
+  }
+});
 
 const observed = '2026-10-02T12:00:00.000Z';
 const now = new Date(observed);
@@ -265,7 +298,8 @@ test('mixed HTTP/native collection feeds offline reader without borrowing the ot
   const facts = await loadQuota(cfg, { env: io.env, now, readText: io.readText, diagnostic: () => {} });
   const gemini = facts.get('gemini'),
     third = facts.get('third');
-  assert.ok(gemini && third);
+  assertSubscriptionQuota(gemini);
+  assertSubscriptionQuota(third);
   assert.equal(gemini.pool_status, 'known');
   assert.ok(gemini.windows.every((w) => w.remaining_percent === 20));
   assert.equal(third.pool_status, 'known');
@@ -564,6 +598,7 @@ for (const bucket of ['codex', 'pi_codex'] as const) {
       }
       assert.deepEqual(refreshed, { buckets: [{ bucket, status: 'malformed' }] });
       assert.equal(files.has(`${quotaDir}/${bucket}.json`), false);
+      assert.ok(selected.schema_version === 1);
       assert.equal(selected.quota.snapshot_status, 'missing');
       assert.equal(selected.quota.account_status, 'unknown');
     });
@@ -606,7 +641,8 @@ for (const oversized of [false, true]) {
           now,
           diagnostic: (code) => diagnostics.push(code),
         });
-        const facts = loaded.get('candidate-0')!;
+        const facts = loaded.get('candidate-0');
+        assertSubscriptionQuota(facts);
         assert.equal(facts.snapshot_status, 'loaded');
         assert.deepEqual(
           facts.windows.map((window) => window.id),

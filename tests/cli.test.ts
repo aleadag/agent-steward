@@ -7,8 +7,25 @@ import type { Runtime } from '../src/cli.ts';
 import type { Config, Evaluation, SelectedResult, StopInput } from '../src/contracts.ts';
 import type { HttpPost, Questions } from '../src/jev.ts';
 import type { NativeLaunch } from '../src/launch.ts';
-import { config, candidate, choiceAnswer, jevResponse, snapshot, windowFact } from './helpers.ts';
+import {
+  apiCandidate,
+  apiSelectedResult,
+  config,
+  candidate,
+  choiceAnswer,
+  jevResponse,
+  snapshot,
+  windowFact,
+} from './helpers.ts';
 import { appendStopEvent } from '../src/stop-ledger.ts';
+
+test('API decision cards distinguish declared billing from measured quota and native authentication', () => {
+  const card = renderDecisionCard(apiSelectedResult());
+  assert.match(card, /billing configured\/unverified: api/);
+  assert.match(card, /subscription quota: not applicable/);
+  assert.match(card, /authentication\/account binding: unverified/);
+  assert.doesNotMatch(card, /account remaining:|snapshot status:|100%|account: null/);
+});
 
 type JevWire = { model: string; state: unknown; questions: Questions };
 type PostAnswer = (wire: JevWire, index: number) => unknown;
@@ -81,6 +98,92 @@ function runtime(overrides: Partial<Runtime> = {}) {
   };
   return { out, err, reads, launches, io, files };
 }
+
+for (const outcome of ['dry-run', 'success', 'nonzero', 'throw'] as const) {
+  test(`API routing ${outcome} keeps native auth owned by the tool and versioned lifecycle history`, async () => {
+    const cfg = config({ tools: ['pi'], candidates: [apiCandidate()] });
+    let requests = 0;
+    const rt = runtime({
+      env: { HOME: '/isolated/home', XDG_CONFIG_HOME: '/isolated/xdg', TYPESAFE_API_KEY: 'SyntheticEvaluatorOnly' },
+      readText: async (path) => {
+        assert.equal(path, CONFIG_PATH, 'API routing must not read auth or quota');
+        return JSON.stringify(cfg);
+      },
+      post: async () => {
+        requests++;
+        return { status: 200, body: JSON.stringify(jevResponse({ pair: choiceAnswer({ 'deepseek-api': 1 }) })) };
+      },
+      launch: async () => {
+        if (outcome === 'throw') throw new Error('Native failure');
+        return outcome === 'nonzero' ? 7 : 0;
+      },
+    });
+    const task = 'Private task text for native delivery only';
+    const args = ['router', 'start', task, ...(outcome === 'dry-run' ? ['--dry-run', '--json'] : [])];
+    assert.equal(await run(args, rt.io), outcome === 'throw' ? 1 : outcome === 'nonzero' ? 7 : 0);
+    assert.equal(requests, 1);
+    assert.equal(rt.launches.length, outcome === 'dry-run' ? 0 : 1);
+    const serialized = [...rt.files.values()].join('\n');
+    assert.doesNotMatch(serialized, /Private task text|SyntheticEvaluatorOnly/);
+    const events = serialized
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.ok(events.length > 0);
+    assert.ok(events.every((event) => event.schema_version === 2));
+    assert.equal(events[0].selected.billing, 'api');
+    assert.equal(events[0].selected.quota_bucket, null);
+    if (outcome === 'dry-run') {
+      const result = JSON.parse(rt.out.join(''));
+      assert.equal(result.schema_version, 2);
+      assert.deepEqual(result.quota, { status: 'not_applicable', reason: 'api_billed' });
+    } else {
+      assert.match(rt.err.join(''), /billing configured\/unverified: api/);
+      assert.equal(events.at(-1).event, outcome === 'throw' ? 'launch-failed' : 'exited');
+      assert.equal(events.at(-1).selected, undefined);
+    }
+  });
+}
+
+for (const command of ['show', 'refresh']) {
+  test(`API-only quota ${command} is an empty successful inventory without native IO`, async () => {
+    const cfg = config({ tools: ['pi'], candidates: [apiCandidate()] });
+    const rt = runtime({
+      readText: async (path) => {
+        assert.equal(path, CONFIG_PATH);
+        return JSON.stringify(cfg);
+      },
+    });
+    assert.equal(await run(['quota', command, '--json'], rt.io), 0);
+    assert.deepEqual(JSON.parse(rt.out.join('')).buckets, []);
+    assert.equal(rt.files.size, 0);
+    assert.equal(rt.launches.length, 0);
+  });
+}
+
+test('doctor admits API billing without native auth or quota discovery', async () => {
+  const cfg = config({ tools: ['pi'], candidates: [apiCandidate()] });
+  const reads: string[] = [];
+  const rt = runtime({
+    env: {
+      HOME: '/isolated/home',
+      XDG_CONFIG_HOME: '/isolated/xdg',
+      PATH: '/isolated/bin',
+      TYPESAFE_API_KEY: 'SyntheticEvaluatorOnly',
+    },
+    executableAvailable: () => true,
+    readText: async (path) => {
+      reads.push(path);
+      assert.equal(path, CONFIG_PATH);
+      return JSON.stringify(cfg);
+    },
+  });
+  assert.equal(await run(['doctor', '--json'], rt.io), 0);
+  assert.equal(JSON.parse(rt.out.join('')).ok, true);
+  assert.deepEqual(reads, [CONFIG_PATH]);
+  assert.equal(rt.files.size, 0);
+  assert.equal(rt.launches.length, 0);
+});
 
 test('doctor parses config and JSON flags and rejects extra arguments', () => {
   assert.deepEqual(parseArgs(['--config', 'local.json', 'doctor', '--json']), {
@@ -763,7 +866,7 @@ test('quota show escapes unsafe display labels and handles text empty inventory'
   assert.ok(!out.join('').includes('\u001b'));
   const empty = runtime({ terminal: { stdin: false, stdout: false } });
   assert.equal(await run(['quota', 'show'], empty.io), 0);
-  assert.equal(empty.out.join(''), 'No enabled quota buckets.\n');
+  assert.equal(empty.out.join(''), 'No enabled subscription quota buckets.\n');
 });
 
 test('quota show groups providers and shares equivalent capture timestamps across buckets', async () => {

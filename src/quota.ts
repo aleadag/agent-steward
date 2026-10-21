@@ -2,6 +2,7 @@ import { isAbsolute, join } from 'node:path';
 import { SnapshotSchema, StewardError } from './contracts.ts';
 import type {
   QuotaBucket,
+  SubscriptionCandidate,
   Config,
   Diagnostic,
   QuotaFacts,
@@ -115,7 +116,12 @@ export async function inspectQuota(
   const now = io.now.toISOString();
   const enabled = new Set(config.tools);
   const buckets = new Set(
-    config.candidates.filter((candidate) => enabled.has(candidate.tool)).map((candidate) => candidate.quota_bucket),
+    config.candidates
+      .filter(
+        (candidate): candidate is SubscriptionCandidate =>
+          enabled.has(candidate.tool) && candidate.billing === 'subscription',
+      )
+      .map((candidate) => candidate.quota_bucket),
   );
   const result = [];
   for (const bucket of buckets) {
@@ -151,6 +157,10 @@ export async function loadQuota(
 
   for (const candidate of config.candidates) {
     if (!enabled.has(candidate.tool)) continue;
+    if (candidate.billing === 'api') {
+      result.set(candidate.id, { status: 'not_applicable', reason: 'api_billed' });
+      continue;
+    }
 
     const bucket = candidate.quota_bucket;
     let loaded = cache.get(bucket);

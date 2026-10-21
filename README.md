@@ -108,7 +108,9 @@ Routing and stop assessment follow the returned choice label. Scores need not su
 
 `router list` shows the latest 20 recorded requests; `--limit <n>` changes the display without pruning history. `router show <request-id>` shows the folded decision fields, latest event, and exit code when recorded. Both commands support `--json` and read local history without loading config, requiring credentials, or calling Jev. A missing ledger gives an empty list; an unknown request ID exits 2 with `agent-steward: not_found` on stderr.
 
-The ledger is `$XDG_STATE_HOME/agent-steward/router.jsonl`, or `$HOME/.local/state/agent-steward/router.jsonl` when XDG state is unset. Before an append would exceed 5 MiB, the current file replaces `router.jsonl.1`; only that one backup is retained. Normal retained history is at most 10 MiB. An existing oversized ledger is preserved as the backup until the following rotation. `router list/show` read both files and fold events across them; older discarded requests are no longer available. Its directory is `0700` and both files are `0600`. Events record selected tool/provider/model/thinking/`quota_bucket`, evaluator usage, and native exit code when known. They never store task/prompt text, keys, pane IDs, PIDs, or planned-command displays. Credential detection blocks writes.
+The ledger is `$XDG_STATE_HOME/agent-steward/router.jsonl`, or `$HOME/.local/state/agent-steward/router.jsonl` when XDG state is unset. Before an append would exceed 5 MiB, the current file replaces `router.jsonl.1`; only that one backup is retained. Normal retained history is at most 10 MiB. An existing oversized ledger is preserved as the backup until the following rotation. `router list/show` read both files and fold events across them; older discarded requests are no longer available. Its directory is `0700` and both files are `0600`. Events record selected tool/provider/model/thinking/`quota_bucket`, evaluator usage, and native exit code when known. They never store task/prompt text, keys, pane IDs, PIDs, or planned-command displays. Credential detection blocks writes. API selections and their lifecycle events use version 2, with `selected.billing: "api"` and a null subscription bucket. Human history labels this configured billing as unverified. New readers fold both versions and legacy account-alias records; unknown versions are rejected, not silently skipped.
+
+History compatibility is one-way: old binaries cannot read version-2 API events. Before enabling API routing, privately back up both `router.jsonl` and `router.jsonl.1` (when present) and the legacy config. To downgrade, stop concurrent steward writers, archive both mixed-version ledger files, and restore the pre-upgrade history and config. Keep directories `0700` and files `0600`; retain the archive for the newer reader rather than discarding or converting API events.
 
 History reads and writes share a local-filesystem lock (`router.jsonl.lock`) and wait up to five seconds for it. Normal errors release the lock, but a forcibly killed process can leave it behind. Remove the empty lock directory with `rmdir` only after confirming no history operation is still running; age alone does not prove a lock is stale.
 
@@ -132,7 +134,7 @@ The live route summary labels the selected provider, model, thinking level, and 
 
 The task is sent as one native process argument, so it may be visible briefly in local process listings. Do not put secrets in task text. The child receives the caller's environment except `TYPESAFE_API_KEY`; native provider credentials are otherwise passed through. For a non-TTY caller, use `--dry-run --json` for a route preview, then have an already-authorized caller launch the selected tool and requested settings using its own safe argv construction. Do not execute `planned_command.display` as a shell command: a preview is not a launch.
 
-A `--dry-run` route uses `schema_version: 1` when returned as JSON; stop results and stop errors use `schema_version: 2`. These JSON results include a `request_id`. The JSON form of a selected `--dry-run` result contains `decision: "selected"`, the chosen candidate, quota facts, the exact planned executable and argument array, and pair/effort evaluation metadata. Its request ID identifies the evaluation, not a session. A successful live foreground start emits no steward route-result JSON; the selected native process owns stdout, and `agent-steward` returns its exit status. When a stop observation has no meaningful context, the CLI returns this local result without calling Jev:
+A selected `--dry-run` route uses `schema_version: 1` for subscription billing or `schema_version: 2` for API billing when returned as JSON; stop results and stop errors use `schema_version: 2`. These JSON results include a `request_id`. The JSON form of a selected `--dry-run` result contains `decision: "selected"`, the chosen candidate, quota facts, the exact planned executable and argument array, and pair/effort evaluation metadata. Its request ID identifies the evaluation, not a session. A successful live foreground start emits no steward route-result JSON; the selected native process owns stdout, and `agent-steward` returns its exit status. When a stop observation has no meaningful context, the CLI returns this local result without calling Jev:
 
 ```json
 {"schema_version":2,"request_id":"request-42","decision":"stop_decision","proposed_action":{"kind":"manual_review"},"reason_code":"insufficient_context","waiting_for":"other","waiting_confidence":null,"risk_probability":null,"evaluation":null}
@@ -148,7 +150,9 @@ Both routing evaluations receive quota windows with numeric `seconds_until_reset
 
 Routing excludes a candidate if any fresh applicable account or pool limit has zero remaining quota. AGY candidates are also excluded when any fresh applicable limit has less than 1% remaining; exactly 1% remains eligible. Other tools retain the exact-zero cutoff. If every enabled candidate is excluded, it returns `quota_exhausted` without evaluating or launching a model. Account windows are shared within a quota bucket; pool windows are shared within that bucket and pool. Unknown or stale quota remains eligible, but is not assumed full.
 
-Jev balances task-required configured capabilities, relative cost, and quota health without fixed model tiers. An over-budget weekly window favors another suitable model, but remains a soft preference: the stronger model can still be selected when its capabilities are needed and no other candidate is suitable. All applicable windows matter. An earlier reset is not a reason to spend quota, even when weekly pacing is on budget or unknown: a 5-hour reset does not replenish the weekly budget. Among suitable candidates, favor capability fit then lower relative cost while accounting for weekly pacing; reset countdowns provide context, not spending priority. Thinking-level selection likewise favors a suitable lower-cost level under quota pressure without sacrificing required capability. Cost is a ranking hint, not measured quota consumption; pacing is an even-spending budget comparison, not a measured recent burn rate. These preferences guide Jev rather than deterministically allocating quota or guaranteeing future availability.
+Jev balances configured capabilities, relative cost, and quota health without fixed model tiers. Among comparably suitable candidates, the soft preference is on-pace subscription capacity, then API-paid capacity, then over-budget subscription capacity. Another healthy subscription takes precedence over API usage; one overspent subscription does not trigger a global API switch. All weekly account/pool windows governing a candidate apply together: a fresh over-budget window is not cancelled by another healthy window. Known on-pace usage requires at least one weekly window and all applicable weekly windows to be fresh and on pace. Missing/stale pacing establishes neither health nor overspending. Shared quotas are shared capacity, never independent allowances per model.
+
+Capability fit can override these soft preferences when a better-fit eligible candidate exists. If no candidate fully meets the task, Jev must still select the best available eligible candidate, including a sole remaining API model; there is no suitability refusal. Exhaustion exclusions remain hard. Earlier resets are not a spending priority: a short-window reset does not replenish weekly quota. Thinking selection uses configured levels and recognizes API quota as not applicable. Relative cost is a ranking hint, not measured consumption, a token price, or a spending cap. Pacing compares remaining quota to an even-spending budget, not a measured recent burn rate. These are evaluator preferences, not deterministic allocation or availability guarantees.
 
 ## Configuration
 
@@ -172,7 +176,51 @@ Existing `"jev": { "model": "jev-1.13.0" }` config remains accepted as Jev via T
 
 For agy, configure one Gemini model with ordinary thinking levels, not a separate candidate per effort. Model IDs pass through unchanged: `gemini-3.8-flash` plus `medium` produces `--model=gemini-3.8-flash --effort=medium`. Non-default effort IDs must be `low`, `medium`, `high`, or `max`; `default` omits the effort flag. Jev, the selected result, and the native command retain the configured model and effort without model-suffix translation. Thinking levels contain only `id` and `description`, with no model overrides. AGY handles model-specific availability and effort restrictions; steward does not claim verified runtime selection.
 
-`tools` lists enabled tool IDs. Candidates using a known but disabled tool remain configured and are not considered. Candidate IDs must be unique and unknown fields are rejected. Each candidate names a `quota_bucket`: `codex` allows only `codex`, `pi` allows `pi_codex` or `pi_xai`, and `agy` allows only `antigravity`. Native Codex and Pi Codex snapshots stay separate even when the logins match. Each candidate also has a required finite `cost` greater than zero: a relative ranking hint (for example Luna `1`, Sol `2`), not a bill or live price. `quota_pool` remains a candidate field; provider account IDs, `accounts`, `account_id`, and snapshot paths are not accepted in config. The default TypeSafe evaluator model is `jev-1.13.0`; missing `thresholds.risky` and `thresholds.choiceConfidence` default to `0.60` and `0.45` respectively. Both are finite probabilities in `[0,1]`.
+`tools` lists enabled tool IDs. Known but disabled tools are not considered. IDs must be unique and unknown fields are rejected. Candidate `billing` is `subscription` (the default when omitted) or `api`, independently of tool or provider. Subscription candidates require `quota_bucket` and `quota_pool`: native Codex uses `codex`, Pi uses `pi_codex` or `pi_xai`, and agy uses `antigravity`. Native/Pi Codex snapshots stay separate even for matching logins. API candidates prohibit bucket/pool fields and can use any supported launcher. Every candidate requires finite positive relative `cost`, configured capabilities, and thinking levels. Credentials, provider account IDs, `accounts`, `account_id`, and snapshot paths are not accepted in steward config. The default TypeSafe evaluator model is `jev-1.13.0`; missing `thresholds.risky` and `thresholds.choiceConfidence` default to `0.60` and `0.45`, both finite probabilities in `[0,1]`.
+
+### API-paid candidates
+
+[`examples/config-api.json`](examples/config-api.json) mixes a legacy subscription candidate with an explicit API candidate. Its costs and capabilities are illustrative, not verified cross-model rankings. Configure keys, endpoints, and authentication in the native tool; `billing: "api"` does not switch credentials or prove actual billing. Routing and doctor do not read native auth stores. Enabled opposite-billing aliases of an indistinguishable native route are rejected; ignored provider labels or different thinking levels do not establish separate authentication routes. Pi collision checks conservatively account for provider/model case, provider-qualified selectors, whitespace, and possible `:thinking` suffixes without reading native registries. Ambiguous opposite-billing declarations may therefore be rejected even when a native registry treats a suffix literally; standalone literal IDs and all native argv remain unchanged. Fuzzy matching, native registry contents, and actual authentication/billing remain unverified.
+
+Adding an API candidate opts it into potentially billable routing. Steward does not check API credit, rate limits, or enforce a dollar budget. API facts are `{"status":"not_applicable","reason":"api_billed"}`: subscription quota does not apply, but capacity is not known unlimited or available. Selected API previews use version 2, `selected.billing: "api"`, and null `quota_bucket`/`quota_pool`. Subscription results remain version 1 unchanged; route errors remain version 1. Inspect both version and decision when parsing results.
+
+Quota show/refresh inspect subscription candidates only. An API-only inventory returns empty `buckets` successfully without snapshot/auth reads, quota collectors, or writes. Native provider rejection is left to the tool; steward does not automatically reroute or launch another paid attempt. Claude Code and configurable tool registration are future work; billing does not depend on the registration mechanism.
+
+### Optional evaluator policy sampling (development only)
+
+Normal tests use injected evaluators and make no paid requests. After separate authorization for each run, the source-checkout recipe below sends six synthetic scenarios to the explicitly selected evaluator. It never launches a native agent, calls a candidate model provider, reads native credentials, or uses real task text. Each candidate has one thinking level, so a run makes at most six sequential evaluator calls with existing deadlines and no retries. It reports preferred versus observed selections, including deviations; sampled results are evidence, not a guarantee of future choices.
+
+Choose exactly one configured evaluator. These commands may incur evaluator charges; do not run them as routine verification or retry a failed run without renewed authorization.
+
+TypeSafe:
+
+```bash
+nix develop path:. --command bun -e '
+import { makeEvaluator, postHttps } from "./src/jev.ts";
+import { runPolicyChecks } from "./tests/policy-check.ts";
+const evaluate = makeEvaluator({
+  provider: "typesafe", model: "jev-1.13.0",
+  apiKey: process.env.TYPESAFE_API_KEY ?? "", post: postHttps
+});
+console.log(JSON.stringify(await runPolicyChecks(evaluate)));
+'
+```
+
+OpenRouter:
+
+```bash
+nix develop path:. --command bun -e '
+import { makeEvaluator, postHttps } from "./src/jev.ts";
+import { runPolicyChecks } from "./tests/policy-check.ts";
+const evaluate = makeEvaluator({
+  provider: "openrouter", model: "~typesafe/jev-latest",
+  apiKey: process.env.OPENROUTER_API_KEY ?? "", post: postHttps
+});
+console.log(JSON.stringify(await runPolicyChecks(evaluate)));
+'
+```
+
+The six cases cover healthy subscriptions, independent healthy versus overspent subscriptions, API preference over overspent capacity, capability overrides, a sole imperfect-fit API candidate, and simultaneous account/pool constraints. No real-evaluator run is implied by unit-test or build success.
 
 ## Show captured quota
 

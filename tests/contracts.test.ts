@@ -11,11 +11,27 @@ import {
   errorResult,
 } from '../src/contracts.ts';
 import * as contractExports from '../src/contracts.ts';
-import { stopInput, candidate, config, evaluation, snapshot, windowFact } from './helpers.ts';
+import { apiSelectedResult, stopInput, candidate, config, evaluation, snapshot, windowFact } from './helpers.ts';
 
 type StopDecision = Extract<StopResult, { decision: 'stop_decision' }>;
 
 const validWindow = windowFact({ type: 'account' });
+
+test('API route results are explicitly versioned and cannot contain subscription quota', () => {
+  const result = apiSelectedResult();
+  assert.deepEqual(ResultSchema.parse(result), result);
+  for (const invalid of [
+    { ...result, schema_version: 1 },
+    { ...result, schema_version: 3 },
+    { ...result, selected: { ...result.selected, billing: 'subscription' } },
+    { ...result, selected: { ...result.selected, quota_bucket: 'pi_codex' } },
+    { ...result, selected: { ...result.selected, quota_pool: 'primary' } },
+    { ...result, quota: { status: 'unknown', reason: 'api_billed' } },
+    { ...result, quota: { ...result.quota, windows: [] } },
+    { ...result, api_key: 'not-a-real-key' },
+  ])
+    assert.equal(ResultSchema.safeParse(invalid).success, false);
+});
 
 test('config schema is strict, preserves configured text, and defaults only documented settings', () => {
   const { evaluator: _evaluator, thresholds: _thresholds, ...raw } = config();
@@ -148,7 +164,11 @@ test('checked-in example parses and keeps its three illustrative tool/provider p
   const parsed = ConfigSchema.parse(raw);
   assert.equal(parsed.candidates.length, 3);
   assert.deepEqual(
-    parsed.candidates.map(({ tool, provider, quota_bucket, model }) => ({ tool, provider, quota_bucket, model })),
+    parsed.candidates.map((candidate) => {
+      assert.ok(candidate.billing === 'subscription');
+      const { tool, provider, quota_bucket, model } = candidate;
+      return { tool, provider, quota_bucket, model };
+    }),
     [
       { tool: 'codex', provider: 'openai', quota_bucket: 'codex', model: 'gpt-astra-example' },
       { tool: 'pi', provider: 'openai-codex', quota_bucket: 'pi_codex', model: 'gpt-astra-example' },

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { appendFile, chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { appendEvent, ledgerFile, readLedger } from '../src/ledger.ts';
+import { appendEvent, formatLedgerRecords, ledgerFile, readLedger } from '../src/ledger.ts';
 import { StewardError } from '../src/contracts.ts';
 import { fileSize, withLedgerLock } from '../src/ledger-io.ts';
 import { run } from '../src/cli.ts';
@@ -107,6 +107,109 @@ async function diskRuntime() {
   await mkdir(path.dirname(file), { mode: 0o700 });
   return { runtime, file, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
+
+test('API lifecycle history folds across rotations without inventing a subscription bucket', async () => {
+  const { runtime, file, cleanup } = await diskRuntime();
+  const event = {
+    schema_version: 2 as const,
+    request_id: 'api-history',
+    recorded_at: '2026-10-21T00:00:00Z',
+    event: 'launched' as const,
+    selected: {
+      tool: 'pi',
+      provider: 'deepseek',
+      model: 'deepseek-v4-flash',
+      thinking_level: 'default',
+      billing: 'api' as const,
+      quota_bucket: null,
+    },
+  };
+  try {
+    await writeFile(file, ' '.repeat(rotationLimit), { mode: 0o600 });
+    await appendEvent(runtime, event);
+    await rename(file, `${file}.1`);
+    await appendEvent(runtime, {
+      schema_version: 2,
+      request_id: event.request_id,
+      recorded_at: '2026-10-21T00:01:00Z',
+      event: 'exited',
+      exit_code: 9,
+    });
+    const [record] = await readLedger(runtime);
+    assert.equal(record?.schema_version, 2);
+    assert.equal(record?.selected?.quota_bucket, null);
+    assert.equal(record?.selected?.model, 'deepseek-v4-flash');
+    assert.equal(record?.event, 'exited');
+    assert.equal(record?.exit_code, 9);
+    assert.match(formatLedgerRecords([record!], new Date('2026-10-21T00:02:00Z')), /api \(unverified\)/);
+    assert.equal((await stat(file)).mode & 0o777, 0o600);
+    assert.equal((await stat(`${file}.1`)).mode & 0o777, 0o600);
+    assert.equal((await stat(path.dirname(file))).mode & 0o777, 0o700);
+    await writeFile(file, JSON.stringify({ ...event, schema_version: 3 }));
+    await assert.rejects(readLedger(runtime), StewardError);
+    await writeFile(file, JSON.stringify({ ...event, schema_version: 1 }));
+    await assert.rejects(readLedger(runtime), StewardError);
+    runtime.env.TYPESAFE_API_KEY = 'private-history-model';
+    await assert.rejects(
+      appendEvent(runtime, { ...event, selected: { ...event.selected, model: 'private-history-model' } }),
+      StewardError,
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test('history rejects a schema-version change within one request instead of mislabelling its selection', async () => {
+  const env = { HOME: '/isolated' };
+  const base = { request_id: 'same-request', recorded_at: '2026-10-21T00:00:00Z' };
+  const files = new Map([
+    [
+      ledgerFile(env),
+      [
+        {
+          ...base,
+          schema_version: 1,
+          event: 'launched',
+          selected: {
+            tool: 'pi',
+            provider: 'openai-codex',
+            model: 'm',
+            thinking_level: 'low',
+            quota_bucket: 'pi_codex',
+          },
+        },
+        { ...base, schema_version: 2, event: 'exited', exit_code: 0 },
+      ]
+        .map((value) => JSON.stringify(value))
+        .join('\n'),
+    ],
+  ]);
+  await assert.rejects(readLedger(memoryRuntime(files, env).rt), StewardError);
+});
+
+test('history rejects relative state roots without filesystem side effects for API-only routes', async () => {
+  for (const env of [
+    { HOME: 'relative-home' },
+    { HOME: '/absolute-home', XDG_STATE_HOME: 'relative-state' },
+    { HOME: '/absolute-home', XDG_STATE_HOME: ' ' },
+  ]) {
+    const files = new Map<string, string>();
+    const { rt, modes } = memoryRuntime(files, env);
+    await assert.rejects(
+      appendEvent(rt, {
+        schema_version: 2,
+        request_id: 'api-state',
+        recorded_at: '2026-10-21T00:00:00Z',
+        event: 'exited',
+        exit_code: 0,
+      }),
+      (error) => error instanceof StewardError && error.code === 'invalid_input',
+    );
+    await assert.rejects(readLedger(rt), (error) => error instanceof StewardError && error.code === 'invalid_input');
+    assert.equal(files.size, 0);
+    assert.deepEqual(modes, []);
+  }
+});
 
 const rotationEvent = {
   schema_version: 1 as const,

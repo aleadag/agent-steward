@@ -62,7 +62,20 @@ test('package core scope selects policy, validation and parsing tests, then smok
   assert.equal(result.code, 0, result.stderr);
   const selected = result.calls[0]!.args;
   assert.equal(selected[0], 'test');
-  for (const file of ['approval', 'commands', 'config', 'contracts', 'privacy', 'quota', 'retry', 'routing', 'triage'])
+  for (const file of [
+    'approval',
+    'commands',
+    'config',
+    'contracts',
+    'privacy',
+    'quota',
+    'retry',
+    'routing',
+    'triage',
+    'native-route',
+    'api-routing',
+    'policy-check',
+  ])
     assert.ok(selected.includes(`tests/${file}.test.ts`), `core behavior missing: ${file}`);
   for (const file of ['herdr-jobs', 'herdr-final-boundaries', 'herdr-shutdown', 'agy-runtime', 'installed'])
     assert.equal(selected.includes(`tests/${file}.test.ts`), false, `integration must stay outside package: ${file}`);

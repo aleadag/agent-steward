@@ -352,7 +352,7 @@ function formatEvaluation(name: string, evaluation: SelectedResult['evaluations'
 }
 
 export function renderDecisionCard(result: SelectedResult): string {
-  const { selected, quota, planned_command: command, evaluations } = result;
+  const { selected, planned_command: command, evaluations } = result;
   const lines = [
     `request ID: ${jsonValue(result.request_id)}`,
     `decision: selected`,
@@ -360,35 +360,43 @@ export function renderDecisionCard(result: SelectedResult): string {
     `provider: ${jsonValue(selected.provider)}`,
     `model: ${jsonValue(selected.model)}`,
     `thinking level: ${jsonValue(selected.thinking_level)}`,
-    `account: ${jsonValue(selected.quota_bucket)}`,
-    `quota source: ${jsonValue(quota.source)}`,
-    `snapshot status: ${quota.snapshot_status}`,
-    `pool: ${jsonValue(selected.quota_pool)}`,
-    `account status: ${quota.account_status}`,
-    `pool status: ${quota.pool_status}`,
   ];
-
-  const accountWindows = quota.windows.filter((window) => window.scope.type === 'account');
-  const poolWindows = quota.windows.filter((window) => window.scope.type === 'pool');
-  const appendWindows = (label: string, windows: typeof quota.windows): void => {
-    if (windows.length === 0) {
-      lines.push(`${label} remaining: unknown`);
-      lines.push(`${label} freshness: unknown`);
-      return;
-    }
-    for (const window of windows) {
-      const suffix = window.scope.type === 'pool' ? ` ${jsonValue(window.scope.pool_id)}` : '';
-      lines.push(
-        `${label}${suffix} remaining: ${window.status === 'known' ? `${window.remaining_percent}%` : 'unknown'}`,
-      );
-      lines.push(`${label}${suffix} reset at: ${jsonValue(window.reset_at)}`);
-      lines.push(`${label}${suffix} observed at: ${jsonValue(window.observed_at)}`);
-      lines.push(`${label}${suffix} valid until: ${jsonValue(window.valid_until)}`);
-      lines.push(`${label}${suffix} freshness: ${window.status}${window.reason === null ? '' : ` (${window.reason})`}`);
-    }
-  };
-  appendWindows('account', accountWindows);
-  appendWindows('pool', poolWindows);
+  if (result.schema_version === 2) {
+    lines.push('billing configured/unverified: api', 'subscription quota: not applicable');
+  } else {
+    const { quota } = result;
+    lines.push(
+      `account: ${jsonValue(selected.quota_bucket)}`,
+      `quota source: ${jsonValue(quota.source)}`,
+      `snapshot status: ${quota.snapshot_status}`,
+      `pool: ${jsonValue(selected.quota_pool)}`,
+      `account status: ${quota.account_status}`,
+      `pool status: ${quota.pool_status}`,
+    );
+    const accountWindows = quota.windows.filter((window) => window.scope.type === 'account');
+    const poolWindows = quota.windows.filter((window) => window.scope.type === 'pool');
+    const appendWindows = (label: string, windows: typeof quota.windows): void => {
+      if (windows.length === 0) {
+        lines.push(`${label} remaining: unknown`);
+        lines.push(`${label} freshness: unknown`);
+        return;
+      }
+      for (const window of windows) {
+        const suffix = window.scope.type === 'pool' ? ` ${jsonValue(window.scope.pool_id)}` : '';
+        lines.push(
+          `${label}${suffix} remaining: ${window.status === 'known' ? `${window.remaining_percent}%` : 'unknown'}`,
+        );
+        lines.push(`${label}${suffix} reset at: ${jsonValue(window.reset_at)}`);
+        lines.push(`${label}${suffix} observed at: ${jsonValue(window.observed_at)}`);
+        lines.push(`${label}${suffix} valid until: ${jsonValue(window.valid_until)}`);
+        lines.push(
+          `${label}${suffix} freshness: ${window.status}${window.reason === null ? '' : ` (${window.reason})`}`,
+        );
+      }
+    };
+    appendWindows('account', accountWindows);
+    appendWindows('pool', poolWindows);
+  }
 
   lines.push(...formatEvaluation('pair', evaluations.pair));
   if ('kind' in evaluations.effort) {
@@ -512,7 +520,7 @@ function relativeTime(timestamp: string, now: Date): string {
 
 function renderQuota(buckets: Awaited<ReturnType<typeof inspectQuota>>, now: Date, color: boolean): string {
   const style = (text: string, code: number): string => (color ? `\u001b[${code}m${text}\u001b[0m` : text);
-  if (buckets.length === 0) return `${style('No enabled quota buckets.', 2)}\n`;
+  if (buckets.length === 0) return `${style('No enabled subscription quota buckets.', 2)}\n`;
   const displayLabel = (value: string): string => (/^[\w.-]+$/.test(value) ? value : jsonValue(value));
   const groups = buckets.map(({ bucket, status, windows }) => ({
     bucket,
@@ -791,6 +799,7 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     }
   }
 
+  let historyVersion: 1 | 2 = 1;
   const recordEvent = async (
     event: LedgerEventKind,
     selected?: SelectedResult,
@@ -800,27 +809,46 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
   ): Promise<void> => {
     if (requestId === null) return;
     const diagnostics = failure?.diagnostics ?? warning;
-    await appendEvent(runtime, {
-      schema_version: 1,
+    if (selected !== undefined) historyVersion = selected.schema_version;
+    const common = {
       request_id: requestId,
       recorded_at: runtime.now().toISOString(),
       event,
-      ...(selected === undefined
-        ? {}
-        : {
-            selected: {
-              tool: selected.selected.tool,
-              provider: selected.selected.provider,
-              model: selected.selected.model,
-              thinking_level: selected.selected.thinking_level,
-              quota_bucket: selected.selected.quota_bucket,
-            },
-            usage: selected.evaluations.pair.usage,
-          }),
+      ...(selected === undefined ? {} : { usage: selected.evaluations.pair.usage }),
       ...(exitCode === undefined ? {} : { exit_code: exitCode }),
       ...(failure === undefined ? {} : { reason_code: failure.reason_code }),
       ...(diagnostics === undefined ? {} : { diagnostics }),
-    });
+    };
+    if (selected?.schema_version === 2) {
+      await appendEvent(runtime, {
+        ...common,
+        schema_version: 2,
+        selected: {
+          tool: selected.selected.tool,
+          provider: selected.selected.provider,
+          model: selected.selected.model,
+          thinking_level: selected.selected.thinking_level,
+          billing: 'api',
+          quota_bucket: null,
+        },
+      });
+    } else if (selected?.schema_version === 1) {
+      await appendEvent(runtime, {
+        ...common,
+        schema_version: 1,
+        selected: {
+          tool: selected.selected.tool,
+          provider: selected.selected.provider,
+          model: selected.selected.model,
+          thinking_level: selected.selected.thinking_level,
+          quota_bucket: selected.selected.quota_bucket,
+        },
+      });
+    } else if (historyVersion === 2) {
+      await appendEvent(runtime, { ...common, schema_version: 2 });
+    } else {
+      await appendEvent(runtime, { ...common, schema_version: 1 });
+    }
   };
   let routeDecisionKnown = false;
   const humanRoute = invocation.kind === 'route' && !invocation.json;
@@ -936,7 +964,9 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
         `provider requested/unverified: ${jsonValue(safeResult.selected.provider)}; ` +
         `model requested/unverified: ${jsonValue(safeResult.selected.model)}; ` +
         `thinking requested/unverified: ${jsonValue(safeResult.selected.thinking_level)}; ` +
-        `account requested/unverified: ${jsonValue(safeResult.selected.quota_bucket)}\n`;
+        (safeResult.schema_version === 2
+          ? 'billing configured/unverified: api; subscription quota: not applicable\n'
+          : `account requested/unverified: ${jsonValue(safeResult.selected.quota_bucket)}\n`);
       assertNoCredentials(summary, apiKey);
       runtime.stderr(summary);
       await recordEvent('launched', safeResult, undefined, undefined, warning);

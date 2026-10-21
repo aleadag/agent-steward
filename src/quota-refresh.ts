@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join } from 'node:path';
 import { SnapshotSchema, StewardError } from './contracts.ts';
-import type { Config, QuotaBucket, QuotaWindow, ReadText, SnapshotSource } from './contracts.ts';
+import type { Config, QuotaBucket, QuotaWindow, ReadText, SnapshotSource, SubscriptionCandidate } from './contracts.ts';
 import { assertByteLength, assertJsonDepth } from './limits.ts';
 import { assertNoCredentials } from './privacy.ts';
 import { quotaFile } from './quota.ts';
@@ -288,7 +288,12 @@ export async function refreshQuota(
   if (!Number.isFinite(now.getTime())) throw new StewardError('invalid_input');
   const enabled = new Set(config.tools);
   const buckets = new Set(
-    config.candidates.filter((candidate) => enabled.has(candidate.tool)).map((candidate) => candidate.quota_bucket),
+    config.candidates
+      .filter(
+        (candidate): candidate is SubscriptionCandidate =>
+          enabled.has(candidate.tool) && candidate.billing === 'subscription',
+      )
+      .map((candidate) => candidate.quota_bucket),
   );
   const result: { bucket: QuotaBucket; status: RefreshStatus }[] = [];
   for (const bucket of buckets) {

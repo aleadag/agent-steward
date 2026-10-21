@@ -11,6 +11,7 @@ case "${1:-}" in
       tests/agy-protocol.test.ts
       tests/agy-quota.test.ts
       tests/approval.test.ts
+      tests/api-routing.test.ts
       tests/bun-cache.test.ts
       tests/commands.test.ts
       tests/config.test.ts
@@ -20,6 +21,8 @@ case "${1:-}" in
       tests/io.test.ts
       tests/jev.test.ts
       tests/limits.test.ts
+      tests/native-route.test.ts
+      tests/policy-check.test.ts
       tests/privacy.test.ts
       tests/quota.test.ts
       tests/response-details.test.ts

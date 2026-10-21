@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { nativeRoute } from './native-route.ts';
 import { compareRfc3339Timestamps } from './timestamps.ts';
 
 const text = z
@@ -41,13 +42,11 @@ const ApprovalContextObjectSchema = z.custom<Record<string, unknown>>(
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null),
 );
 const ThinkingLevelSchema = z.strictObject({ id: text, description: text });
-const CandidateSchema = z.strictObject({
+const CandidateCommonSchema = z.strictObject({
   id: text,
   tool: ToolSchema,
   provider: text,
   model: text,
-  quota_bucket: QuotaBucketSchema,
-  quota_pool: text,
   cost: z.number().finite().positive(),
   capabilities: text,
   thinking_levels: z
@@ -62,6 +61,18 @@ const CandidateSchema = z.strictObject({
       });
     }),
 });
+
+const CandidateSchema = z.preprocess(
+  (value) => (isRecord(value) && !Object.hasOwn(value, 'billing') ? { ...value, billing: 'subscription' } : value),
+  z.discriminatedUnion('billing', [
+    CandidateCommonSchema.extend({
+      billing: z.literal('subscription'),
+      quota_bucket: QuotaBucketSchema,
+      quota_pool: text,
+    }),
+    CandidateCommonSchema.extend({ billing: z.literal('api') }),
+  ]),
+);
 
 export const EvaluatorConfigSchema = z
   .strictObject({
@@ -95,10 +106,24 @@ export const ConfigSchema = z
     if (config.jev !== undefined && config.evaluator !== undefined)
       context.addIssue({ code: 'custom', path: ['evaluator'], message: 'Use evaluator or legacy jev, not both' });
     const candidateIds = new Set<string>();
+    const enabledTools = new Set(config.tools);
+    const routes = new Map<string, 'api' | 'subscription'>();
     config.candidates.forEach((candidate, index) => {
       if (candidateIds.has(candidate.id))
         context.addIssue({ code: 'custom', path: ['candidates', index, 'id'], message: 'Duplicate candidate ID' });
       candidateIds.add(candidate.id);
+      if (enabledTools.has(candidate.tool)) {
+        const identity = nativeRoute(candidate).identity;
+        const previous = routes.get(identity);
+        if (previous !== undefined && previous !== candidate.billing)
+          context.addIssue({
+            code: 'custom',
+            path: ['candidates', index, 'billing'],
+            message: 'Conflicting native route billing',
+          });
+        routes.set(identity, candidate.billing);
+      }
+      if (candidate.billing === 'api') return;
       const paired =
         candidate.tool === 'codex'
           ? candidate.quota_bucket === 'codex'
@@ -241,7 +266,7 @@ const QuotaWindowFactSchema = z.strictObject({
   observed_at: dateTime,
   valid_until: dateTime,
 });
-const QuotaFactsSchema = z.strictObject({
+export const SubscriptionQuotaFactsSchema = z.strictObject({
   source: QuotaBucketSchema,
   quota_bucket: QuotaBucketSchema,
   pool_id: text,
@@ -249,6 +274,10 @@ const QuotaFactsSchema = z.strictObject({
   account_status: z.enum(['known', 'unknown']),
   pool_status: z.enum(['known', 'unknown']),
   windows: z.array(QuotaWindowFactSchema),
+});
+export const ApiQuotaFactsSchema = z.strictObject({
+  status: z.literal('not_applicable'),
+  reason: z.literal('api_billed'),
 });
 const PlannedCommandSchema = z.strictObject({
   executable: ToolSchema,
@@ -259,7 +288,7 @@ const PlannedCommandSchema = z.strictObject({
   authentication: z.literal('unverified'),
   provider_selection: z.enum(['explicit_flag', 'existing_settings']),
 });
-const SelectedResultSchema = z.strictObject({
+const SubscriptionSelectedResultSchema = z.strictObject({
   schema_version: z.literal(1),
   request_id: text,
   decision: z.literal('selected'),
@@ -272,13 +301,24 @@ const SelectedResultSchema = z.strictObject({
     quota_bucket: QuotaBucketSchema,
     quota_pool: text,
   }),
-  quota: QuotaFactsSchema,
+  quota: SubscriptionQuotaFactsSchema,
   planned_command: PlannedCommandSchema,
   evaluations: z.strictObject({
     pair: EvaluationSchema,
     effort: z.union([EvaluationSchema, z.strictObject({ kind: z.literal('fixed'), level: text })]),
   }),
 });
+const ApiSelectedResultSchema = SubscriptionSelectedResultSchema.extend({
+  schema_version: z.literal(2),
+  selected: SubscriptionSelectedResultSchema.shape.selected.extend({
+    billing: z.literal('api'),
+    quota_bucket: z.null(),
+    quota_pool: z.null(),
+  }),
+  quota: ApiQuotaFactsSchema,
+});
+const SelectedResultSchema = z.union([SubscriptionSelectedResultSchema, ApiSelectedResultSchema]);
+
 export const FailureDiagnosticsSchema = z.strictObject({
   stage: z.enum(['input', 'config', 'preflight', 'quota', 'credentials', 'evaluation', 'response', 'launch']),
   kind: z
@@ -492,13 +532,19 @@ export type Config = z.infer<typeof ConfigSchema>;
 export type QuotaBucket = z.infer<typeof QuotaBucketSchema>;
 export type SnapshotSource = z.infer<typeof SnapshotSourceSchema>;
 export type Candidate = Config['candidates'][number];
+export type SubscriptionCandidate = Extract<Candidate, { billing: 'subscription' }>;
+export type ApiCandidate = Extract<Candidate, { billing: 'api' }>;
 export type ThinkingLevel = Candidate['thinking_levels'][number];
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 export type QuotaWindow = Snapshot['windows'][number];
 export type StopInput = z.infer<typeof StopInputSchema>;
-export type QuotaFacts = z.infer<typeof QuotaFactsSchema>;
+export type SubscriptionQuotaFacts = z.infer<typeof SubscriptionQuotaFactsSchema>;
+export type ApiQuotaFacts = z.infer<typeof ApiQuotaFactsSchema>;
+export type QuotaFacts = SubscriptionQuotaFacts | ApiQuotaFacts;
 export type QuotaWindowFact = z.infer<typeof QuotaWindowFactSchema>;
 export type PlannedCommand = z.infer<typeof PlannedCommandSchema>;
+export type SubscriptionSelectedResult = z.infer<typeof SubscriptionSelectedResultSchema>;
+export type ApiSelectedResult = z.infer<typeof ApiSelectedResultSchema>;
 export type SelectedResult = z.infer<typeof SelectedResultSchema>;
 export type ErrorResult = z.infer<typeof ErrorResultSchema>;
 export type ChoiceAnswer = z.infer<typeof ChoiceAnswerSchema>;

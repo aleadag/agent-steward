@@ -287,6 +287,74 @@ test.skipIf(!pkg)('installed routing ignores cwd bucket files and reads trusted 
   });
 });
 
+test.skipIf(!pkg)('installed API billing admits native config without reading native auth or calling a model', () => {
+  assert.ok(pkg);
+  const packagePath = pkg;
+  withIsolatedHome(({ root, home, xdg, run }) => {
+    const configDir = join(xdg, 'agent-steward');
+    mkdirSync(configDir);
+    const configPath = join(configDir, 'config.json');
+    writeConfig(configPath, {
+      tools: ['pi'],
+      candidates: [
+        {
+          id: 'api-only',
+          tool: 'pi',
+          billing: 'api',
+          provider: 'synthetic',
+          model: 'api-example',
+          cost: 1,
+          capabilities: 'Synthetic fixture only',
+          thinking_levels: [{ id: 'default', description: 'Native default' }],
+        },
+      ],
+    });
+    const noKey = run(['router', 'start', 'Synthetic task', '--dry-run', '--json']);
+    assert.equal(parsed(noKey).reason_code, 'missing_credentials');
+    assert.doesNotMatch(noKey.stderr, /quota_missing/);
+    const cli = pathToFileURL(join(packagePath, 'lib/agent-steward/dist/src/cli.js')).href;
+    const main = pathToFileURL(join(packagePath, 'lib/agent-steward/dist/src/main.js')).href;
+    const source = `
+      const { run } = await import(${JSON.stringify(cli)});
+      const { createRuntime } = await import(${JSON.stringify(main)});
+      const runtime = createRuntime();
+      const readText = runtime.readText;
+      const deny = async () => { throw new Error('Unexpected native model/auth/quota operation'); };
+      let calls = 0;
+      process.exitCode = await run(['router', 'start', 'Synthetic task', '--dry-run', '--json'], {
+        ...runtime, launch: deny, httpGet: deny, collectAgy: deny,
+        readText: async file => {
+          if (file !== ${JSON.stringify(configPath)}) throw new Error('Unexpected auth/snapshot read');
+          return readText(file);
+        },
+        post: async request => {
+          calls++;
+          const wire = JSON.parse(request.body);
+          if (Object.keys(wire.questions.pair.criteria).join(',') !== 'api-only') throw new Error('Bad candidates');
+          return { status: 200, body: JSON.stringify({
+            model: 'jev-1.13.0',
+            answers: { pair: { type: 'choice', choice: 'api-only', probabilities: { 'api-only': 1 }, confidence: 1 } },
+            usage: { input_tokens: 1, output_tokens: 1 },
+          }) };
+        },
+      });
+      if (calls !== 1) throw new Error('Unexpected evaluator count');
+    `;
+    const response = spawnSync(join(packagePath, 'lib/agent-steward/bun/bin/bun'), ['--eval', source], {
+      cwd: root,
+      env: { HOME: home, XDG_CONFIG_HOME: xdg, PATH: '', TYPESAFE_API_KEY: 'SyntheticEvaluatorOnly' },
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    assert.equal(response.status, 0, response.stderr);
+    const selected = parsed(response);
+    assert.equal(selected.schema_version, 2);
+    assert.equal(selected.selected.billing, 'api');
+    assert.deepEqual(selected.quota, { status: 'not_applicable', reason: 'api_billed' });
+    assert.equal(existsSync(join(home, '.pi')), false);
+  });
+});
+
 test.skipIf(!pkg)('installed bundle contains no account, quota, example, or session inputs', () => {
   assert.ok(pkg, 'installed check must receive the explicit package path');
   const root = join(pkg, 'lib/agent-steward');

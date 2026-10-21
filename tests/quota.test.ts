@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { readFileText } from '../src/io.ts';
 import { loadQuota as loadQuotaSource } from '../src/quota.ts';
-import type { Config, QuotaFacts, QuotaWindowFact } from '../src/contracts.ts';
-import { config, candidate, snapshot, windowFact } from './helpers.ts';
+import type { Config, SubscriptionQuotaFacts as QuotaFacts, QuotaWindowFact } from '../src/contracts.ts';
+import { assertSubscriptionQuota, config, candidate, snapshot, windowFact } from './helpers.ts';
 
 const now = new Date('2026-09-28T10:30:00Z');
 
@@ -21,7 +21,7 @@ async function loadQuota(config: Config, io: QuotaTestIO) {
     size: loaded.size,
     get(candidateId: string): QuotaFacts {
       const facts = loaded.get(candidateId);
-      assert.ok(facts, `expected quota facts for ${candidateId}`);
+      assertSubscriptionQuota(facts);
       return facts;
     },
   };

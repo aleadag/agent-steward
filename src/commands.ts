@@ -1,7 +1,7 @@
 import { StewardError } from './contracts.ts';
+import { isPiThinkingLevel, nativeRoute } from './native-route.ts';
 import type { Candidate, PlannedCommand, ThinkingLevel, Tool } from './contracts.ts';
 
-const PI_EFFORTS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const AGY_EFFORTS = new Set(['low', 'medium', 'high', 'max']);
 // eslint-disable-next-line no-control-regex -- Reject ASCII controls in executable arguments.
 const ASCII_CONTROLS = /[\x00-\x1f\x7f]/;
@@ -17,7 +17,7 @@ function validateArgString(value: string, optionLike = false): void {
 function validateLevel(tool: Tool, level: ThinkingLevel): void {
   validateArgString(level.id);
   if (level.id === 'default') return;
-  if (tool === 'pi' && !PI_EFFORTS.has(level.id)) invalidConfig();
+  if (tool === 'pi' && !isPiThinkingLevel(level.id)) invalidConfig();
   if (tool === 'agy' && !AGY_EFFORTS.has(level.id)) invalidConfig();
 }
 
@@ -52,7 +52,6 @@ export function buildCommand(candidate: Candidate, level: string): PlannedComman
 
   const displayProvider = candidate.provider;
   let args: string[];
-  let providerSelection: PlannedCommand['provider_selection'];
   switch (candidate.tool) {
     case 'codex':
       args = [
@@ -62,15 +61,12 @@ export function buildCommand(candidate: Candidate, level: string): PlannedComman
         `model_provider=${JSON.stringify(displayProvider)}`,
         ...effortArgs(candidate.tool, level),
       ];
-      providerSelection = 'explicit_flag';
       break;
     case 'pi':
       args = ['--provider', displayProvider, '--model', candidate.model, ...effortArgs(candidate.tool, level)];
-      providerSelection = 'explicit_flag';
       break;
     case 'agy':
       args = [`--model=${candidate.model}`, ...effortArgs(candidate.tool, level)];
-      providerSelection = 'existing_settings';
       break;
   }
 
@@ -82,6 +78,6 @@ export function buildCommand(candidate: Candidate, level: string): PlannedComman
     syntax_validated: true,
     runtime_selection: 'unverified',
     authentication: 'unverified',
-    provider_selection: providerSelection,
+    provider_selection: nativeRoute(candidate).provider_selection,
   };
 }

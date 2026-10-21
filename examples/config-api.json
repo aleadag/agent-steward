@@ -1,0 +1,38 @@
+{
+  "tools": [
+    "pi"
+  ],
+  "candidates": [
+    {
+      "id": "subscription-pi-example",
+      "tool": "pi",
+      "provider": "openai-codex",
+      "model": "subscription-model-example",
+      "quota_bucket": "pi_codex",
+      "quota_pool": "primary",
+      "cost": 2,
+      "capabilities": "Operator-supplied subscription model capabilities; example only",
+      "thinking_levels": [
+        {
+          "id": "default",
+          "description": "Use the native default"
+        }
+      ]
+    },
+    {
+      "id": "deepseek-api-example",
+      "tool": "pi",
+      "billing": "api",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "cost": 1,
+      "capabilities": "Operator-supplied API model capabilities; example only",
+      "thinking_levels": [
+        {
+          "id": "default",
+          "description": "Use the native default"
+        }
+      ]
+    }
+  ]
+}

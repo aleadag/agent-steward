@@ -1,12 +1,23 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { StopInputSchema } from '../src/contracts.ts';
+import { ConfigSchema, StopInputSchema } from '../src/contracts.ts';
 import { parseArgs, run } from '../src/cli.ts';
 import type { Invocation, Runtime } from '../src/cli.ts';
 
 const skill = readFileSync(new URL('../skills/agent-steward/SKILL.md', import.meta.url), 'utf8');
 const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+test('mixed-billing example admits a default subscription and an explicit API candidate', () => {
+  const raw = JSON.parse(readFileSync(new URL('../examples/config-api.json', import.meta.url), 'utf8'));
+  const cfg = ConfigSchema.parse(raw);
+  assert.deepEqual(
+    cfg.candidates.map((candidate) => candidate.billing),
+    ['subscription', 'api'],
+  );
+  assert.equal(Object.hasOwn(raw.candidates[0], 'billing'), false);
+  assert.equal(Object.hasOwn(cfg.candidates[1]!, 'quota_bucket'), false);
+});
+
 const stopExample = JSON.parse(readFileSync(new URL('../examples/stop.json', import.meta.url), 'utf8'));
 
 function parseSkillCommands(text: string): string[] {

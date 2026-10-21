@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'bun:test';
 import { quotaResetHint } from '../src/herdr-adapter/quota-hint.ts';
+import { ConfigSchema } from '../src/contracts.ts';
+import { apiCandidate } from './helpers.ts';
 import type { ObservedStop } from '../src/herdr-adapter/observe.ts';
 
 const now = new Date('2026-10-04T10:00:00Z');
@@ -84,6 +86,31 @@ function fixture(
     },
   };
 }
+
+test('API and mixed-billing model mentions never infer a subscription reset', async () => {
+  const api = apiCandidate({ model: candidate.model });
+  for (const candidates of [[api], [candidate, api]]) {
+    const raw = { tools: ['pi'], candidates };
+    assert.equal(ConfigSchema.safeParse(raw).success, true);
+    const io = fixture({ configText: JSON.stringify(raw) });
+    assert.equal(await quotaResetHint(observed, io), null);
+    assert.equal(io.reads.length, 1);
+  }
+});
+
+test('native API aliases are counted before assigning a subscription hint or reading its snapshot', async () => {
+  for (const model of ['other-provider/model-one', 'model-one:high', 'model-one:high:low', 'MODEL-ONE']) {
+    const raw = { tools: ['pi'], candidates: [candidate, apiCandidate({ provider: 'other-provider', model })] };
+    assert.equal(ConfigSchema.safeParse(raw).success, true, 'Distinct providers remain legal');
+    const io = fixture({ configText: JSON.stringify(raw) });
+    assert.equal(await quotaResetHint(observed, io), null);
+    assert.equal(io.reads.length, 1, 'Ambiguous aliases must not read subscription snapshots');
+  }
+  const unrelated = { tools: ['pi'], candidates: [candidate, apiCandidate({ model: 'unrelated-model' })] };
+  const io = fixture({ configText: JSON.stringify(unrelated) });
+  assert.equal(await quotaResetHint(observed, io), '2026-10-04T10:13:00.000Z');
+  assert.equal(io.reads.length, 2);
+});
 
 test('fresh exhausted account windows use latest reset plus one minute', async () => {
   const io = fixture({

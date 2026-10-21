@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { FailureDiagnosticsSchema, StewardError } from './contracts.ts';
 import { assertNoCredentials, configuredApiKeys } from './privacy.ts';
 
-const EventSchema = z
+const EventV1Schema = z
   .object({
     schema_version: z.literal(1),
     request_id: z.string().min(1),
@@ -38,6 +38,18 @@ const EventSchema = z
   })
   .strict();
 
+const EventV2Schema = EventV1Schema.extend({
+  schema_version: z.literal(2),
+  selected: EventV1Schema.shape.selected
+    .unwrap()
+    .extend({
+      billing: z.literal('api'),
+      quota_bucket: z.null(),
+    })
+    .optional(),
+});
+const EventSchema = z.union([EventV1Schema, EventV2Schema]);
+
 export type LedgerEvent = z.infer<typeof EventSchema>;
 export type LedgerEventKind = LedgerEvent['event'];
 const MAX_LEDGER_BYTES = 5 * 1024 * 1024;
@@ -55,7 +67,7 @@ export type LedgerRuntime = {
 
 export function ledgerFile(env: { XDG_STATE_HOME?: string; HOME?: string }): string {
   const state = env.XDG_STATE_HOME || (env.HOME ? path.join(env.HOME, '.local/state') : null);
-  if (state === null) throw new StewardError('invalid_input');
+  if (state === null || !path.isAbsolute(state)) throw new StewardError('invalid_input');
   return path.join(state, 'agent-steward/router.jsonl');
 }
 
@@ -80,7 +92,7 @@ export async function appendEvent(runtime: LedgerRuntime, event: LedgerEvent): P
   });
 }
 
-const SelectedSchema = EventSchema.shape.selected.unwrap();
+const SelectedSchema = EventV1Schema.shape.selected.unwrap();
 const LegacySelectedSchema = SelectedSchema.omit({ quota_bucket: true })
   .extend({ account_id: z.string(), quota_bucket: z.string().optional() })
   .transform(({ account_id: _accountId, quota_bucket, ...selected }) => ({
@@ -88,9 +100,10 @@ const LegacySelectedSchema = SelectedSchema.omit({ quota_bucket: true })
     // Legacy account IDs were aliases, not evidence of a credential bucket.
     quota_bucket: quota_bucket ?? null,
   }));
-const ReadEventSchema = EventSchema.extend({
-  selected: z.union([SelectedSchema, LegacySelectedSchema]).optional(),
-});
+const ReadEventSchema = z.union([
+  EventV1Schema.extend({ selected: z.union([SelectedSchema, LegacySelectedSchema]).optional() }),
+  EventV2Schema,
+]);
 type LedgerRecord = z.infer<typeof ReadEventSchema>;
 
 export async function readLedger(runtime: LedgerRuntime): Promise<LedgerRecord[]> {
@@ -112,8 +125,16 @@ export async function readLedger(runtime: LedgerRuntime): Promise<LedgerRecord[]
       throw new StewardError('invalid_input');
     }
     const previous = folded.get(event.request_id);
+    if (previous !== undefined && previous.schema_version !== event.schema_version)
+      throw new StewardError('invalid_input');
     folded.delete(event.request_id);
-    folded.set(event.request_id, { ...previous, ...event });
+    if (event.schema_version === 2) {
+      const prior = previous?.schema_version === 2 ? previous : undefined;
+      folded.set(event.request_id, { ...prior, ...event });
+    } else {
+      const prior = previous?.schema_version === 1 ? previous : undefined;
+      folded.set(event.request_id, { ...prior, ...event });
+    }
   }
   return [...folded.values()].reverse();
 }
@@ -142,7 +163,8 @@ export function formatLedgerRecords(records: LedgerRecord[], now: Date): string 
     const selected = record.selected;
     const route = selected ? `${selected.tool}/${selected.model}/${selected.thinking_level}` : '—';
     const time = relativeLedgerTime(record.recorded_at, now);
-    const fields = [record.request_id, time, route, selected?.quota_bucket ?? '—', record.event];
+    const account = record.schema_version === 2 && selected ? 'api (unverified)' : (selected?.quota_bucket ?? '—');
+    const fields = [record.request_id, time, route, account, record.event];
     if (hasExitCode) fields.push(record.exit_code === undefined ? '—' : String(record.exit_code));
     return fields.map((field) => JSON.stringify(field).slice(1, -1));
   });

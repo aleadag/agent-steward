@@ -1,5 +1,9 @@
 import type {
   StopInput,
+  ApiSelectedResult,
+  ApiCandidate,
+  SubscriptionCandidate,
+  SubscriptionQuotaFacts,
   Candidate,
   ChoiceAnswer,
   Config,
@@ -21,9 +25,12 @@ export function config(overrides: Partial<Config> | Record<string, unknown> = {}
   } as Config;
 }
 
-export function candidate(overrides: Partial<Candidate> | Record<string, unknown> = {}): Candidate {
+export function candidate(
+  overrides: Partial<SubscriptionCandidate> | Record<string, unknown> = {},
+): SubscriptionCandidate {
   return {
     id: 'codex-astra',
+    billing: 'subscription',
     tool: 'codex',
     provider: 'openai',
     model: 'gpt-astra-example',
@@ -33,7 +40,53 @@ export function candidate(overrides: Partial<Candidate> | Record<string, unknown
     capabilities: 'Illustrative coding model; not verified live',
     thinking_levels: [{ id: 'low', description: 'Configured low effort' }],
     ...overrides,
-  } as Candidate;
+  } as SubscriptionCandidate;
+}
+
+export function apiCandidate(overrides: Partial<ApiCandidate> = {}): ApiCandidate {
+  return {
+    id: 'deepseek-api',
+    tool: 'pi',
+    billing: 'api',
+    provider: 'deepseek',
+    model: 'deepseek-v4-flash',
+    cost: 1,
+    capabilities: 'Synthetic bounded implementation capability',
+    thinking_levels: [{ id: 'default', description: 'Native default' }],
+    ...overrides,
+  };
+}
+
+export function apiSelectedResult(): ApiSelectedResult {
+  return {
+    schema_version: 2,
+    request_id: 'api-request',
+    decision: 'selected',
+    selected: {
+      candidate_id: 'api-model',
+      tool: 'pi',
+      provider: 'deepseek',
+      model: 'deepseek-v4-flash',
+      thinking_level: 'default',
+      billing: 'api',
+      quota_bucket: null,
+      quota_pool: null,
+    },
+    quota: { status: 'not_applicable', reason: 'api_billed' },
+    planned_command: {
+      executable: 'pi',
+      args: ['--provider', 'deepseek', '--model', 'deepseek-v4-flash'],
+      display: "'pi' '--provider' 'deepseek' '--model' 'deepseek-v4-flash'",
+      syntax_validated: true,
+      runtime_selection: 'unverified',
+      authentication: 'unverified',
+      provider_selection: 'explicit_flag',
+    },
+    evaluations: {
+      pair: evaluation({ pair: choice({ 'api-model': 1 }) }),
+      effort: { kind: 'fixed', level: 'default' },
+    },
+  };
 }
 
 export function choice(probabilities: Record<string, number>, confidence = 0.9, returned?: string): ChoiceAnswer {
@@ -50,8 +103,9 @@ export function evaluation(answers: Evaluation['answers'] | Record<string, unkno
 
 export function quotaFacts(
   candidate: Candidate,
-  overrides: Partial<QuotaFacts> | Record<string, unknown> = {},
-): QuotaFacts {
+  overrides: Partial<SubscriptionQuotaFacts> | Record<string, unknown> = {},
+): SubscriptionQuotaFacts {
+  if (candidate.billing === 'api') throw new Error('Expected subscription candidate');
   return {
     source: candidate.quota_bucket,
     quota_bucket: candidate.quota_bucket,
@@ -61,7 +115,11 @@ export function quotaFacts(
     pool_status: 'unknown',
     windows: [],
     ...overrides,
-  } as QuotaFacts;
+  } as SubscriptionQuotaFacts;
+}
+
+export function assertSubscriptionQuota(value: QuotaFacts | undefined): asserts value is SubscriptionQuotaFacts {
+  if (value === undefined || !('windows' in value)) throw new Error('Expected subscription quota');
 }
 
 export function choiceAnswer(probabilities: Record<string, number>, confidence = 0.9, returned?: string): ChoiceAnswer {

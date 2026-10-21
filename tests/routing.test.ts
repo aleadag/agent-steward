@@ -1,14 +1,26 @@
 import { afterEach, mock, spyOn, test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { route } from '../src/routing.ts';
+import { route as routeAny } from '../src/routing.ts';
 import { loadQuota } from '../src/quota.ts';
 import { makeEvaluator, validateEvaluation } from '../src/jev.ts';
 import { ResultSchema, StewardError } from '../src/contracts.ts';
-import type { Candidate, Config, QuotaFacts } from '../src/contracts.ts';
+import type {
+  Candidate,
+  Config,
+  QuotaFacts,
+  SubscriptionQuotaFacts,
+  SubscriptionSelectedResult,
+} from '../src/contracts.ts';
 import type { Evaluate, Questions } from '../src/jev.ts';
 import { config, candidate, choice, evaluation, quotaFacts, snapshot, windowFact, runSubcase } from './helpers.ts';
 
 afterEach(() => mock.restore());
+
+async function route(input: Parameters<typeof routeAny>[0]): Promise<SubscriptionSelectedResult> {
+  const result = await routeAny(input);
+  assert.ok(result.schema_version === 1, 'Subscription fixtures must retain version-1 results');
+  return result;
+}
 
 const task = 'Review parser';
 const fixedNow = new Date('2026-09-28T10:30:00Z');
@@ -17,17 +29,7 @@ function routeInput(
   cfg: Config,
   evaluate: Evaluate,
   quota: Map<string, QuotaFacts> = new Map(
-    cfg.candidates
-      .filter((item) => cfg.tools.includes(item.tool))
-      .map(
-        (item) =>
-          [
-            item.id,
-            quotaFacts(item, {
-              source: item.quota_bucket,
-            }),
-          ] as const,
-      ),
+    cfg.candidates.filter((item) => cfg.tools.includes(item.tool)).map((item) => [item.id, quotaFacts(item)] as const),
   ),
 ) {
   return { task, requestId: 'route-1', config: cfg, quota, evaluate, now: new Date(fixedNow) };
@@ -156,8 +158,8 @@ test('Jev gets only relative reset timing without changing shared or stale quota
       ),
   });
   const before = JSON.stringify([...quota]);
-  type EvaluatorQuota = Omit<QuotaFacts, 'windows'> & {
-    windows: (Omit<QuotaFacts['windows'][number], 'reset_at'> & { seconds_until_reset: number })[];
+  type EvaluatorQuota = Omit<SubscriptionQuotaFacts, 'windows'> & {
+    windows: (Omit<SubscriptionQuotaFacts['windows'][number], 'reset_at'> & { seconds_until_reset: number })[];
   };
   const wires: {
     state: {
@@ -472,8 +474,8 @@ test('Jev receives local weekly pacing in both stages and may select an over-bud
       ),
   });
   const before = JSON.stringify([...quota]);
-  type PacingQuota = Omit<QuotaFacts, 'windows'> & {
-    windows: (QuotaFacts['windows'][number] & {
+  type PacingQuota = Omit<SubscriptionQuotaFacts, 'windows'> & {
+    windows: (SubscriptionQuotaFacts['windows'][number] & {
       weekly_pacing: { expected_remaining_percent: number; deficit_percent: number; over_budget: boolean } | null;
     })[];
   };
