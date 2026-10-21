@@ -223,7 +223,7 @@ export function beginWorkflow(options: AuthorityOptions): WorkflowAttempt {
         lifetime.close('not_admitted');
         return null;
       }
-      const captured = await options.state.capture(scope.serverId, initial.enabled);
+      const captured = await options.state.capture(scope.serverId, initial.enabled, () => lifetime.open());
       if (!lifetime.open()) return null;
       if (!captured || !(await options.state.matches(captured))) {
         lifetime.close('not_admitted');

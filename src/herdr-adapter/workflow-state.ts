@@ -818,16 +818,27 @@ export class WorkflowState {
     }
   }
 
-  async capture(serverId: string, enabled: boolean): Promise<AdmissionTicket | null> {
-    if (enabled !== true || !serverId || this.closed.has(serverId)) return null;
+  async capture(serverId: string, enabled: boolean, open = () => true): Promise<AdmissionTicket | null> {
+    if (enabled !== true || !serverId || this.closed.has(serverId) || !open()) return null;
     const revision = this.revision.get(serverId);
+    const live = () => open() && !this.closed.has(serverId) && this.revision.get(serverId) === revision;
     try {
       const path = await this.prepare(serverId);
+      // Anchor an existing epoch before waiting; a pause/resume cannot become a
+      // fresh grant for this invocation. Absence is validated under the guard.
+      let expected: Control | null = null;
+      try {
+        expected = controlSchema.parse(await readPrivateJson(path, 8192, this.options));
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+      }
       const selected = await withPrivateGuard(
         dirname(path),
         'control-guard',
         async () => {
+          if (!live()) return null;
           let control = await this.read(serverId, path);
+          if (expected && (!control || control.epoch !== expected.epoch || expected.mode !== 'open')) return null;
           if (control === null) {
             if (this.closed.has(serverId)) return null;
             control = { protocol: 1, epoch: randomUUID(), mode: 'open' };
@@ -838,8 +849,12 @@ export class WorkflowState {
           return confirmed;
         },
         this.options,
+        // No prior epoch means contention could be the first administrative
+        // pause, not initialization. Retain the original try-lock refusal then.
+        expected ? { deadline: performance.now() + 2000, open: live } : undefined,
       );
       if (
+        !open() ||
         !selected ||
         this.revision.get(serverId) !== revision ||
         this.closed.has(serverId) ||
@@ -947,6 +962,7 @@ export class WorkflowState {
     const start = new Promise<void>((resolve) => {
       started = resolve;
     });
+    const deadline = performance.now() + 2000;
     const reserve = (assertBinding?: () => Promise<void>) =>
       withPrivateGuard(
         dirname(this.path(ticket.serverId)),
@@ -978,10 +994,11 @@ export class WorkflowState {
           return options.generation ? this.lease(scope).withGenerationGuard(options.generation, slot) : slot();
         },
         this.options,
+        { deadline, open: live },
       );
-    // Located exit writers retain their exact binding while refreshing the
-    // captured G/socket/native permission proofs. Both guards are try-locks:
-    // pane -> retry -> binding -> control never waits on a competing publisher.
+    // Retain the exact binding while waiting briefly for control admission.
+    // Binding stays a try-lock; control holders never wait for a binding.
+    // Fresh epoch, permission and generation checks still precede invocation.
     const reservation =
       options.revalidate && !options.bindingHeld
         ? withPrivateGuard(this.workflowDirectory(scope), 'binding-guard', reserve, this.options)
