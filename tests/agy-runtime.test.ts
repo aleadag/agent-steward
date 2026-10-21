@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { Server } from 'node:net';
 import { collectNativeAgy, runPreviousAgyRenderer, sendAgyCapture } from '../src/agy-runtime.ts';
 import { agyPaths } from '../src/agy-setup.ts';
+import { agyAuth } from './agy-helpers.ts';
 
 async function fixture(
   run: (
@@ -136,6 +137,19 @@ test('Bun PTY collects only post-/usage observations without a caller terminal',
     });
     assert.equal(result.status, 'captured');
     if (result.status === 'captured') assert.equal(result.observation.requestId, 'request-a');
+  }));
+test('native renewal survives a transient login selection without a caller terminal', async () =>
+  fixture(async (paths, executable, nativeEnv) => {
+    await fs.writeFile(paths.auth, agyAuth('same', '2000-01-01T00:00:00Z'));
+    const result = await collectNativeAgy({
+      paths,
+      executable,
+      nativeEnv: { ...nativeEnv, STEWARD_FAKE_AGY_CASE: 'renew' },
+      requestId: 'request-a',
+      now: () => new Date(),
+    });
+    assert.equal(result.status, 'captured');
+    assert.equal(JSON.parse(await fs.readFile(paths.auth, 'utf8')).token.expiry, '2050-01-01T00:00:00Z');
   }));
 test('native refusal/error states, wrong requests and missing executables fail safely', async () =>
   fixture(async (paths, executable, nativeEnv) => {

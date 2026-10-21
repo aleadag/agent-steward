@@ -25,6 +25,8 @@ function agyQuota() {
   );
 }
 if (scenario === 'renew') {
+  console.log('Signing in...\nSelect login method:');
+  await Bun.sleep(10);
   const auth = join(process.env.HOME!, '.gemini/antigravity-cli/antigravity-oauth-token');
   const value = await Bun.file(auth).json();
   value.token.expiry = '2050-01-01T00:00:00Z';
@@ -79,8 +81,10 @@ async function capture() {
     });
 }
 if (scenario === 'trust') console.log('Do you trust the contents of this project?');
-else if (scenario === 'auth') console.log('Select login method:');
-else if (scenario === 'overflow') process.stdout.write('x'.repeat(1048577));
+else if (scenario === 'auth') {
+  console.log('Select login method:');
+  setTimeout(() => process.exit(0), 50);
+} else if (scenario === 'overflow') process.stdout.write('x'.repeat(1048577));
 else if (scenario === 'early') process.exit(0);
 else if (scenario === 'timeout') console.log('loading');
 else {

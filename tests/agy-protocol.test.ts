@@ -57,7 +57,6 @@ test('stale, wrong-request, pre-submit and future observations cannot complete r
 test('trust/login/settings/refresh errors never receive approval input', () => {
   for (const [screen, status, diagnostic] of [
     ['Do you trust the contents of this project?', 'fetch', 'quota_agy_trust'],
-    ['Select login method:', 'auth', undefined],
     ['paste the authorization code', 'auth', undefined],
     ['Settings Error', 'fetch', undefined],
     ['Failed to refresh quota', 'fetch', undefined],
@@ -66,6 +65,44 @@ test('trust/login/settings/refresh errors never receive approval input', () => {
     assert.deepEqual(f.terminal(screen), [{ kind: 'stop' }]);
     assert.deepEqual(f.machine.result(), { status, ...(diagnostic ? { diagnostic } : {}) });
     assert.deepEqual(f.terminal(prompt), []);
+  }
+});
+test('native renewal may pass through login selection before a later normal prompt', () => {
+  const stream = Buffer.from('Signing in...\nSelect login method:\n' + prompt);
+  for (let split = 0; split <= stream.length; split++) {
+    const f = fixture();
+    const actions = [
+      ...f.machine.accept({ kind: 'terminal', bytes: stream.subarray(0, split) }),
+      ...f.machine.accept({ kind: 'terminal', bytes: stream.subarray(split) }),
+    ];
+    assert.deepEqual(actions, [{ kind: 'write', text: '/usage' }]);
+    assert.deepEqual(f.terminal(suggestion), [{ kind: 'write', text: '\r' }]);
+    f.tick();
+    f.capture();
+    assert.deepEqual(f.terminal(panel), [{ kind: 'write', text: '\x1b' }, { kind: 'stop' }]);
+    assert.ok(f.machine.result() && 'observation' in f.machine.result()!);
+  }
+});
+test('unresolved login selection receives no input, even with an earlier normal prompt', () => {
+  for (const prefix of ['', prompt]) {
+    for (const event of [{ kind: 'deadline' }, { kind: 'exit', code: 0 }] as const) {
+      const f = fixture();
+      assert.deepEqual(f.terminal(prefix + 'Select login method:\n'), []);
+      assert.equal(f.machine.result(), null);
+      assert.deepEqual(f.machine.accept(event), [{ kind: 'stop' }]);
+      assert.deepEqual(f.machine.result(), { status: 'auth' });
+    }
+  }
+});
+test('login selection after startup and browser authorization never receive command input', () => {
+  const f = fixture();
+  f.terminal(prompt);
+  assert.deepEqual(f.terminal('Select login method:\n' + suggestion), [{ kind: 'stop' }]);
+  assert.deepEqual(f.machine.result(), { status: 'auth' });
+  for (const screen of ['paste the authorization code', 'click here to authenticate']) {
+    const login = fixture();
+    assert.deepEqual(login.terminal('Select login method:\n' + screen + prompt), [{ kind: 'stop' }]);
+    assert.deepEqual(login.machine.result(), { status: 'auth' });
   }
 });
 test('unknown slash commands, initial cache, panel alone and early exit fail closed', () => {
