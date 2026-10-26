@@ -163,7 +163,7 @@ export function formatLedgerRecords(records: LedgerRecord[], now: Date): string 
     const selected = record.selected;
     const route = selected ? `${selected.tool}/${selected.model}/${selected.thinking_level}` : '—';
     const time = relativeLedgerTime(record.recorded_at, now);
-    const account = record.schema_version === 2 && selected ? 'api (unverified)' : (selected?.quota_bucket ?? '—');
+    const account = record.schema_version === 2 && selected ? 'api' : (selected?.quota_bucket ?? '—');
     const fields = [record.request_id, time, route, account, record.event];
     if (hasExitCode) fields.push(record.exit_code === undefined ? '—' : String(record.exit_code));
     return fields.map((field) => JSON.stringify(field).slice(1, -1));

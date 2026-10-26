@@ -141,7 +141,9 @@ test('API lifecycle history folds across rotations without inventing a subscript
     assert.equal(record?.selected?.model, 'deepseek-v4-flash');
     assert.equal(record?.event, 'exited');
     assert.equal(record?.exit_code, 9);
-    assert.match(formatLedgerRecords([record!], new Date('2026-10-21T00:02:00Z')), /api \(unverified\)/);
+    const output = formatLedgerRecords([record!], new Date('2026-10-21T00:02:00Z'));
+    assert.match(output, /\sapi\s+exited\s+9/);
+    assert.doesNotMatch(output, /unverified/);
     assert.equal((await stat(file)).mode & 0o777, 0o600);
     assert.equal((await stat(`${file}.1`)).mode & 0o777, 0o600);
     assert.equal((await stat(path.dirname(file))).mode & 0o777, 0o700);
