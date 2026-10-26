@@ -16,6 +16,19 @@ export function agyAuth(
     },
   });
 }
+export function agyEmailAuth(email = 'synthetic-user@example.com', expiry = '2026-10-02T13:00:00Z') {
+  return JSON.stringify({
+    auth_method: 'consumer',
+    id_token_email: email,
+    token: {
+      access_token: 'synthetic-access',
+      refresh_token: 'synthetic-refresh',
+      token_type: 'Bearer',
+      expires_in: 3600,
+      expiry,
+    },
+  });
+}
 export function agyQuota(): Record<
   string,
   { remaining_fraction: number; reset_time?: string; reset_in_seconds?: number }

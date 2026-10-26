@@ -29,7 +29,7 @@ import {
   refreshQuota,
 } from '../src/quota-refresh.ts';
 
-import { agyAuth, agyQuota } from './agy-helpers.ts';
+import { agyAuth, agyEmailAuth, agyQuota } from './agy-helpers.ts';
 import { readAgyIdentity } from '../src/agy-auth.ts';
 
 test('API-only refresh never reads auth, collects quotas, or writes snapshots for any tool', async () => {
@@ -204,6 +204,81 @@ test('AGY renewal accepts the same principal and writes separate private pools o
   assert.equal(operations.filter(([op]) => op === 'write').length, 1);
   assert.equal(operations.find(([op]) => op === 'write')?.[2], 0o600);
 });
+test('AGY email-only renewal writes quota without persisting email or credentials', async () => {
+  const { io, files, requests } = refreshIO();
+  const auth = '/home/.gemini/antigravity-cli/antigravity-oauth-token';
+  files.set(auth, agyEmailAuth('synthetic-user@example.com', '2026-10-02T11:00:00Z'));
+  let calls = 0;
+  io.collectAgy = async (_paths, requestId) => {
+    calls++;
+    files.set(auth, agyEmailAuth());
+    return { status: 'captured', observation: { requestId, observedAt: observed, quota: agyQuota() } };
+  };
+  assert.equal((await refreshQuota(refreshConfig(['antigravity']), io)).buckets[0]?.status, 'written');
+  assert.equal(calls, 1);
+  assert.equal(requests.length, 0);
+  const body = files.get(`${quotaDir}/antigravity.json`)!;
+  const saved = SnapshotSchema.parse(JSON.parse(body));
+  assert.equal(
+    saved.identity_fingerprint,
+    createHash('sha256').update('antigravity:email:synthetic-user@example.com').digest('hex'),
+  );
+  for (const secret of ['synthetic-user@example.com', 'synthetic-access', 'synthetic-refresh']) {
+    assert.equal(body.includes(secret), false);
+  }
+  assert.equal(files.get(auth), agyEmailAuth());
+});
+
+test('AGY email identity changes invalidate snapshots even after successful collection', async () => {
+  for (const next of ['synthetic-user@example.com', 'changed@example.com', null]) {
+    const { io, files } = refreshIO();
+    const auth = '/home/.gemini/antigravity-cli/antigravity-oauth-token',
+      dest = `${quotaDir}/antigravity.json`;
+    files.set(auth, agyEmailAuth());
+    io.collectAgy = async (_paths, requestId) => ({
+      status: 'captured',
+      observation: { requestId, observedAt: observed, quota: agyQuota() },
+    });
+    assert.equal((await refreshQuota(refreshConfig(['antigravity']), io)).buckets[0]?.status, 'written');
+    const original = files.get(dest)!;
+    io.collectAgy = async (_paths, requestId) => {
+      if (next === null) files.set(auth, agyEmailAuth(''));
+      else files.set(auth, agyEmailAuth(next));
+      return { status: 'captured', observation: { requestId, observedAt: observed, quota: agyQuota() } };
+    };
+    assert.equal(
+      (await refreshQuota(refreshConfig(['antigravity']), io)).buckets[0]?.status,
+      next === 'synthetic-user@example.com' ? 'written' : 'auth',
+    );
+    assert.equal(files.get(dest), next === 'synthetic-user@example.com' ? original : undefined);
+  }
+});
+
+test('AGY email fallback invalidates legacy snapshots but preserves same-email failures', async () => {
+  const { io, files } = refreshIO();
+  const auth = '/home/.gemini/antigravity-cli/antigravity-oauth-token',
+    dest = `${quotaDir}/antigravity.json`;
+  files.set(auth, agyAuth());
+  io.collectAgy = async (_paths, requestId) => ({
+    status: 'captured',
+    observation: { requestId, observedAt: observed, quota: agyQuota() },
+  });
+  assert.equal((await refreshQuota(refreshConfig(['antigravity']), io)).buckets[0]?.status, 'written');
+  files.set(auth, agyEmailAuth());
+  io.collectAgy = async () => ({ status: 'fetch' });
+  assert.equal((await refreshQuota(refreshConfig(['antigravity']), io)).buckets[0]?.status, 'fetch');
+  assert.equal(files.has(dest), false);
+  io.collectAgy = async (_paths, requestId) => ({
+    status: 'captured',
+    observation: { requestId, observedAt: observed, quota: agyQuota() },
+  });
+  assert.equal((await refreshQuota(refreshConfig(['antigravity']), io)).buckets[0]?.status, 'written');
+  const original = files.get(dest);
+  io.collectAgy = async () => ({ status: 'fetch' });
+  assert.equal((await refreshQuota(refreshConfig(['antigravity']), io)).buckets[0]?.status, 'fetch');
+  assert.equal(files.get(dest), original);
+});
+
 test('AGY changed or unknown identity invalidates previous data; same-principal failure preserves bytes', async () => {
   for (const next of ['same', 'changed', null]) {
     const { io, files } = refreshIO();
