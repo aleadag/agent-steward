@@ -326,6 +326,69 @@ test('OpenRouter routing uses only its selected credential and records normalize
   assert.doesNotMatch(out.join(''), /opaque-openrouter-value|other-key/);
 });
 
+test('Laya routing works without keys and never transmits configured cloud credentials', async () => {
+  for (const keys of [
+    {},
+    { TYPESAFE_API_KEY: 'opaque-typesafe-value', OPENROUTER_API_KEY: 'opaque-openrouter-value' },
+  ]) {
+    const cfg = routeConfig();
+    cfg.evaluator = { type: 'laya', provider: 'ollama', model: 'laya' };
+    const { post, requests } = fakePost((wire, index) => ({
+      ...(routeAnswer(wire, index) as Evaluation),
+      model: 'laya',
+    }));
+    const { io, out } = runtime({
+      env: { HOME: '/isolated/home', ...keys },
+      readText: async () => JSON.stringify(cfg),
+      post,
+    });
+    assert.equal(await run(['router', 'start', 'task', '--dry-run', '--json'], io), 0);
+    assert.equal(result(out).decision, 'selected');
+    assert.ok(requests.length > 0);
+    for (const request of requests) {
+      assert.equal(request.url, 'http://localhost:11434/v1/systemone');
+      assert.deepEqual(request.headers, { 'content-type': 'application/json' });
+      assert.equal(JSON.parse(request.body).model, 'laya');
+    }
+    assert.doesNotMatch(out.join('') + JSON.stringify(requests), /opaque-typesafe-value|opaque-openrouter-value/);
+  }
+});
+
+test('Laya stop assessments retain risk and explicit-restriction approval gates', async () => {
+  for (const [risk, forbidden, expected, exit] of [
+    [0.1, false, 'approve_request', 0],
+    [0.6, false, 'manual_review', 2],
+    [0.1, true, 'manual_review', 2],
+  ] as const) {
+    const { post, requests } = fakePost((wire) => ({ ...stopAnswer(wire, 'approve_command', risk), model: 'laya' }));
+    const { io, out } = runtime({
+      readText: async () => JSON.stringify(config({ evaluator: { type: 'laya', provider: 'ollama' } })),
+      readStdin: async () => JSON.stringify(stopInput({ automatic_approval_forbidden: forbidden })),
+      post,
+    });
+    assert.equal(await run(['stop', 'check'], io), exit);
+    assert.equal(result(out).proposed_action.kind, expected);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]?.url, 'http://localhost:11434/v1/systemone');
+    assert.equal(requests[0]?.headers.authorization, undefined);
+  }
+});
+
+test('doctor skips Ollama credentials without contacting its server', async () => {
+  const { io, out } = runtime({
+    env: { HOME: '/isolated/home', PATH: '/isolated/bin' },
+    readText: async () => JSON.stringify(config({ evaluator: { type: 'laya', provider: 'ollama' } })),
+    executableAvailable: () => true,
+    post: async () => {
+      throw new Error('doctor must stay offline');
+    },
+  });
+  assert.equal(await run(['doctor', '--json'], io), 0);
+  const report = JSON.parse(out.join(''));
+  assert.equal(report.ok, true);
+  assert.equal(report.checks.find((check: { id: string }) => check.id === 'evaluator_key').status, 'skipped');
+});
+
 test('OpenRouter has no credential fallback and empty stop context remains local', async () => {
   const cfg = config({ evaluator: { type: 'jev', provider: 'openrouter', model: '~typesafe/jev-latest' } });
   const { io, out } = runtime({

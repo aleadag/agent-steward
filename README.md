@@ -87,7 +87,7 @@ Run `agent-steward doctor` to check config readability, JSON/schema validity, en
 
 Human output marks checks with ✅ (pass), ❌ (fail), or ⏭️ (skipped), with suggested fixes indented on separate lines. JSON retains `pass`, `fail`, and `skipped` status strings. Independent checks continue after a failure; checks needing valid config or a safe PATH are skipped. Exit status is 0 when all required checks pass and 1 otherwise. `--json` returns `{ "schema_version": 1, "ok": true|false, "checks": [...] }`; each check includes `id`, `status`, and `message`, with `fix` on failures. Config failures also include `kind` (`read`, `json`, or `schema`) and may include credential-checked field names, never values or raw errors.
 
-Doctor runs offline without a terminal. It does not launch executables, read native auth stores or quota snapshots, contact providers, write history, or repair files. Executable versions, login state, and key validity remain unverified. Missing evaluator keys fail the readiness check even though commands such as local history inspection do not need them. A separate Node executable is not required by the packaged CLI.
+Doctor runs offline without a terminal. It does not launch executables, read native auth stores or quota snapshots, contact providers, write history, or repair files. Executable versions, login state, and key validity remain unverified. Missing cloud evaluator keys fail the readiness check even though commands such as local history inspection do not need them. Local Ollama skips the key check; server and model availability remain unverified. A separate Node executable is not required by the packaged CLI.
 
 ### Local route history
 
@@ -170,7 +170,19 @@ Select the evaluator separately from the models being routed:
 }
 ```
 
-Only `type: "jev"` is supported today; the type selector leaves room for future decision-model adapters without treating them as Jev. Providers are `typesafe` and `openrouter`. An omitted model defaults to `jev-1.13.0` for TypeSafe and `~typesafe/jev-latest` for OpenRouter. Model IDs pass through unchanged; use `typesafe/jev-1.13` to pin OpenRouter's release family. OpenRouter uses its [System One endpoint](https://openrouter.ai/docs/api/api-reference/systemone/submit-a-system-one-request), not chat completions or `jev-router`. There is no credential or provider fallback.
+For `type: "jev"`, providers are `typesafe` and `openrouter`. An omitted model defaults to `jev-1.13.0` for TypeSafe and `~typesafe/jev-latest` for OpenRouter. Model IDs pass through unchanged; use `typesafe/jev-1.13` to pin OpenRouter's release family. OpenRouter uses its [System One endpoint](https://openrouter.ai/docs/api/api-reference/systemone/submit-a-system-one-request), not chat completions or `jev-router`. There is no credential or provider fallback.
+
+To replace Jev with local [Laya](https://ollama.com/library/laya), use:
+
+```json
+"evaluator": {
+  "type": "laya",
+  "provider": "ollama",
+  "model": "laya"
+}
+```
+
+Laya requires Ollama 0.40.0 or later and a locally pulled model (`ollama pull laya`). The model defaults to `laya` when omitted; tags such as `laya:latest` pass through unchanged. Requests use the fixed `http://localhost:11434/v1/systemone` endpoint, without an API key or authorization header. Other HTTP endpoints are not enabled. Routing and stop assessments use the same response validation, privacy checks, approval thresholds, 30-second deadline, and no-retry policy. An unavailable server, missing model, or rejected request fails without cloud fallback. Ollama's model/context and option limits still apply; steward does not split or truncate requests to fit them. Confidence values from different models are not an assurance of equivalent decision quality.
 
 Existing `"jev": { "model": "jev-1.13.0" }` config remains accepted as Jev via TypeSafe. Omit both selectors to keep that default; supplying both `jev` and `evaluator` is invalid.
 
@@ -294,7 +306,7 @@ Config files, snapshots, stop stdin, quota responses, and Jev request/response b
 
 ## Decision and privacy boundaries
 
-Both dry-run previews and live starts send the supplied task, configured candidate facts, applicable snapshot facts, and fixed evaluator questions to the configured provider: `https://api.typesafe.ai/v1/systemone` for TypeSafe or `https://openrouter.ai/api/v1/systemone` for OpenRouter. `stop check` sends the supplied version-2 observation, including context and any structured action hints, with fixed classification questions when evaluation is needed. Send only the excerpt around the current stop. Routing and stop checks do not inspect terminal history, repository files, provider credentials, live account state, or Herdr, and do not persist request/response bodies. Only explicit `quota refresh` reads the documented auth stores and contacts quota endpoints; credentials never enter Jev state. If context is absent, blank, null, or empty, even action hints produce local manual review without a Jev call or API-key requirement. A meaningful context is required before Jev evaluation.
+Both dry-run previews and live starts send the supplied task, configured candidate facts, applicable snapshot facts, and fixed evaluator questions to the configured provider: `https://api.typesafe.ai/v1/systemone` for TypeSafe, `https://openrouter.ai/api/v1/systemone` for OpenRouter, or `http://localhost:11434/v1/systemone` for local Ollama Laya. `stop check` sends the supplied version-2 observation, including context and any structured action hints, with fixed classification questions when evaluation is needed. Send only the excerpt around the current stop. Routing and stop checks do not inspect terminal history, repository files, provider credentials, live account state, or Herdr, and do not persist request/response bodies. Only explicit `quota refresh` reads the documented auth stores and contacts quota endpoints; credentials never enter Jev state. If context is absent, blank, null, or empty, even action hints produce local manual review without a Jev call or API-key requirement. A meaningful context is required before Jev evaluation.
 
 Before sending, the CLI rejects either configured TypeSafe or OpenRouter key if it appears in outbound data and checks a limited set of recognizable credential patterns: private-key headers, common `sk-`/GitHub token prefixes, AWS `AKIA` keys, Bearer tokens, and values under credential-named fields. It also checks caller IDs and output for both configured keys. Detection is incomplete and may miss unfamiliar or encoded secrets, while rejecting token-like ordinary text. Do not rely on it to make sensitive input safe. The opt-in evaluation sends the supplied context through the configured provider to Jev.
 

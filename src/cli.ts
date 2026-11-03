@@ -890,7 +890,11 @@ export async function run(argv: readonly string[], runtime: Runtime): Promise<nu
     const evaluate: Evaluate = async (state: unknown, questions: Questions) => {
       if (evaluator === undefined) {
         const key =
-          config.evaluator.provider === 'openrouter' ? runtime.env.OPENROUTER_API_KEY : runtime.env.TYPESAFE_API_KEY;
+          config.evaluator.provider === 'ollama'
+            ? undefined
+            : config.evaluator.provider === 'openrouter'
+              ? runtime.env.OPENROUTER_API_KEY
+              : runtime.env.TYPESAFE_API_KEY;
         evaluator = makeEvaluator({
           ...config.evaluator,
           apiKey: key ?? '',

@@ -102,18 +102,30 @@ export async function diagnose(override: string | undefined, io: DoctorIO) {
             },
       );
     }
-    const keyName = config.evaluator.provider === 'openrouter' ? 'OPENROUTER_API_KEY' : 'TYPESAFE_API_KEY';
-    const present = (io.env[keyName] ?? '').trim().length > 0;
-    checks.push(
-      present
-        ? { id: 'evaluator_key', status: 'pass', message: 'Selected evaluator key is present; validity is unverified.' }
-        : {
-            id: 'evaluator_key',
-            status: 'fail',
-            message: 'Selected evaluator key is missing.',
-            fix: `Set ${keyName} in the environment; do not put credentials in config.`,
-          },
-    );
+    if (config.evaluator.provider === 'ollama') {
+      checks.push({
+        id: 'evaluator_key',
+        status: 'skipped',
+        message: 'Local Ollama requires no API key; server and model availability are unverified.',
+      });
+    } else {
+      const keyName = config.evaluator.provider === 'openrouter' ? 'OPENROUTER_API_KEY' : 'TYPESAFE_API_KEY';
+      const present = (io.env[keyName] ?? '').trim().length > 0;
+      checks.push(
+        present
+          ? {
+              id: 'evaluator_key',
+              status: 'pass',
+              message: 'Selected evaluator key is present; validity is unverified.',
+            }
+          : {
+              id: 'evaluator_key',
+              status: 'fail',
+              message: 'Selected evaluator key is missing.',
+              fix: `Set ${keyName} in the environment; do not put credentials in config.`,
+            },
+      );
+    }
   }
   return { schema_version: 1, ok: checks.every((check) => check.status !== 'fail'), checks };
 }

@@ -75,14 +75,23 @@ const CandidateSchema = z.preprocess(
 );
 
 export const EvaluatorConfigSchema = z
-  .strictObject({
-    type: z.literal('jev'),
-    provider: z.enum(['typesafe', 'openrouter']),
-    model: text.optional(),
-  })
+  .discriminatedUnion('type', [
+    z.strictObject({
+      type: z.literal('jev'),
+      provider: z.enum(['typesafe', 'openrouter']),
+      model: text.optional(),
+    }),
+    z.strictObject({
+      type: z.literal('laya'),
+      provider: z.literal('ollama'),
+      model: text.optional(),
+    }),
+  ])
   .transform((value) => ({
     ...value,
-    model: value.model ?? (value.provider === 'openrouter' ? '~typesafe/jev-latest' : 'jev-1.13.0'),
+    model:
+      value.model ??
+      (value.provider === 'ollama' ? 'laya' : value.provider === 'openrouter' ? '~typesafe/jev-latest' : 'jev-1.13.0'),
   }));
 
 export const ConfigSchema = z

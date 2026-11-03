@@ -1,4 +1,5 @@
 import https from 'node:https';
+import http from 'node:http';
 import type { ClientRequest } from 'node:http';
 import type { Evaluation, FailureDiagnostics } from './contracts.ts';
 import { EvaluationSchema, StewardError } from './contracts.ts';
@@ -7,6 +8,8 @@ import { readBoundedUtf8 } from './io.ts';
 import { z } from 'zod';
 import { assertNoCredentials } from './privacy.ts';
 import type { CredentialKeys } from './privacy.ts';
+
+const OLLAMA_URL = 'http://localhost:11434/v1/systemone';
 
 const OpenRouterEvaluationSchema = EvaluationSchema.extend({
   id: z.string().optional(),
@@ -238,14 +241,15 @@ function mapInputError(error: unknown): never {
 
 export function makeEvaluator(options: {
   model: string;
-  provider?: 'typesafe' | 'openrouter';
-  apiKey: string;
+  provider?: 'typesafe' | 'openrouter' | 'ollama';
+  apiKey?: string;
   credentialKeys?: CredentialKeys;
   post: HttpPost;
 }): Evaluate {
-  if (typeof options.apiKey !== 'string' || options.apiKey.trim().length === 0)
+  if (options.provider !== 'ollama' && (typeof options.apiKey !== 'string' || options.apiKey.trim().length === 0))
     throw new StewardError('missing_credentials', { stage: 'credentials' });
 
+  const credentialKeys = options.credentialKeys ?? options.apiKey ?? '';
   let evaluationIndex = 0;
   return async (state, questions) => {
     let body: string;
@@ -254,7 +258,7 @@ export function makeEvaluator(options: {
       assertJsonDepth(wire);
       assertJsonValue(wire);
       assertQuestions(questions);
-      assertNoCredentials(wire, options.credentialKeys ?? options.apiKey);
+      assertNoCredentials(wire, credentialKeys);
       const serialized = JSON.stringify(wire);
       if (serialized === undefined) throw new StewardError('invalid_input');
       assertByteLength(serialized);
@@ -272,10 +276,15 @@ export function makeEvaluator(options: {
     try {
       response = await options.post({
         url:
-          options.provider === 'openrouter'
-            ? 'https://openrouter.ai/api/v1/systemone'
-            : 'https://api.typesafe.ai/v1/systemone',
-        headers: { authorization: `Bearer ${options.apiKey}`, 'content-type': 'application/json' },
+          options.provider === 'ollama'
+            ? OLLAMA_URL
+            : options.provider === 'openrouter'
+              ? 'https://openrouter.ai/api/v1/systemone'
+              : 'https://api.typesafe.ai/v1/systemone',
+        headers:
+          options.provider === 'ollama'
+            ? { 'content-type': 'application/json' }
+            : { authorization: `Bearer ${options.apiKey}`, 'content-type': 'application/json' },
         body,
         signal,
       });
@@ -318,7 +327,7 @@ export function makeEvaluator(options: {
         options.provider === 'openrouter' ? OpenRouterEvaluationSchema.parse(parsed) : parsed,
         questions,
       );
-      assertNoCredentials(parsed, options.credentialKeys ?? options.apiKey);
+      assertNoCredentials(parsed, credentialKeys);
       return evaluation;
     } catch (error) {
       if (error instanceof StewardError && error.code === 'credential_detected') throw error;
@@ -364,7 +373,9 @@ export function postHttps(request: Parameters<HttpPost>[0]): ReturnType<HttpPost
     };
 
     try {
-      clientRequest = https.request(
+      // Plain HTTP is allowed only for the fixed local Ollama endpoint.
+      const transport = request.url === OLLAMA_URL ? http : https;
+      clientRequest = transport.request(
         request.url,
         {
           method: 'POST',

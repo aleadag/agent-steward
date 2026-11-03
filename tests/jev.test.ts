@@ -1,6 +1,7 @@
 import { afterEach, mock, spyOn, test } from 'bun:test';
 import assert from 'node:assert/strict';
 import https from 'node:https';
+import http from 'node:http';
 import type { ClientRequest, IncomingMessage, RequestOptions } from 'node:http';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
@@ -600,6 +601,72 @@ test('malformed, oversized, and deeply nested fake-post responses fail as invali
       post: async () => ({ status: 200, body }),
     });
     await assert.rejects(evaluate({}, requestedQuestions()), (error) => hasCode(error, 'invalid_response'));
+  }
+});
+
+test('transport permits only the fixed Ollama endpoint over HTTP and does not follow redirects', async () => {
+  let calls = 0;
+  spyOn(http, 'request').mockImplementation(((url, options, callback) => {
+    calls++;
+    assert.equal(url, 'http://localhost:11434/v1/systemone');
+    assert.equal(options.method, 'POST');
+    assert.deepEqual(options.headers, { 'content-type': 'application/json' });
+    return fakeRequest((body) => {
+      assert.equal(body, '{"model":"laya"}');
+      const response = fakeResponse(302);
+      respond(callback, response);
+      response.end();
+    }) as unknown as ClientRequest;
+  }) as RequestMockImplementation as unknown as typeof http.request);
+  const response = await postHttps({
+    url: 'http://localhost:11434/v1/systemone',
+    headers: { 'content-type': 'application/json' },
+    body: '{"model":"laya"}',
+    signal: new AbortController().signal,
+  });
+  assert.deepEqual(response, { status: 302, body: '' });
+  assert.equal(calls, 1);
+  for (const url of ['http://remote.example/v1/systemone', 'http://localhost:11434/other']) {
+    await assert.rejects(postHttps({ url, headers: {}, body: '{}', signal: new AbortController().signal }), (error) =>
+      hasCode(error, 'evaluation_failed'),
+    );
+  }
+  assert.equal(calls, 1);
+});
+
+test('Ollama HTTP transport bounds responses and cancels active readers', async () => {
+  for (const mode of ['valid', 'oversized', 'abort'] as const) {
+    let request: FakeRequest | undefined;
+    let response: FakeResponse | undefined;
+    spyOn(http, 'request').mockImplementation(((_url, _options, callback) => {
+      request = fakeRequest(() => {
+        response = fakeResponse(200);
+        respond(callback, response);
+        if (mode === 'valid') response.end('{"ok":true}');
+        if (mode === 'oversized') {
+          response.write(Buffer.alloc(MAX_JSON_BYTES));
+          response.end('x');
+        }
+      });
+      return request as unknown as ClientRequest;
+    }) as RequestMockImplementation as unknown as typeof http.request);
+    const controller = new AbortController();
+    const pending = postHttps({
+      url: 'http://localhost:11434/v1/systemone',
+      headers: {},
+      body: '{}',
+      signal: controller.signal,
+    });
+    if (mode === 'abort') controller.abort();
+    if (mode === 'valid') assert.deepEqual(await pending, { status: 200, body: '{"ok":true}' });
+    else {
+      await assert.rejects(pending, (error) =>
+        hasCode(error, mode === 'oversized' ? 'invalid_response' : 'evaluation_failed'),
+      );
+      assert.equal(request?.destroyedByCaller, true);
+      assert.equal(response?.destroyed, true);
+    }
+    mock.restore();
   }
 });
 

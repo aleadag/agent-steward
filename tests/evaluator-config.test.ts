@@ -41,6 +41,94 @@ test('OpenRouter evaluator defaults its model and rejects ambiguous or unsupport
   );
 });
 
+test('Laya config defaults its model and keeps provider/type combinations strict', () => {
+  assert.deepEqual(ConfigSchema.parse({ ...base, evaluator: { type: 'laya', provider: 'ollama' } }).evaluator, {
+    type: 'laya',
+    provider: 'ollama',
+    model: 'laya',
+  });
+  assert.equal(
+    ConfigSchema.parse({ ...base, evaluator: { type: 'laya', provider: 'ollama', model: 'laya:latest' } }).evaluator
+      .model,
+    'laya:latest',
+  );
+  for (const evaluator of [
+    { type: 'jev', provider: 'ollama' },
+    { type: 'laya', provider: 'typesafe' },
+    { type: 'laya', provider: 'openrouter' },
+    { type: 'laya', provider: 'ollama', api_key: 'secret' },
+    { type: 'laya', provider: 'ollama', base_url: 'http://remote' },
+    { type: 'laya', provider: 'ollama', model: ' ' },
+  ])
+    assert.equal(ConfigSchema.safeParse({ ...base, evaluator }).success, false);
+  assert.equal(
+    ConfigSchema.safeParse({ ...base, jev: {}, evaluator: { type: 'laya', provider: 'ollama' } }).success,
+    false,
+  );
+});
+
+test('Ollama sends System One without credentials and preserves typed answers', async () => {
+  const raw = {
+    model: 'laya',
+    answers: { safe: { type: 'noul', noul: 0.2 } },
+    usage: { input_tokens: 59, output_tokens: 0 },
+  };
+  const evaluate = makeEvaluator({
+    provider: 'ollama',
+    model: 'laya',
+    post: async (request) => {
+      assert.equal(request.url, 'http://localhost:11434/v1/systemone');
+      assert.deepEqual(request.headers, { 'content-type': 'application/json' });
+      assert.deepEqual(JSON.parse(request.body), { model: 'laya', state: { task: 'check' }, questions });
+      return { status: 200, body: JSON.stringify(raw) };
+    },
+  });
+  assert.deepEqual(await evaluate({ task: 'check' }, questions), raw);
+});
+
+test('Ollama retains strict response validation and configured cloud-key privacy guards', async () => {
+  let posts = 0;
+  let raw: unknown = { model: 'laya', answers: {}, usage: {} };
+  const evaluate = makeEvaluator({
+    provider: 'ollama',
+    model: 'laya',
+    credentialKeys: ['opaque-typesafe-value', 'opaque-openrouter-value'],
+    post: async () => {
+      posts++;
+      return { status: 200, body: JSON.stringify(raw) };
+    },
+  });
+  for (const secret of ['opaque-typesafe-value', 'opaque-openrouter-value'])
+    await assert.rejects(
+      evaluate({ task: secret }, questions),
+      (e) => e instanceof StewardError && e.code === 'credential_detected',
+    );
+  assert.equal(posts, 0);
+  await assert.rejects(evaluate({}, questions), (e) => e instanceof StewardError && e.code === 'invalid_response');
+  raw = { model: 'prefix-opaque-typesafe-value', answers: { safe: { type: 'noul', noul: 0.2 } }, usage: {} };
+  await assert.rejects(evaluate({}, questions), (e) => e instanceof StewardError && e.code === 'credential_detected');
+});
+
+test('Ollama failures do not fall back to a cloud provider', async () => {
+  for (const status of [404, 500]) {
+    let posts = 0;
+    const evaluate = makeEvaluator({
+      provider: 'ollama',
+      model: 'laya',
+      post: async (request) => {
+        posts++;
+        assert.equal(request.url, 'http://localhost:11434/v1/systemone');
+        return { status, body: 'private server error' };
+      },
+    });
+    await assert.rejects(
+      evaluate({}, questions),
+      (e) => e instanceof StewardError && e.code === 'evaluation_failed' && e.diagnostics?.http_status === status,
+    );
+    assert.equal(posts, 1);
+  }
+});
+
 test('OpenRouter uses System One and normalizes only documented response metadata', async () => {
   const evaluate = makeEvaluator({
     provider: 'openrouter',
