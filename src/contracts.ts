@@ -75,18 +75,10 @@ const CandidateSchema = z.preprocess(
 );
 
 export const EvaluatorConfigSchema = z
-  .discriminatedUnion('type', [
-    z.strictObject({
-      type: z.literal('jev'),
-      provider: z.enum(['typesafe', 'openrouter']),
-      model: text.optional(),
-    }),
-    z.strictObject({
-      type: z.literal('laya'),
-      provider: z.literal('ollama'),
-      model: text.optional(),
-    }),
-  ])
+  .strictObject({
+    provider: z.enum(['typesafe', 'openrouter', 'ollama']),
+    model: text.optional(),
+  })
   .transform((value) => ({
     ...value,
     model:
@@ -149,7 +141,7 @@ export const ConfigSchema = z
   })
   .transform(({ jev, evaluator, ...config }) => ({
     ...config,
-    evaluator: evaluator ?? { type: 'jev' as const, provider: 'typesafe' as const, model: jev?.model ?? 'jev-1.13.0' },
+    evaluator: evaluator ?? { provider: 'typesafe' as const, model: jev?.model ?? 'jev-1.13.0' },
   }));
 
 const AccountScopeSchema = z.strictObject({ type: z.literal('account') });

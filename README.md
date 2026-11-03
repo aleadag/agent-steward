@@ -164,25 +164,23 @@ Select the evaluator separately from the models being routed:
 
 ```json
 "evaluator": {
-  "type": "jev",
   "provider": "openrouter",
   "model": "~typesafe/jev-latest"
 }
 ```
 
-For `type: "jev"`, providers are `typesafe` and `openrouter`. An omitted model defaults to `jev-1.13.0` for TypeSafe and `~typesafe/jev-latest` for OpenRouter. Model IDs pass through unchanged; use `typesafe/jev-1.13` to pin OpenRouter's release family. OpenRouter uses its [System One endpoint](https://openrouter.ai/docs/api/api-reference/systemone/submit-a-system-one-request), not chat completions or `jev-router`. There is no credential or provider fallback.
+Providers are `typesafe`, `openrouter`, and `ollama`; all use the System One API. Configure only `provider` and optional `model`; the former `evaluator.type` field is no longer accepted and must be removed from existing configs. An omitted model defaults to `jev-1.13.0` for TypeSafe and `~typesafe/jev-latest` for OpenRouter. Model IDs pass through unchanged; use `typesafe/jev-1.13` to pin OpenRouter's release family. OpenRouter uses its [System One endpoint](https://openrouter.ai/docs/api/api-reference/systemone/submit-a-system-one-request), not chat completions or `jev-router`. There is no credential or provider fallback.
 
 To replace Jev with local [Laya](https://ollama.com/library/laya), use:
 
 ```json
 "evaluator": {
-  "type": "laya",
   "provider": "ollama",
   "model": "laya"
 }
 ```
 
-Laya requires Ollama 0.40.0 or later and a locally pulled model (`ollama pull laya`). The model defaults to `laya` when omitted; tags such as `laya:latest` pass through unchanged. Requests use the fixed `http://localhost:11434/v1/systemone` endpoint, without an API key or authorization header. Other HTTP endpoints are not enabled. Routing and stop assessments use the same response validation, privacy checks, approval thresholds, 30-second deadline, and no-retry policy. An unavailable server, missing model, or rejected request fails without cloud fallback. Ollama's model/context and option limits still apply; steward does not split or truncate requests to fit them. Confidence values from different models are not an assurance of equivalent decision quality.
+Laya requires Ollama 0.40.0 or later and a locally pulled model (`ollama pull laya`). The model defaults to `laya` when omitted; other System One-compatible models and tags, such as `kev:4b-q8_0`, pass through unchanged and require their own runtime compatibility and decision-quality checks. Requests use the fixed `http://localhost:11434/v1/systemone` endpoint, without an API key or authorization header. Other HTTP endpoints are not enabled. Routing and stop assessments use the same response validation, privacy checks, approval thresholds, 30-second deadline, and no-retry policy. An unavailable server, missing model, or rejected request fails without cloud fallback. Ollama's model/context and option limits still apply; steward does not split or truncate requests to fit them. Confidence values from different models are not an assurance of equivalent decision quality.
 
 Existing `"jev": { "model": "jev-1.13.0" }` config remains accepted as Jev via TypeSafe. Omit both selectors to keep that default; supplying both `jev` and `evaluator` is invalid.
 

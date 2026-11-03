@@ -42,7 +42,7 @@ test('config schema is strict, preserves configured text, and defaults only docu
   const parsedCandidate = parsed.candidates[0];
   assert.ok(parsedCandidate);
   assert.equal(parsedCandidate.id, ' candidate-id ');
-  assert.deepEqual(parsed.evaluator, { type: 'jev', provider: 'typesafe', model: 'jev-1.13.0' });
+  assert.deepEqual(parsed.evaluator, { provider: 'typesafe', model: 'jev-1.13.0' });
   assert.deepEqual(parsed.thresholds, { risky: 0.6, choiceConfidence: 0.45 });
 
   for (const key of ['unknown', 'api_key', 'token', 'credential']) {

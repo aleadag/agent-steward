@@ -1,5 +1,7 @@
 # Unreleased
 
+- Removed `evaluator.type`. Configure the System One evaluator with `provider` and optional `model`; existing configs must remove `type`. Provider endpoints, credentials, model defaults, and legacy `jev.model` support are unchanged. See [configuration](README.md#configuration).
+
 - Long-running agents can regain a bounded API-retry budget without finishing their entire task. After a confirmed recovery delivery, the optional Herdr adapter can confirm that the same agent is still working with an unchanged state sequence after one configurable wait. Set `recovery_reset_after_seconds` in the plugin's `targets.json` (default 60). This uses no screen or Jev polling and preserves quota, manual-handoff, uncertain-delivery and cancellation protections. Reported activity is not proof of successful work; see the [recovery policy and limits](README.md#optional-herdr-adapter-not-activated).
 
 - Route to explicitly configured API-paid candidates with any supported launcher using `billing: "api"`; omitted billing remains subscription-based. Soft preferences spend suitable on-pace subscription capacity first, then API, then over-budget subscription capacity. Capability fit is best-effort and an eligible candidate is always chosen. Authentication stays with the native tool; no API balance collection or dollar-budget enforcement is added. See [API-paid candidates](README.md#api-paid-candidates).

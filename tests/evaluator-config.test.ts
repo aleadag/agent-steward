@@ -14,57 +14,46 @@ const response = {
   usage: { input_tokens: 12, output_tokens: 3, cost: 0.0001 },
 };
 
-test('legacy Jev config normalizes to the extensible evaluator selector', () => {
-  assert.deepEqual(ConfigSchema.parse(base).evaluator, { type: 'jev', provider: 'typesafe', model: 'jev-1.13.0' });
+test('legacy Jev config normalizes to provider and model only', () => {
+  assert.deepEqual(ConfigSchema.parse(base).evaluator, { provider: 'typesafe', model: 'jev-1.13.0' });
   assert.deepEqual(ConfigSchema.parse({ ...base, jev: { model: 'custom-jev' } }).evaluator, {
-    type: 'jev',
     provider: 'typesafe',
     model: 'custom-jev',
   });
 });
 
-test('OpenRouter evaluator defaults its model and rejects ambiguous or unsupported selectors', () => {
-  assert.deepEqual(ConfigSchema.parse({ ...base, evaluator: { type: 'jev', provider: 'openrouter' } }).evaluator, {
-    type: 'jev',
-    provider: 'openrouter',
-    model: '~typesafe/jev-latest',
-  });
-  for (const evaluator of [
-    { type: 'openai', provider: 'openai', model: 'example' },
-    { type: 'jev', provider: 'unknown' },
-    { type: 'jev', provider: 'openrouter', api_key: 'secret' },
-  ])
-    assert.equal(ConfigSchema.safeParse({ ...base, evaluator }).success, false);
+test('evaluator providers default their models and preserve explicit model IDs', () => {
+  for (const [provider, model] of [
+    ['typesafe', 'jev-1.13.0'],
+    ['openrouter', '~typesafe/jev-latest'],
+    ['ollama', 'laya'],
+  ]) {
+    assert.deepEqual(ConfigSchema.parse({ ...base, evaluator: { provider } }).evaluator, { provider, model });
+    assert.deepEqual(ConfigSchema.parse({ ...base, evaluator: { provider, model: 'custom-model' } }).evaluator, {
+      provider,
+      model: 'custom-model',
+    });
+    assert.equal(ConfigSchema.safeParse({ ...base, jev: {}, evaluator: { provider } }).success, false);
+  }
   assert.equal(
-    ConfigSchema.safeParse({ ...base, jev: {}, evaluator: { type: 'jev', provider: 'typesafe' } }).success,
-    false,
+    ConfigSchema.parse({ ...base, evaluator: { provider: 'ollama', model: 'kev:4b-q8_0' } }).evaluator.model,
+    'kev:4b-q8_0',
   );
 });
 
-test('Laya config defaults its model and keeps provider/type combinations strict', () => {
-  assert.deepEqual(ConfigSchema.parse({ ...base, evaluator: { type: 'laya', provider: 'ollama' } }).evaluator, {
-    type: 'laya',
-    provider: 'ollama',
-    model: 'laya',
-  });
-  assert.equal(
-    ConfigSchema.parse({ ...base, evaluator: { type: 'laya', provider: 'ollama', model: 'laya:latest' } }).evaluator
-      .model,
-    'laya:latest',
-  );
+test('evaluator rejects removed type, unknown providers, credentials and endpoint overrides', () => {
   for (const evaluator of [
-    { type: 'jev', provider: 'ollama' },
-    { type: 'laya', provider: 'typesafe' },
-    { type: 'laya', provider: 'openrouter' },
-    { type: 'laya', provider: 'ollama', api_key: 'secret' },
-    { type: 'laya', provider: 'ollama', base_url: 'http://remote' },
-    { type: 'laya', provider: 'ollama', model: ' ' },
+    { type: 'jev', provider: 'typesafe' },
+    { type: 'jev', provider: 'openrouter' },
+    { type: 'laya', provider: 'ollama' },
+    { model: 'example' },
+    { provider: 'unknown' },
+    { provider: 'openrouter', api_key: 'secret' },
+    { provider: 'ollama', api_key: 'secret' },
+    { provider: 'ollama', base_url: 'http://remote' },
+    { provider: 'ollama', model: ' ' },
   ])
     assert.equal(ConfigSchema.safeParse({ ...base, evaluator }).success, false);
-  assert.equal(
-    ConfigSchema.safeParse({ ...base, jev: {}, evaluator: { type: 'laya', provider: 'ollama' } }).success,
-    false,
-  );
 });
 
 test('Ollama sends System One without credentials and preserves typed answers', async () => {

@@ -264,7 +264,7 @@ test('doctor reports missing executables and selected evaluator key with actiona
       TYPESAFE_API_KEY: 'wrong-provider-key',
       OPENROUTER_API_KEY: '  ',
     },
-    readText: async () => JSON.stringify(config({ evaluator: { type: 'jev', provider: 'openrouter' } })),
+    readText: async () => JSON.stringify(config({ evaluator: { provider: 'openrouter' } })),
     executableAvailable: () => false,
   });
   assert.equal(await run(['doctor'], io), 1);
@@ -307,7 +307,7 @@ test('doctor output privacy failures remain local without publishing launcher lo
 
 test('OpenRouter routing uses only its selected credential and records normalized Jev answers', async () => {
   const cfg = routeConfig();
-  cfg.evaluator = { type: 'jev', provider: 'openrouter', model: '~typesafe/jev-latest' };
+  cfg.evaluator = { provider: 'openrouter', model: '~typesafe/jev-latest' };
   const { post, requests } = fakePost((wire, index) => ({
     ...(routeAnswer(wire, index) as Evaluation),
     id: 'gen-example',
@@ -332,7 +332,7 @@ test('Laya routing works without keys and never transmits configured cloud crede
     { TYPESAFE_API_KEY: 'opaque-typesafe-value', OPENROUTER_API_KEY: 'opaque-openrouter-value' },
   ]) {
     const cfg = routeConfig();
-    cfg.evaluator = { type: 'laya', provider: 'ollama', model: 'laya' };
+    cfg.evaluator = { provider: 'ollama', model: 'laya' };
     const { post, requests } = fakePost((wire, index) => ({
       ...(routeAnswer(wire, index) as Evaluation),
       model: 'laya',
@@ -362,7 +362,7 @@ test('Laya stop assessments retain risk and explicit-restriction approval gates'
   ] as const) {
     const { post, requests } = fakePost((wire) => ({ ...stopAnswer(wire, 'approve_command', risk), model: 'laya' }));
     const { io, out } = runtime({
-      readText: async () => JSON.stringify(config({ evaluator: { type: 'laya', provider: 'ollama' } })),
+      readText: async () => JSON.stringify(config({ evaluator: { provider: 'ollama' } })),
       readStdin: async () => JSON.stringify(stopInput({ automatic_approval_forbidden: forbidden })),
       post,
     });
@@ -377,7 +377,7 @@ test('Laya stop assessments retain risk and explicit-restriction approval gates'
 test('doctor skips Ollama credentials without contacting its server', async () => {
   const { io, out } = runtime({
     env: { HOME: '/isolated/home', PATH: '/isolated/bin' },
-    readText: async () => JSON.stringify(config({ evaluator: { type: 'laya', provider: 'ollama' } })),
+    readText: async () => JSON.stringify(config({ evaluator: { provider: 'ollama' } })),
     executableAvailable: () => true,
     post: async () => {
       throw new Error('doctor must stay offline');
@@ -390,7 +390,7 @@ test('doctor skips Ollama credentials without contacting its server', async () =
 });
 
 test('OpenRouter has no credential fallback and empty stop context remains local', async () => {
-  const cfg = config({ evaluator: { type: 'jev', provider: 'openrouter', model: '~typesafe/jev-latest' } });
+  const cfg = config({ evaluator: { provider: 'openrouter', model: '~typesafe/jev-latest' } });
   const { io, out } = runtime({
     env: { HOME: '/isolated/home', TYPESAFE_API_KEY: 'other-key' },
     readText: async () => JSON.stringify(cfg),
